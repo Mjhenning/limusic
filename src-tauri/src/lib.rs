@@ -7,6 +7,7 @@ mod blocked;
 mod cipher;
 mod commands;
 mod db;
+mod integrations;
 mod devicelink;
 mod diagnostics;
 mod discord;
@@ -1374,6 +1375,10 @@ pub fn run() {
             commands::stop_matugen_watcher,
             commands::get_settings,
             commands::set_setting,
+            commands::get_integration_settings,
+            commands::set_integration_settings,
+            commands::get_integration_status,
+            commands::regenerate_control_api_token,
             commands::get_global_hotkeys,
             commands::global_hotkeys_on_wayland,
             commands::set_global_hotkeys,

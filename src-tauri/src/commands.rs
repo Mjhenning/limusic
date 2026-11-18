@@ -3583,3 +3583,84 @@ mod tests {
         assert_eq!(row.title, played.title, "the song itself survives");
     }
 }
+
+/// Integration settings (Control API + Tuna) — milestone 1
+#[tauri::command]
+pub async fn get_integration_settings(state: St<'_>) -> Result<serde_json::Value, String> {
+    let db = &state.db;
+    let ca_json = db.get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY);
+    let tuna_json = db.get_setting(crate::integrations::settings::TUNA_SETTINGS_KEY);
+    let control_api: crate::integrations::settings::ControlApiSettings = match ca_json {
+        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+        None => Default::default(),
+    };
+    let tuna: crate::integrations::settings::TunaSettings = match tuna_json {
+        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+        None => Default::default(),
+    };
+    let out = crate::integrations::settings::IntegrationSettings { control_api, tuna };
+    serde_json::to_value(out).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_integration_settings(state: St<'_>, settings: serde_json::Value) -> Result<(), String> {
+    let parsed: crate::integrations::settings::IntegrationSettings =
+        serde_json::from_value(settings).map_err(|e| format!("invalid settings: {e}"))?;
+    crate::integrations::settings::validate_control_api_settings(&parsed.control_api)
+        .map_err(|e| e.to_string())?;
+    // validate tuna url basic
+    if parsed.tuna.url.trim().is_empty() {
+        return Err("tuna url cannot be empty".to_string());
+    }
+    let db = &state.db;
+    db.set_setting(
+        crate::integrations::settings::CONTROL_API_SETTINGS_KEY,
+        &serde_json::to_string(&parsed.control_api).map_err(|e| e.to_string())?,
+    );
+    db.set_setting(
+        crate::integrations::settings::TUNA_SETTINGS_KEY,
+        &serde_json::to_string(&parsed.tuna).map_err(|e| e.to_string())?,
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_integration_status(state: St<'_>) -> Result<serde_json::Value, String> {
+    let db = &state.db;
+    let ca_json = db.get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY);
+    let tuna_json = db.get_setting(crate::integrations::settings::TUNA_SETTINGS_KEY);
+    let control_api: crate::integrations::settings::ControlApiSettings = match ca_json {
+        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+        None => Default::default(),
+    };
+    let tuna: crate::integrations::settings::TunaSettings = match tuna_json {
+        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+        None => Default::default(),
+    };
+    // milestone 1: no servers running yet
+    let status = crate::integrations::settings::IntegrationStatus {
+        control_api: crate::integrations::settings::ControlApiStatus {
+            enabled: control_api.enabled,
+            running: false,
+            bind_addr: if control_api.enabled { Some(control_api.bind.clone()) } else { None },
+            port: if control_api.enabled { Some(control_api.port) } else { None },
+            last_error: None,
+        },
+        tuna: crate::integrations::settings::TunaStatus {
+            enabled: tuna.enabled,
+            url: tuna.url.clone(),
+            last_ok_at_ms: None,
+            last_error: None,
+            backoff_secs: None,
+        },
+    };
+    serde_json::to_value(status).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn regenerate_control_api_token(state: St<'_>) -> Result<String, String> {
+    let token = crate::integrations::token::generate_token();
+    state.db.set_setting(crate::integrations::settings::CONTROL_API_TOKEN_KEY, &token);
+    // Note: milestone 1 has no server; when server is added, it must close all WS connections on regen.
+    Ok(token)
+}
