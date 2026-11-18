@@ -5075,7 +5075,9 @@ impl AppState {
                 items
                     .into_iter()
                     .map(|mut i| {
-                        i.queued_by = Some(by.clone());
+                        if i.queued_by.as_deref().unwrap_or("").trim().is_empty() {
+                            i.queued_by = Some(by.clone());
+                        }
                         i
                     })
                     .collect()
