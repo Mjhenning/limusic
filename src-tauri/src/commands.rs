@@ -3606,20 +3606,23 @@ pub async fn get_integration_settings(state: St<'_>) -> Result<serde_json::Value
 pub async fn set_integration_settings(state: St<'_>, settings: serde_json::Value) -> Result<(), String> {
     let parsed: crate::integrations::settings::IntegrationSettings =
         serde_json::from_value(settings).map_err(|e| format!("invalid settings: {e}"))?;
-    crate::integrations::settings::validate_control_api_settings(&parsed.control_api)
-        .map_err(|e| e.to_string())?;
-    // validate tuna url basic
-    if parsed.tuna.url.trim().is_empty() {
-        return Err("tuna url cannot be empty".to_string());
-    }
+    let control_api = crate::integrations::settings::validate_and_normalize_control_api_settings(
+        parsed.control_api,
+    )
+    .map_err(|e| e.to_string())?;
+    crate::integrations::settings::validate_tuna_url(&parsed.tuna.url).map_err(|e| e.to_string())?;
+    let tuna = crate::integrations::settings::TunaSettings {
+        enabled: parsed.tuna.enabled,
+        url: parsed.tuna.url.trim().to_string(),
+    };
     let db = &state.db;
     db.set_setting(
         crate::integrations::settings::CONTROL_API_SETTINGS_KEY,
-        &serde_json::to_string(&parsed.control_api).map_err(|e| e.to_string())?,
+        &serde_json::to_string(&control_api).map_err(|e| e.to_string())?,
     );
     db.set_setting(
         crate::integrations::settings::TUNA_SETTINGS_KEY,
-        &serde_json::to_string(&parsed.tuna).map_err(|e| e.to_string())?,
+        &serde_json::to_string(&tuna).map_err(|e| e.to_string())?,
     );
     Ok(())
 }

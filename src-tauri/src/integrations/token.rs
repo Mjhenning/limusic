@@ -1,9 +1,11 @@
-use rand::Rng;
+use rand::rngs::OsRng;
+use rand::RngCore;
+use subtle::ConstantTimeEq;
 
 pub fn generate_token() -> String {
-    // 32 random bytes -> hex string (64 chars)
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 32] = rng.gen();
+    // 32 random bytes from OS CSPRNG -> hex string (64 chars)
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
@@ -12,11 +14,7 @@ pub fn tokens_equal(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut diff: u8 = 0;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 #[cfg(test)]

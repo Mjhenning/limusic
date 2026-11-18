@@ -75,19 +75,36 @@ impl Default for IntegrationSettings {
     }
 }
 
-/// Validate control API settings. Returns Err(message) if invalid.
-pub fn validate_control_api_settings(s: &ControlApiSettings) -> Result<(), String> {
-    // bind must be 127.0.0.1 or 0.0.0.0 (or a valid IP) — be lenient but validate basics
-    let bind = s.bind.trim();
-    if bind != "127.0.0.1" && bind != "0.0.0.0" && bind != "localhost" {
-        // allow other IPs? plan says "validate the bind setting (IP address or the two presets)"
-        // try parse as IpAddr
+/// Validate and normalize control API settings. Returns normalized settings or Err.
+pub fn validate_and_normalize_control_api_settings(mut s: ControlApiSettings) -> Result<ControlApiSettings, String> {
+    let bind = s.bind.trim().to_string();
+    let bind = if bind.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1".to_string()
+    } else {
+        bind
+    };
+    if bind != "127.0.0.1" && bind != "0.0.0.0" {
         if bind.parse::<std::net::IpAddr>().is_err() {
             return Err(format!("invalid bind address: {}", bind));
         }
     }
-    if s.port == 0 {
-        return Err("port must be between 1 and 65535".to_string());
+    if s.port == 0 || s.port < 1024 {
+        return Err("port must be between 1024 and 65535".to_string());
+    }
+    s.bind = bind;
+    Ok(s)
+}
+
+pub fn validate_tuna_url(url: &str) -> Result<(), String> {
+    let u = url.trim();
+    let lower = u.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("tuna url must start with http:// or https://".to_string());
+    }
+    // Basic check: there must be something after scheme
+    let rest = if lower.starts_with("https://") { &u[8..] } else { &u[7..] };
+    if rest.trim().is_empty() || !rest.contains(|c: char| c != '/' && c != ' ') {
+        return Err("tuna url must include a host".to_string());
     }
     Ok(())
 }
@@ -117,20 +134,39 @@ mod tests {
     #[test]
     fn validate_bind_ok() {
         let mut s = ControlApiSettings::default();
-        assert!(validate_control_api_settings(&s).is_ok());
+        let s2 = validate_and_normalize_control_api_settings(s.clone()).unwrap();
+        assert_eq!(s2.bind, "127.0.0.1");
         s.bind = "0.0.0.0".to_string();
-        assert!(validate_control_api_settings(&s).is_ok());
+        assert!(validate_and_normalize_control_api_settings(s.clone()).is_ok());
         s.bind = "192.168.1.5".to_string();
-        assert!(validate_control_api_settings(&s).is_ok());
+        assert!(validate_and_normalize_control_api_settings(s.clone()).is_ok());
+        s.bind = "localhost".to_string();
+        let s3 = validate_and_normalize_control_api_settings(s.clone()).unwrap();
+        assert_eq!(s3.bind, "127.0.0.1");
     }
 
     #[test]
     fn validate_bind_bad() {
         let mut s = ControlApiSettings::default();
         s.bind = "not-an-ip".to_string();
-        assert!(validate_control_api_settings(&s).is_err());
+        assert!(validate_and_normalize_control_api_settings(s.clone()).is_err());
         s.bind = "127.0.0.1".to_string();
         s.port = 0;
-        assert!(validate_control_api_settings(&s).is_err());
+        assert!(validate_and_normalize_control_api_settings(s.clone()).is_err());
+        s.port = 80;
+        assert!(validate_and_normalize_control_api_settings(s.clone()).is_err());
+    }
+
+    #[test]
+    fn validate_tuna_url_ok() {
+        assert!(validate_tuna_url("http://127.0.0.1:1608/").is_ok());
+        assert!(validate_tuna_url("https://example.com/path").is_ok());
+    }
+
+    #[test]
+    fn validate_tuna_url_bad() {
+        assert!(validate_tuna_url("file:///etc/passwd").is_err());
+        assert!(validate_tuna_url("ftp://example.com").is_err());
+        assert!(validate_tuna_url("").is_err());
     }
 }

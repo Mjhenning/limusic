@@ -3561,6 +3561,7 @@ dependencies = [
  "sha2",
  "souvlaki",
  "strsim",
+ "subtle",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
