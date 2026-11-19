@@ -21,9 +21,9 @@ use tokio::sync::Mutex;
 use crate::db::{now_secs, Db, StoredAccount};
 use crate::devicelink::{LinkCommand, LinkSession, Publish, RemoteView};
 use crate::discord::DiscordHandle;
+use crate::integrations::hub::HubEvent;
 use crate::listentogether::{LtSession, SyncCommand};
 use crate::media::MediaHandle;
-use crate::integrations::hub::HubEvent;
 use crate::orchestrator::{Orchestrator, PlaybackData, PlaybackPing, ResolveError};
 
 /// Synthetic browseId for the On Repeat playlist. Not a YouTube id: `get_playlist` intercepts it
@@ -1886,11 +1886,7 @@ impl AppState {
             Some(if v.playing { RemoteAction::Pause } else { RemoteAction::Play })
         }) {
             // Shown at once; the other device's answer follows within a round trip.
-            self.emit_ui_event(
-                "playback-state",
-                if playing { "playing" } else { "paused" },
-                true,
-            );
+            self.emit_ui_event("playback-state", if playing { "playing" } else { "paused" }, true);
             return;
         }
         if self.lt.is_guest().await {
@@ -3767,6 +3763,30 @@ impl AppState {
         f64::from_bits(self.latest_position.load(Ordering::SeqCst))
     }
 
+    /// Read-only answer to "what would Skip/Previous select?" for an external controller. The
+    /// indices refer to the same snapshot order the UI shows, so shuffle needs no special case:
+    /// `queue_snapshot()` has already applied it.
+    pub async fn queue_navigation(&self) -> QueueNeighbors {
+        queue_neighbors_from_snapshot(&self.queue_snapshot().await)
+    }
+
+    /// True when a linked device, not this desktop, is the current player. Mutations from the
+    /// control API must be rejected with `remote_linked` in this state.
+    pub fn remote_linked(&self) -> bool {
+        self.link.linked() && !self.link.is_player()
+    }
+
+    /// The UI's Listen Together role, for status reporting by external controllers.
+    pub async fn lt_role(&self) -> String {
+        if self.lt.is_host().await {
+            "host".to_string()
+        } else if self.lt.is_guest().await {
+            "guest".to_string()
+        } else {
+            "none".to_string()
+        }
+    }
+
     /// Advance/rewind the queue (OS "next"/"previous" keys + the UI's skip buttons). `play_index`
     /// itself no-ops for guests.
     pub async fn next_in_queue(self: &std::sync::Arc<Self>) {
@@ -3781,10 +3801,7 @@ impl AppState {
     async fn next_in_queue_local(self: &std::sync::Arc<Self>) {
         let i = {
             let q = self.queue.lock().await;
-            // Manual next escapes a repeat-one loop (the next track then loops too), so treat One
-            // as All here: with any repeat engaged the queue wraps instead of dead-ending.
-            let repeat = if q.repeat == RepeatMode::One { RepeatMode::All } else { q.repeat };
-            next_index(q.items.len(), q.current, repeat)
+            manual_next_index(q.items.len(), q.current, q.repeat)
         };
         match i {
             Some(i) => self.play_index(i).await,
@@ -5024,7 +5041,9 @@ impl AppState {
             let _ = self.player.set_loop_file(q.repeat == RepeatMode::One);
             q.repeat
         };
-        if let Some(mode) = serde_json::to_value(mode).ok().and_then(|v| v.as_str().map(str::to_owned)) {
+        if let Some(mode) =
+            serde_json::to_value(mode).ok().and_then(|v| v.as_str().map(str::to_owned))
+        {
             self.publish_hub(HubEvent::RepeatChanged(mode));
         }
         self.emit_queue().await; // carries the new repeat state to the UI
@@ -5617,7 +5636,11 @@ impl AppState {
                 if let Some(v) = me.link.remote_view().filter(|v| v.playing && !held) {
                     let position = v.position_ms as f64 / 1000.0;
                     // Remote ticker ticks are UI-only: consumers run their own timer.
-                    me.emit_ui_event("position", serde_json::json!({ "position": position }), false);
+                    me.emit_ui_event(
+                        "position",
+                        serde_json::json!({ "position": position }),
+                        false,
+                    );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
@@ -5653,11 +5676,7 @@ impl AppState {
             self.emit_ui_event("queue-changed", queue, true);
             sent.1 = sig;
         }
-        self.emit_ui_event(
-            "playback-state",
-            if v.playing { "playing" } else { "paused" },
-            true,
-        );
+        self.emit_ui_event("playback-state", if v.playing { "playing" } else { "paused" }, true);
         let position = v.position_ms as f64 / 1000.0;
         self.emit_ui_event("position", serde_json::json!({ "position": position }), true);
         if let Some(m) = &self.media {
@@ -5671,11 +5690,7 @@ impl AppState {
         let snap = self.playback_snapshot().await;
         let paused = snap["paused"].as_bool().unwrap_or(true);
         self.emit_ui_event("now-playing", &snap["now"], true);
-        self.emit_ui_event(
-            "playback-state",
-            if paused { "paused" } else { "playing" },
-            true,
-        );
+        self.emit_ui_event("playback-state", if paused { "paused" } else { "playing" }, true);
         self.emit_ui_event("position", serde_json::json!({ "position": snap["position"] }), true);
         self.emit_ui_event("duration", serde_json::json!({ "duration": snap["duration"] }), true);
         // The windows hold the other device's rows: send ours whole, not just the index.
@@ -6180,6 +6195,40 @@ fn next_index(len: usize, current: usize, repeat: RepeatMode) -> Option<usize> {
         Some(0)
     } else {
         None
+    }
+}
+
+/// Read-only transport neighbors, shared by the control API and manual Skip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueueNeighbors {
+    pub next: Option<usize>,
+    pub previous: Option<usize>,
+}
+
+/// Manual Next escapes a repeat-one loop: the next track loops too, so behave like repeat-all.
+/// [`Self::queue_navigation`] uses the same rule so the API reports what Skip would actually do.
+fn manual_next_index(len: usize, current: usize, repeat: RepeatMode) -> Option<usize> {
+    next_index(len, current, if repeat == RepeatMode::One { RepeatMode::All } else { repeat })
+}
+
+/// Compute neighbors from the same JSON shape as `queue_snapshot()`, without touching locks or
+/// fetching autoplay. Shuffle is already reflected in the order of `items`.
+pub fn queue_neighbors_from_snapshot(snapshot: &serde_json::Value) -> QueueNeighbors {
+    let len = snapshot.get("items").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+    let current = snapshot
+        .get("currentIndex")
+        .or_else(|| snapshot.get("current"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let repeat = match snapshot.get("repeat").and_then(serde_json::Value::as_str) {
+        Some("all") => RepeatMode::All,
+        Some("one") => RepeatMode::One,
+        _ => RepeatMode::Off,
+    };
+    QueueNeighbors {
+        next: manual_next_index(len, current, repeat),
+        // Previous never wraps: `prev_in_queue` rewinds/restores context at the head instead.
+        previous: current.checked_sub(1),
     }
 }
 
@@ -6733,10 +6782,10 @@ mod tests {
         drop_duplicates, enqueue_at, format_duration, freshen, get_url, guest_insert_index,
         history_threshold, is_mix, loudness_gain, merge_radio, next_index, parse_duration_ms,
         persist_fingerprint, playlist_context, prefer_version, prev_track_title, put_url,
-        queue_fingerprint, radio_seed_for, remote_list, retain_upcoming, shuffle_new_queue,
-        shuffle_upcoming, splice_radio_into, swap_version, trim_played, twin_position, unshuffled,
-        upcoming_queued, QueueState, RepeatMode, VideoUrls, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX,
-        MAX_BOOST_DB,
+        queue_fingerprint, queue_neighbors_from_snapshot, radio_seed_for, remote_list,
+        retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into, swap_version,
+        trim_played, twin_position, unshuffled, upcoming_queued, QueueState, RepeatMode, VideoUrls,
+        KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
     };
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
@@ -7301,6 +7350,40 @@ mod tests {
         assert_eq!(next_index(3, 0, RepeatMode::Off), Some(1));
         assert_eq!(next_index(0, 0, RepeatMode::All), None);
         assert_eq!(next_index(1, 0, RepeatMode::All), Some(0)); // single-item wrap
+    }
+
+    #[test]
+    fn queue_neighbors_follow_snapshot_order_and_repeat() {
+        let snapshot = |ids: &[&str], current, repeat, shuffle| {
+            serde_json::json!({
+                "items": ids.iter().map(|id| serde_json::json!({ "videoId": id })).collect::<Vec<_>>(),
+                "currentIndex": current,
+                "repeat": repeat,
+                "shuffle": shuffle,
+                "autoplay": false,
+            })
+        };
+        let id = |snap: &serde_json::Value, index: Option<usize>| -> String {
+            index.and_then(|i| snap["items"][i]["videoId"].as_str()).unwrap_or("none").to_string()
+        };
+
+        let off = snapshot(&["a", "b", "c"], 0, "off", false);
+        assert_eq!(id(&off, queue_neighbors_from_snapshot(&off).next), "b");
+
+        // Shuffle only changes the snapshot's item order; the helper follows that order.
+        let shuffled = snapshot(&["b", "a", "c"], 0, "off", true);
+        assert_eq!(id(&shuffled, queue_neighbors_from_snapshot(&shuffled).next), "a");
+
+        let all = snapshot(&["a", "b", "c"], 2, "all", false);
+        assert_eq!(id(&all, queue_neighbors_from_snapshot(&all).next), "a");
+
+        let one = snapshot(&["a", "b", "c"], 2, "one", false);
+        assert_eq!(id(&one, queue_neighbors_from_snapshot(&one).next), "a");
+
+        let tail = snapshot(&["a", "b", "c"], 2, "off", false);
+        assert!(queue_neighbors_from_snapshot(&tail).next.is_none());
+        assert_eq!(id(&tail, queue_neighbors_from_snapshot(&tail).previous), "b");
+        assert_eq!(queue_neighbors_from_snapshot(&off).previous, None);
     }
 
     // The background playlist walk: a page that lands mid-playback has to reach the *unplayed*

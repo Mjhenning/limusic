@@ -9,6 +9,11 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Whether a persisted token still has the 64-hex shape we generate.
+pub fn is_well_formed(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Constant-time comparison for bearer tokens.
 pub fn tokens_equal(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
@@ -25,7 +30,10 @@ mod tests {
     fn token_roundtrip() {
         let t = generate_token();
         assert_eq!(t.len(), 64);
+        assert!(is_well_formed(&t));
         assert!(tokens_equal(&t, &t));
         assert!(!tokens_equal(&t, "wrong"));
+        assert!(!is_well_formed("short"));
+        assert!(!is_well_formed(&"z".repeat(64)));
     }
 }

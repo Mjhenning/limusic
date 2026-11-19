@@ -44,6 +44,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# Local control API. Pin the first axum 0.8: it uses hyper 1 / tower 0.5 / reqwest 0.12,
+# matching the lockfile, instead of the later reqwest 0.13. The ws feature is enabled now so
+# the WebSocket handler only needs to be added later.
+axum = { version = "=0.8.0", features = ["ws"] }
+async-trait = "0.1"
 
 innertube = { path = "../crates/innertube" }
 player = { path = "../crates/player" }
@@ -86,6 +91,7 @@ unicode-normalization = "0.1"
 [dev-dependencies]
 # Mock runtime for the IPC guard test (lib.rs `only_ui`).
 tauri = { version = "2", features = ["test"] }
+tower = { version = "0.5", features = ["util"] }
 
 # Letting a song notification show while Limusic is frontmost (notify.rs, #94). Same objc2 that
 # mac-notification-sys and tao already pull in.

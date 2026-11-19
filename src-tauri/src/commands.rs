@@ -12,6 +12,7 @@ use innertube::{
 use tauri::{Emitter, Manager, State};
 
 use crate::blocked::BlockedArtist;
+use crate::control_api::IntegrationsManager;
 use crate::state::{
     is_local_playlist, AppState, LOCAL_PLAYLIST_PREFIX, ON_REPEAT_ID, ON_REPEAT_LIMIT,
     ON_REPEAT_WINDOW_SECS,
@@ -3584,7 +3585,7 @@ mod tests {
     }
 }
 
-/// Integration settings (Control API + Tuna) — milestone 1
+/// Integration settings (Control API + Tuna)
 #[tauri::command]
 pub async fn get_integration_settings(state: St<'_>) -> Result<serde_json::Value, String> {
     let db = &state.db;
@@ -3603,14 +3604,19 @@ pub async fn get_integration_settings(state: St<'_>) -> Result<serde_json::Value
 }
 
 #[tauri::command]
-pub async fn set_integration_settings(state: St<'_>, settings: serde_json::Value) -> Result<(), String> {
+pub async fn set_integration_settings(
+    state: St<'_>,
+    manager: State<'_, Arc<IntegrationsManager>>,
+    settings: serde_json::Value,
+) -> Result<(), String> {
     let parsed: crate::integrations::settings::IntegrationSettings =
         serde_json::from_value(settings).map_err(|e| format!("invalid settings: {e}"))?;
     let control_api = crate::integrations::settings::validate_and_normalize_control_api_settings(
         parsed.control_api,
     )
     .map_err(|e| e.to_string())?;
-    crate::integrations::settings::validate_tuna_url(&parsed.tuna.url).map_err(|e| e.to_string())?;
+    crate::integrations::settings::validate_tuna_url(&parsed.tuna.url)
+        .map_err(|e| e.to_string())?;
     let tuna = crate::integrations::settings::TunaSettings {
         enabled: parsed.tuna.enabled,
         url: parsed.tuna.url.trim().to_string(),
@@ -3624,31 +3630,22 @@ pub async fn set_integration_settings(state: St<'_>, settings: serde_json::Value
         crate::integrations::settings::TUNA_SETTINGS_KEY,
         &serde_json::to_string(&tuna).map_err(|e| e.to_string())?,
     );
+    manager.apply_settings(control_api).await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn get_integration_status(state: St<'_>) -> Result<serde_json::Value, String> {
-    let db = &state.db;
-    let ca_json = db.get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY);
-    let tuna_json = db.get_setting(crate::integrations::settings::TUNA_SETTINGS_KEY);
-    let control_api: crate::integrations::settings::ControlApiSettings = match ca_json {
-        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
-        None => Default::default(),
-    };
+pub async fn get_integration_status(
+    state: St<'_>,
+    manager: State<'_, Arc<IntegrationsManager>>,
+) -> Result<serde_json::Value, String> {
+    let tuna_json = state.db.get_setting(crate::integrations::settings::TUNA_SETTINGS_KEY);
     let tuna: crate::integrations::settings::TunaSettings = match tuna_json {
         Some(s) => serde_json::from_str(&s).unwrap_or_default(),
         None => Default::default(),
     };
-    // milestone 1: no servers running yet
     let status = crate::integrations::settings::IntegrationStatus {
-        control_api: crate::integrations::settings::ControlApiStatus {
-            enabled: control_api.enabled,
-            running: false,
-            bind_addr: if control_api.enabled { Some(control_api.bind.clone()) } else { None },
-            port: if control_api.enabled { Some(control_api.port) } else { None },
-            last_error: None,
-        },
+        control_api: manager.control_api_status().await,
         tuna: crate::integrations::settings::TunaStatus {
             enabled: tuna.enabled,
             url: tuna.url.clone(),
@@ -3661,9 +3658,8 @@ pub async fn get_integration_status(state: St<'_>) -> Result<serde_json::Value, 
 }
 
 #[tauri::command]
-pub async fn regenerate_control_api_token(state: St<'_>) -> Result<String, String> {
-    let token = crate::integrations::token::generate_token();
-    state.db.set_setting(crate::integrations::settings::CONTROL_API_TOKEN_KEY, &token);
-    // Note: milestone 1 has no server; when server is added, it must close all WS connections on regen.
-    Ok(token)
+pub async fn regenerate_control_api_token(
+    manager: State<'_, Arc<IntegrationsManager>>,
+) -> Result<String, String> {
+    manager.regenerate_token().await
 }

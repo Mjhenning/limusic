@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedInput {
     MaybeVideoId(String),
@@ -41,10 +39,8 @@ fn is_likely_video_id(s: &str) -> bool {
 
 fn parse_url(s: &str) -> Result<ParsedInput, ParseError> {
     // Extract host
-    let without_scheme = s
-        .strip_prefix("https://")
-        .or_else(|| s.strip_prefix("http://"))
-        .unwrap_or(s);
+    let without_scheme =
+        s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).unwrap_or(s);
     let host_end = without_scheme.find('/').unwrap_or(without_scheme.len());
     let host = &without_scheme[..host_end];
     let host_lc = host.to_ascii_lowercase();
@@ -180,10 +176,7 @@ mod tests {
 
     #[test]
     fn parse_non_youtube_url() {
-        assert_eq!(
-            parse_input("https://vimeo.com/123456"),
-            Err(ParseError::UnsupportedUrl)
-        );
+        assert_eq!(parse_input("https://vimeo.com/123456"), Err(ParseError::UnsupportedUrl));
     }
 
     #[test]

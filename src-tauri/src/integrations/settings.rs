@@ -13,11 +13,7 @@ pub struct ControlApiSettings {
 
 impl Default for ControlApiSettings {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            bind: "127.0.0.1".to_string(),
-            port: 27199,
-        }
+        Self { enabled: false, bind: "127.0.0.1".to_string(), port: 27199 }
     }
 }
 
@@ -29,14 +25,11 @@ pub struct TunaSettings {
 
 impl Default for TunaSettings {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            url: "http://127.0.0.1:1608/".to_string(),
-        }
+        Self { enabled: false, url: "http://127.0.0.1:1608/".to_string() }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlApiStatus {
     pub enabled: bool,
     pub running: bool,
@@ -68,21 +61,16 @@ pub struct IntegrationSettings {
 
 impl Default for IntegrationSettings {
     fn default() -> Self {
-        Self {
-            control_api: ControlApiSettings::default(),
-            tuna: TunaSettings::default(),
-        }
+        Self { control_api: ControlApiSettings::default(), tuna: TunaSettings::default() }
     }
 }
 
 /// Validate and normalize control API settings. Returns normalized settings or Err.
-pub fn validate_and_normalize_control_api_settings(mut s: ControlApiSettings) -> Result<ControlApiSettings, String> {
+pub fn validate_and_normalize_control_api_settings(
+    mut s: ControlApiSettings,
+) -> Result<ControlApiSettings, String> {
     let bind = s.bind.trim().to_string();
-    let bind = if bind.eq_ignore_ascii_case("localhost") {
-        "127.0.0.1".to_string()
-    } else {
-        bind
-    };
+    let bind = if bind.eq_ignore_ascii_case("localhost") { "127.0.0.1".to_string() } else { bind };
     if bind != "127.0.0.1" && bind != "0.0.0.0" {
         if bind.parse::<std::net::IpAddr>().is_err() {
             return Err(format!("invalid bind address: {}", bind));

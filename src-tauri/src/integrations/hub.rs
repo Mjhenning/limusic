@@ -15,7 +15,9 @@ pub enum HubEvent {
     Duration(f64),
     /// `queue-changed`, `queue-index` and `queue-appended` all collapse into this. Consumers
     /// fetch `queue_snapshot()` when they need the rows.
-    QueueChanged { current: Option<usize> },
+    QueueChanged {
+        current: Option<usize>,
+    },
     ShuffleChanged(bool),
     RepeatChanged(String),
     Volume(i64),
@@ -34,19 +36,18 @@ impl HubEvent {
         match event {
             "now-playing" => Some(Self::NowPlaying(payload.clone())),
             "playback-state" => payload.as_str().map(|s| Self::PlaybackState(s.to_string())),
-            "position" => payload
-                .get("position")
-                .and_then(serde_json::Value::as_f64)
-                .map(Self::PositionSet),
-            "duration" => payload
-                .get("duration")
-                .and_then(serde_json::Value::as_f64)
-                .map(Self::Duration),
-            "queue-changed" | "queue-index" | "queue-appended" => {
-                Some(Self::QueueChanged {
-                    current: payload.get("currentIndex").and_then(serde_json::Value::as_u64).map(|v| v as usize),
-                })
+            "position" => {
+                payload.get("position").and_then(serde_json::Value::as_f64).map(Self::PositionSet)
             }
+            "duration" => {
+                payload.get("duration").and_then(serde_json::Value::as_f64).map(Self::Duration)
+            }
+            "queue-changed" | "queue-index" | "queue-appended" => Some(Self::QueueChanged {
+                current: payload
+                    .get("currentIndex")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|v| v as usize),
+            }),
             "volume" => payload.as_i64().map(Self::Volume),
             "track-loading" => payload.as_str().map(|s| Self::TrackLoading(s.to_string())),
             "track-failed" => payload

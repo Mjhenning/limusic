@@ -6,8 +6,8 @@ mod autopause;
 mod blocked;
 mod cipher;
 mod commands;
+mod control_api;
 mod db;
-mod integrations;
 mod devicelink;
 mod diagnostics;
 mod discord;
@@ -16,6 +16,7 @@ mod http;
 mod import;
 #[cfg(target_os = "linux")]
 mod inhibit;
+mod integrations;
 mod karaoke;
 mod karaoke_model;
 mod karaoke_runtime;
@@ -1072,6 +1073,12 @@ pub fn run() {
             ));
             app.manage(app_state.clone());
 
+            let integrations = Arc::new(control_api::IntegrationsManager::new(app_state.clone()));
+            app.manage(integrations.clone());
+            tauri::async_runtime::spawn(async move {
+                integrations.start_from_settings().await;
+            });
+
             // Debug builds log the UI mirror so integration work can verify it without a WS
             // client. Release builds pay for neither the subscriber nor the tracing calls.
             if cfg!(debug_assertions) {
@@ -1614,6 +1621,9 @@ pub fn run() {
                 if let Some(state) = handle.try_state::<Arc<AppState>>() {
                     state.flush_position();
                 }
+                if let Some(manager) = handle.try_state::<Arc<control_api::IntegrationsManager>>() {
+                    tauri::async_runtime::block_on(manager.stop());
+                }
                 mini::save_position(handle);
             }
         });
@@ -1698,11 +1708,7 @@ fn spawn_event_pump(
                 }
                 PlayerEvent::Duration(d) => {
                     if !state.showing_remote() {
-                        state.emit_ui_event(
-                            "duration",
-                            serde_json::json!({ "duration": d }),
-                            true,
-                        );
+                        state.emit_ui_event("duration", serde_json::json!({ "duration": d }), true);
                     }
                     state.on_duration(d).await;
                 }
