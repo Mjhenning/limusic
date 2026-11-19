@@ -148,6 +148,7 @@ impl IntegrationsManager {
                 tracing::info!(%addr, "control API listening");
             }
             Err(e) => {
+                tracing::warn!(error = %e, "control API bind failed");
                 status.last_error = Some(e.to_string());
                 self.inner.lock().await.status = status;
             }

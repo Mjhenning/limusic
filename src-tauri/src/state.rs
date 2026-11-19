@@ -3773,7 +3773,7 @@ impl AppState {
     /// True when a linked device, not this desktop, is the current player. Mutations from the
     /// control API must be rejected with `remote_linked` in this state.
     pub fn remote_linked(&self) -> bool {
-        self.link.linked() && !self.link.is_player()
+        self.link_target().is_some()
     }
 
     /// The UI's Listen Together role, for status reporting by external controllers.
@@ -5709,13 +5709,20 @@ impl AppState {
         }
     }
 
+    /// The one predicate that decides whether a command goes to another linked device. Both
+    /// `link_route` (command forwarding) and `remote_linked` (API mutation gating) call it, so a
+    /// control that is forwarded is also reported as linked to external callers.
+    fn link_target(&self) -> Option<RemoteView> {
+        if !self.showing_remote() {
+            return None;
+        }
+        self.link.remote_view()
+    }
+
     /// While the windows show another device, playback goes there: `action` picks what to send
     /// (nothing, for what it can't do). True when the call was the other device's.
     fn link_route(&self, action: impl FnOnce(&RemoteView) -> Option<RemoteAction>) -> bool {
-        if !self.showing_remote() {
-            return false;
-        }
-        let Some(v) = self.link.remote_view() else { return false };
+        let Some(v) = self.link_target() else { return false };
         if let Some(a) = action(&v) {
             self.link.remote(a, None);
         }
@@ -6203,6 +6210,8 @@ fn next_index(len: usize, current: usize, repeat: RepeatMode) -> Option<usize> {
 pub struct QueueNeighbors {
     pub next: Option<usize>,
     pub previous: Option<usize>,
+    /// True when `next` is absent only because a manual Skip would fetch autoplay at the tail.
+    pub next_is_autoplay_fetch: bool,
 }
 
 /// Manual Next escapes a repeat-one loop: the next track loops too, so behave like repeat-all.
@@ -6215,20 +6224,24 @@ fn manual_next_index(len: usize, current: usize, repeat: RepeatMode) -> Option<u
 /// fetching autoplay. Shuffle is already reflected in the order of `items`.
 pub fn queue_neighbors_from_snapshot(snapshot: &serde_json::Value) -> QueueNeighbors {
     let len = snapshot.get("items").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
-    let current = snapshot
-        .get("currentIndex")
-        .or_else(|| snapshot.get("current"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0) as usize;
+    let current =
+        snapshot.get("currentIndex").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
     let repeat = match snapshot.get("repeat").and_then(serde_json::Value::as_str) {
         Some("all") => RepeatMode::All,
         Some("one") => RepeatMode::One,
         _ => RepeatMode::Off,
     };
+    let next = manual_next_index(len, current, repeat);
     QueueNeighbors {
-        next: manual_next_index(len, current, repeat),
-        // Previous never wraps: `prev_in_queue` rewinds/restores context at the head instead.
+        next,
+        // Previous is always the row before current, regardless of the three-second restart
+        // rule in the transport command. That rule changes what a button press does, not what
+        // the queue shows.
         previous: current.checked_sub(1),
+        next_is_autoplay_fetch: next.is_none()
+            && len > 0
+            && repeat == RepeatMode::Off
+            && snapshot.get("autoplay").and_then(serde_json::Value::as_bool).unwrap_or(false),
     }
 }
 
@@ -7354,36 +7367,51 @@ mod tests {
 
     #[test]
     fn queue_neighbors_follow_snapshot_order_and_repeat() {
-        let snapshot = |ids: &[&str], current, repeat, shuffle| {
+        let snapshot = |ids: &[&str], current, repeat, shuffle, autoplay, position| {
             serde_json::json!({
                 "items": ids.iter().map(|id| serde_json::json!({ "videoId": id })).collect::<Vec<_>>(),
                 "currentIndex": current,
                 "repeat": repeat,
                 "shuffle": shuffle,
-                "autoplay": false,
+                "autoplay": autoplay,
+                "position": position,
             })
         };
         let id = |snap: &serde_json::Value, index: Option<usize>| -> String {
             index.and_then(|i| snap["items"][i]["videoId"].as_str()).unwrap_or("none").to_string()
         };
 
-        let off = snapshot(&["a", "b", "c"], 0, "off", false);
+        let off = snapshot(&["a", "b", "c"], 0, "off", false, false, 0.0);
         assert_eq!(id(&off, queue_neighbors_from_snapshot(&off).next), "b");
 
         // Shuffle only changes the snapshot's item order; the helper follows that order.
-        let shuffled = snapshot(&["b", "a", "c"], 0, "off", true);
+        let shuffled = snapshot(&["b", "a", "c"], 0, "off", true, false, 0.0);
         assert_eq!(id(&shuffled, queue_neighbors_from_snapshot(&shuffled).next), "a");
 
-        let all = snapshot(&["a", "b", "c"], 2, "all", false);
+        let all = snapshot(&["a", "b", "c"], 2, "all", false, false, 0.0);
         assert_eq!(id(&all, queue_neighbors_from_snapshot(&all).next), "a");
 
-        let one = snapshot(&["a", "b", "c"], 2, "one", false);
+        let one = snapshot(&["a", "b", "c"], 2, "one", false, false, 0.0);
         assert_eq!(id(&one, queue_neighbors_from_snapshot(&one).next), "a");
 
-        let tail = snapshot(&["a", "b", "c"], 2, "off", false);
+        let tail = snapshot(&["a", "b", "c"], 2, "off", false, false, 0.0);
         assert!(queue_neighbors_from_snapshot(&tail).next.is_none());
-        assert_eq!(id(&tail, queue_neighbors_from_snapshot(&tail).previous), "b");
+        assert!(!queue_neighbors_from_snapshot(&tail).next_is_autoplay_fetch);
+
+        // Previous is the preceding row even well past the transport's three-second rewind.
+        let late = snapshot(&["a", "b", "c"], 2, "off", false, false, 25.0);
+        assert_eq!(id(&late, queue_neighbors_from_snapshot(&late).previous), "b");
         assert_eq!(queue_neighbors_from_snapshot(&off).previous, None);
+
+        // Only a repeat-off tail with autoplay enabled would fetch a continuation.
+        let fetching = snapshot(&["a", "b", "c"], 2, "off", false, true, 25.0);
+        let neighbors = queue_neighbors_from_snapshot(&fetching);
+        assert!(neighbors.next.is_none());
+        assert!(neighbors.next_is_autoplay_fetch);
+        assert_eq!(id(&fetching, neighbors.previous), "b");
+
+        let wrapped = snapshot(&["a", "b", "c"], 2, "all", false, true, 0.0);
+        assert!(!queue_neighbors_from_snapshot(&wrapped).next_is_autoplay_fetch);
     }
 
     // The background playlist walk: a page that lands mid-playback has to reach the *unplayed*

@@ -57,9 +57,9 @@ async fn status(State(shared): State<Arc<ApiShared>>) -> Response {
     let mut snap = shared.context.playback_snapshot().await;
     if let Some(object) = snap.as_object_mut() {
         object.insert("linked".into(), json!(shared.context.remote_linked()));
-        object.insert("remoteLinked".into(), json!(shared.context.remote_linked()));
+        object.insert("remote_linked".into(), json!(shared.context.remote_linked()));
         object.insert(
-            "listenTogetherRole".into(),
+            "listen_together_role".into(),
             json!(shared.context.listen_together_role().await),
         );
     }
@@ -81,16 +81,16 @@ async fn now_playing(State(shared): State<Arc<ApiShared>>) -> Response {
 }
 
 /// `GET /api/v1/queue`: the UI queue snapshot plus read-only `next`/`previous` track objects.
-/// `current` mirrors `currentIndex`; both are included because older callers used either name.
-/// `next` and `previous` are `null` when there is no such row in the current (possibly shuffled)
-/// snapshot. Autoplay is never fetched here, so a tail with repeat off has no `next` until the
-/// continuation has actually been appended.
+/// Item objects are unchanged. `current_index` mirrors the existing `currentIndex`; new top-level
+/// fields are snake_case. `next` and `previous` are `null` when there is no such row in the current
+/// (possibly shuffled) snapshot. `next_is_autoplay_fetch` says that a repeat-off tail would need
+/// to fetch autoplay; the read itself never fetches or mutates state.
 async fn queue(State(shared): State<Arc<ApiShared>>) -> Response {
     let mut snap = shared.context.queue_snapshot().await;
     let neighbors: QueueNeighbors = shared.context.queue_neighbors().await;
     if let Some(object) = snap.as_object_mut() {
         let current = object.get("currentIndex").cloned().unwrap_or(json!(0));
-        object.insert("current".into(), current);
+        object.insert("current_index".into(), current);
         let items = object.get("items").and_then(Value::as_array).cloned();
         let track = |index: Option<usize>| -> Value {
             index
@@ -100,8 +100,9 @@ async fn queue(State(shared): State<Arc<ApiShared>>) -> Response {
         };
         object.insert("next".into(), track(neighbors.next));
         object.insert("previous".into(), track(neighbors.previous));
-        object.insert("nextIndex".into(), json!(neighbors.next));
-        object.insert("previousIndex".into(), json!(neighbors.previous));
+        object.insert("next_index".into(), json!(neighbors.next));
+        object.insert("previous_index".into(), json!(neighbors.previous));
+        object.insert("next_is_autoplay_fetch".into(), json!(neighbors.next_is_autoplay_fetch));
     }
     Json(snap).into_response()
 }
@@ -137,7 +138,7 @@ mod tests {
         }
 
         async fn queue_neighbors(&self) -> QueueNeighbors {
-            QueueNeighbors { next: Some(1), previous: None }
+            QueueNeighbors { next: Some(1), previous: None, next_is_autoplay_fetch: false }
         }
 
         fn remote_linked(&self) -> bool {
@@ -187,8 +188,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["listenTogetherRole"], "none");
-        assert_eq!(json["remoteLinked"], false);
+        assert_eq!(json["listen_together_role"], "none");
+        assert_eq!(json["remote_linked"], false);
     }
 
     #[tokio::test]
@@ -197,9 +198,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["current"], 0);
+        assert_eq!(json["current_index"], 0);
+        assert_eq!(json["currentIndex"], 0);
         assert_eq!(json["next"]["videoId"], "b");
         assert_eq!(json["next"]["queued_by"], "friend");
+        assert_eq!(json["next_is_autoplay_fetch"], false);
         assert!(json["previous"].is_null());
     }
 

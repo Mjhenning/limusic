@@ -190,12 +190,6 @@ impl LinkSession {
         self.lock().config.is_some()
     }
 
-    /// Whether this desktop is the linked room's current player. Local playback commands are only
-    /// safe when this is true (or when no device is linked at all).
-    pub fn is_player(&self) -> bool {
-        self.lock().is_player()
-    }
-
     /// Send a playback change through the [`send_rule`]. Never blocks.
     pub fn publish(&self, mut p: Playback) -> Publish {
         let decision = {
