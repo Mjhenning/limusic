@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 use crate::db::Db;
@@ -222,7 +222,7 @@ pub fn execute_action(app: &AppHandle, action: HotkeyAction) {
 
 /// Read, change, set, persist and echo the volume, the same as a slider commit. Serialized: each
 /// press is its own task, so a held key would otherwise lose steps and two mutes could both mute.
-pub(crate) fn change_volume(state: &AppState, app: &AppHandle, f: impl FnOnce(i64) -> i64) {
+pub(crate) fn change_volume(state: &AppState, _app: &AppHandle, f: impl FnOnce(i64) -> i64) {
     static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock().unwrap();
     let volume = f(state.player.volume()).clamp(0, 100);
@@ -231,7 +231,7 @@ pub(crate) fn change_volume(state: &AppState, app: &AppHandle, f: impl FnOnce(i6
             LAST_NONZERO_VOLUME.store(volume, Ordering::Relaxed);
         }
         state.db.set_setting("volume", &volume.to_string());
-        let _ = app.emit("volume", volume);
+        state.emit_ui_event("volume", volume, true);
         state.media_set_volume(volume);
     }
 }

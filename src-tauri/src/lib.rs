@@ -1072,6 +1072,12 @@ pub fn run() {
             ));
             app.manage(app_state.clone());
 
+            // Debug builds log the UI mirror so integration work can verify it without a WS
+            // client. Release builds pay for neither the subscriber nor the tracing calls.
+            if cfg!(debug_assertions) {
+                crate::integrations::hub::spawn_debug_logger(app_state.ui_events.subscribe());
+            }
+
             app_state.set_auto_pause_enabled(
                 app_state.db.get_setting("auto_pause_other_audio").as_deref() == Some("true"),
             );
@@ -1681,28 +1687,41 @@ fn spawn_event_pump(
                     // Quiet while the windows show another linked device's playback.
                     if throttle.should_emit(p, std::time::Instant::now()) && !state.showing_remote()
                     {
-                        let _ = app.emit("position", serde_json::json!({ "position": p }));
+                        // mpv ticks are UI-only; integrations use their own timer.
+                        state.emit_ui_event(
+                            "position",
+                            serde_json::json!({ "position": p }),
+                            false,
+                        );
                     }
                     state.on_position(p).await;
                 }
                 PlayerEvent::Duration(d) => {
                     if !state.showing_remote() {
-                        let _ = app.emit("duration", serde_json::json!({ "duration": d }));
+                        state.emit_ui_event(
+                            "duration",
+                            serde_json::json!({ "duration": d }),
+                            true,
+                        );
                     }
                     state.on_duration(d).await;
                 }
                 PlayerEvent::Playing(playing) => {
                     let remote = state.showing_remote();
                     if !remote {
-                        let _ =
-                            app.emit("playback-state", if playing { "playing" } else { "paused" });
+                        state.emit_ui_event(
+                            "playback-state",
+                            if playing { "playing" } else { "paused" },
+                            true,
+                        );
                     }
                     if !playing {
                         state.flush_position(); // persist exact resume position on pause
                         if !remote {
-                            let _ = app.emit(
+                            state.emit_ui_event(
                                 "position",
                                 serde_json::json!({ "position": state.current_position() }),
+                                true,
                             );
                         }
                     }
@@ -1738,17 +1757,22 @@ fn spawn_event_pump(
                             Some(c) => format!("{msg} ({c})"),
                             None => msg,
                         };
-                        let _ = app.emit("playback-error", serde_json::json!({ "message": msg }));
+                        state.emit_ui_event(
+                            "playback-error",
+                            serde_json::json!({ "message": msg }),
+                            true,
+                        );
                     }
                 }
                 PlayerEvent::AudioDeviceLost => {
                     tracing::warn!("audio device unavailable, holding the queue where it is");
                     state.on_audio_device_lost().await;
-                    let _ = app.emit(
+                    state.emit_ui_event(
                         "playback-error",
                         serde_json::json!({
                             "message": "Your audio device is unavailable. Press play once it's back."
                         }),
+                        true,
                     );
                 }
                 PlayerEvent::LookaheadFailed(msg) => {
@@ -1760,7 +1784,11 @@ fn spawn_event_pump(
                 PlayerEvent::VideoFailed(audio) => state.on_video_failed(&audio).await,
                 PlayerEvent::Error(msg) => {
                     tracing::error!(error = %msg, "player error");
-                    let _ = app.emit("playback-error", serde_json::json!({ "message": msg }));
+                    state.emit_ui_event(
+                        "playback-error",
+                        serde_json::json!({ "message": msg }),
+                        true,
+                    );
                 }
             }
         }

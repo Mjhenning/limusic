@@ -23,6 +23,7 @@ use crate::devicelink::{LinkCommand, LinkSession, Publish, RemoteView};
 use crate::discord::DiscordHandle;
 use crate::listentogether::{LtSession, SyncCommand};
 use crate::media::MediaHandle;
+use crate::integrations::hub::HubEvent;
 use crate::orchestrator::{Orchestrator, PlaybackData, PlaybackPing, ResolveError};
 
 /// Synthetic browseId for the On Repeat playlist. Not a YouTube id: `get_playlist` intercepts it
@@ -71,6 +72,8 @@ pub struct AppState {
     pub orchestrator: Arc<Orchestrator>,
     /// Listen Together session (context/19). Drives host broadcasts + guest gating.
     pub lt: Arc<LtSession>,
+    /// Mirror of the UI event stream for optional integrations (WS/Tuna). Not a playback source.
+    pub ui_events: tokio::sync::broadcast::Sender<HubEvent>,
     // Serialize effect commands with the room's tempo reset, including requests already pending.
     playback_effects: Mutex<()>,
     /// Device link: the phone as a remote, and Continue here (`crate::devicelink`).
@@ -544,6 +547,7 @@ impl AppState {
         discord: Option<DiscordHandle>,
         lastfm: crate::lastfm::LastfmHandle,
     ) -> Self {
+        let (ui_events, _) = tokio::sync::broadcast::channel(256);
         AppState {
             it,
             clients,
@@ -552,6 +556,7 @@ impl AppState {
             app,
             orchestrator,
             lt,
+            ui_events,
             link,
             cache_dir,
             media,
@@ -1881,7 +1886,11 @@ impl AppState {
             Some(if v.playing { RemoteAction::Pause } else { RemoteAction::Play })
         }) {
             // Shown at once; the other device's answer follows within a round trip.
-            let _ = self.app.emit("playback-state", if playing { "playing" } else { "paused" });
+            self.emit_ui_event(
+                "playback-state",
+                if playing { "playing" } else { "paused" },
+                true,
+            );
             return;
         }
         if self.lt.is_guest().await {
@@ -3920,9 +3929,11 @@ impl AppState {
 
     fn emit_error(&self, video_id: &str, message: &str) {
         tracing::error!(video_id, message, "playback error");
-        let _ = self
-            .app
-            .emit("playback-error", serde_json::json!({ "videoId": video_id, "message": message }));
+        self.emit_ui_event(
+            "playback-error",
+            serde_json::json!({ "videoId": video_id, "message": message }),
+            true,
+        );
     }
 
     /// Guest tried a host-only playback action — explain instead of silently ignoring.
@@ -4890,7 +4901,11 @@ impl AppState {
         if self.link_route(|_| Some(RemoteAction::Seek { position_ms })) {
             *self.remote_hold.lock().unwrap() =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
-            let _ = self.app.emit("position", serde_json::json!({ "position": position.max(0.0) }));
+            self.emit_ui_event(
+                "position",
+                serde_json::json!({ "position": position.max(0.0) }),
+                true,
+            );
             return Ok(());
         }
         if self.lt.is_guest().await {
@@ -4929,7 +4944,7 @@ impl AppState {
             self.emit_guest_hint();
             return;
         }
-        {
+        let shuffle = {
             let mut q = self.queue.lock().await;
             if q.items.is_empty() {
                 return;
@@ -4954,7 +4969,9 @@ impl AppState {
             if q.lookahead_loaded.take().is_some() {
                 let _ = self.player.clear_playlist();
             }
-        }
+            q.shuffle_orig.is_some()
+        };
+        self.publish_hub(HubEvent::ShuffleChanged(shuffle));
         self.emit_queue().await;
         self.persist_queue().await;
         let gen = self.generation.load(Ordering::SeqCst);
@@ -5001,10 +5018,14 @@ impl AppState {
             self.emit_guest_hint();
             return;
         }
-        {
+        let mode = {
             let mut q = self.queue.lock().await;
             q.repeat = next(q.repeat);
             let _ = self.player.set_loop_file(q.repeat == RepeatMode::One);
+            q.repeat
+        };
+        if let Some(mode) = serde_json::to_value(mode).ok().and_then(|v| v.as_str().map(str::to_owned)) {
+            self.publish_hub(HubEvent::RepeatChanged(mode));
         }
         self.emit_queue().await; // carries the new repeat state to the UI
         self.persist_queue().await;
@@ -5554,11 +5575,34 @@ impl AppState {
         self.remote_on.load(Ordering::SeqCst)
     }
 
+    /// Single choke point for UI mirrors: emit to the webviews, then (unless the caller opts out)
+    /// publish the same event to the integrations hub. Continuous mpv ticks pass `hub = false`;
+    /// everything else here mirrors what the UI is actually shown.
+    pub(crate) fn emit_ui_event<S: serde::Serialize + Clone>(
+        &self,
+        event: &str,
+        payload: S,
+        hub: bool,
+    ) {
+        let mirror = hub
+            .then(|| serde_json::to_value(&payload).ok())
+            .flatten()
+            .and_then(|value| HubEvent::from_ui_event(event, &value, true));
+        let _ = self.app.emit(event, payload);
+        if let Some(event) = mirror {
+            let _ = self.ui_events.send(event);
+        }
+    }
+
+    pub(crate) fn publish_hub(&self, event: HubEvent) {
+        let _ = self.ui_events.send(event);
+    }
+
     /// The windows' playback events from this desktop's own player. Quiet while they show another
     /// device's, which `emit_remote` sends instead.
     fn emit_own<S: serde::Serialize + Clone>(&self, event: &str, payload: S) {
         if !self.showing_remote() {
-            let _ = self.app.emit(event, payload);
+            self.emit_ui_event(event, payload, true);
         }
     }
 
@@ -5572,7 +5616,8 @@ impl AppState {
                 let held = me.remote_hold.lock().unwrap().is_some_and(|t| t > now);
                 if let Some(v) = me.link.remote_view().filter(|v| v.playing && !held) {
                     let position = v.position_ms as f64 / 1000.0;
-                    let _ = me.app.emit("position", serde_json::json!({ "position": position }));
+                    // Remote ticker ticks are UI-only: consumers run their own timer.
+                    me.emit_ui_event("position", serde_json::json!({ "position": position }), false);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
@@ -5593,10 +5638,10 @@ impl AppState {
                 song.duration = Some(format_duration(duration_ms));
             }
             let now = Self::now_playing_json(&song, "remote", false);
-            let _ = self.app.emit("now-playing", now);
+            self.emit_ui_event("now-playing", now, true);
             crate::windowtitle::apply(&self.app, Some(&song));
             let duration = duration_ms as f64 / 1000.0;
-            let _ = self.app.emit("duration", serde_json::json!({ "duration": duration }));
+            self.emit_ui_event("duration", serde_json::json!({ "duration": duration }), true);
             // The OS widget too: its keys already reach the other device (`link_route`).
             self.media_show(&song);
             if let Some(m) = &self.media {
@@ -5605,12 +5650,16 @@ impl AppState {
             sent.0 = key;
         }
         if all || sent.1 != sig {
-            let _ = self.app.emit("queue-changed", queue);
+            self.emit_ui_event("queue-changed", queue, true);
             sent.1 = sig;
         }
-        let _ = self.app.emit("playback-state", if v.playing { "playing" } else { "paused" });
+        self.emit_ui_event(
+            "playback-state",
+            if v.playing { "playing" } else { "paused" },
+            true,
+        );
         let position = v.position_ms as f64 / 1000.0;
-        let _ = self.app.emit("position", serde_json::json!({ "position": position }));
+        self.emit_ui_event("position", serde_json::json!({ "position": position }), true);
         if let Some(m) = &self.media {
             m.set_playback(v.playing, position, 1.0);
         }
@@ -5621,10 +5670,14 @@ impl AppState {
         *self.remote_sent.lock().unwrap() = Default::default();
         let snap = self.playback_snapshot().await;
         let paused = snap["paused"].as_bool().unwrap_or(true);
-        let _ = self.app.emit("now-playing", &snap["now"]);
-        let _ = self.app.emit("playback-state", if paused { "paused" } else { "playing" });
-        let _ = self.app.emit("position", serde_json::json!({ "position": snap["position"] }));
-        let _ = self.app.emit("duration", serde_json::json!({ "duration": snap["duration"] }));
+        self.emit_ui_event("now-playing", &snap["now"], true);
+        self.emit_ui_event(
+            "playback-state",
+            if paused { "paused" } else { "playing" },
+            true,
+        );
+        self.emit_ui_event("position", serde_json::json!({ "position": snap["position"] }), true);
+        self.emit_ui_event("duration", serde_json::json!({ "duration": snap["duration"] }), true);
         // The windows hold the other device's rows: send ours whole, not just the index.
         self.last_queue_fingerprint.store(0, Ordering::Relaxed);
         self.emit_queue().await;
