@@ -3296,7 +3296,7 @@ impl AppState {
     /// window that asks for the current track can't be told a different shape than one that
     /// listened for it.
     fn now_playing_json(item: &SongItem, stream_client: &str, live: bool) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "videoId": item.video_id,
             "title": item.title,
             "artists": item.artists,
@@ -3317,7 +3317,15 @@ impl AppState {
             "isEpisode": item.is_episode,
             // A broadcast on air: no length, nothing to seek, a Live badge for the bar (#424).
             "live": live,
-        })
+        });
+        // Integrations consumers get the current row's attribution here too, so they don't have
+        // to cross-reference `/queue`. Omitted when absent, exactly like queue item objects.
+        if let Some(by) = &item.queued_by {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("queued_by".into(), serde_json::json!(by));
+            }
+        }
+        value
     }
 
     /// What a window that opened mid-playback missed. Events are fire-and-forget, so the mini

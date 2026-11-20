@@ -100,6 +100,15 @@ mod tests {
     }
 
     #[test]
+    fn now_playing_keeps_queued_by() {
+        let payload = serde_json::json!({ "videoId": "abc", "queued_by": "friend" });
+        match HubEvent::from_ui_event("now-playing", &payload, true) {
+            Some(HubEvent::NowPlaying(now)) => assert_eq!(now["queued_by"], "friend"),
+            other => panic!("expected now-playing, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn ignores_unrelated_events() {
         assert!(HubEvent::from_ui_event("karaoke", &serde_json::json!({}), true).is_none());
     }
