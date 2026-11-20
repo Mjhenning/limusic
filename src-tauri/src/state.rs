@@ -3873,6 +3873,98 @@ impl AppState {
         self.queue.lock().await.items.len()
     }
 
+    /// Resolve one control-API request. A bare/URL id is looked up with `/next` first and only
+    /// falls back to a songs search when that lookup says not-found; a text query goes straight to
+    /// the songs filter. The chosen row is then enriched from `/player` so duration is authoritative.
+    pub async fn resolve_control_input(
+        &self,
+        parsed: &crate::integrations::parse::ParsedInput,
+    ) -> Result<SongItem, crate::control_api::types::ResolveError> {
+        use crate::control_api::types::ResolveError;
+        use crate::integrations::parse::ParsedInput;
+
+        let item = match parsed {
+            ParsedInput::Query(query) => self.search_song_for_request(query).await?,
+            ParsedInput::MaybeVideoId(video_id) => {
+                match self.song_by_id_for_request(video_id).await {
+                    Ok(item) => item,
+                    Err(ResolveError::NotFound) => self.search_song_for_request(video_id).await?,
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        self.fill_request_metadata(item).await
+    }
+
+    async fn song_by_id_for_request(
+        &self,
+        video_id: &str,
+    ) -> Result<SongItem, crate::control_api::types::ResolveError> {
+        use crate::control_api::types::ResolveError;
+        let client = self
+            .clients
+            .get(innertube::METADATA_CLIENT)
+            .ok_or_else(|| ResolveError::ResolveFailed("metadata client missing".into()))?;
+        let next = self
+            .it
+            .next(client, Some(video_id), None)
+            .await
+            .map_err(|e| request_resolve_error(&e))?;
+        next.items.into_iter().find(|item| item.video_id == video_id).ok_or(ResolveError::NotFound)
+    }
+
+    async fn search_song_for_request(
+        &self,
+        query: &str,
+    ) -> Result<SongItem, crate::control_api::types::ResolveError> {
+        use crate::control_api::types::ResolveError;
+        let client = self
+            .clients
+            .get(innertube::METADATA_CLIENT)
+            .ok_or_else(|| ResolveError::ResolveFailed("metadata client missing".into()))?;
+        let result = self
+            .it
+            .search_songs(client, query, true)
+            .await
+            .map_err(|e| request_resolve_error(&e))?;
+        result
+            .items
+            .into_iter()
+            .find(|item| !item.is_video && !item.is_episode)
+            .ok_or(ResolveError::NotFound)
+    }
+
+    async fn fill_request_metadata(
+        &self,
+        mut item: SongItem,
+    ) -> Result<SongItem, crate::control_api::types::ResolveError> {
+        use crate::control_api::types::ResolveError;
+        let client = self
+            .clients
+            .get(innertube::METADATA_CLIENT)
+            .ok_or_else(|| ResolveError::ResolveFailed("metadata client missing".into()))?;
+        let player = self
+            .it
+            .player(client, &item.video_id, None, None, None)
+            .await
+            .map_err(|e| request_resolve_error(&e))?;
+        let details = player.video_details.as_ref();
+        if details.and_then(|v| v.is_live).unwrap_or(false) {
+            return Err(ResolveError::LiveStream);
+        }
+        if !player.playability_status.is_ok() && details.is_none() {
+            return Err(ResolveError::NotFound);
+        }
+        backfill_metadata(
+            &mut item,
+            details.and_then(|v| v.length_seconds.as_deref()),
+            details.and_then(|v| v.author.as_deref()),
+            details.and_then(|v| v.is_music_video()),
+            details.and_then(|v| v.is_podcast_episode()),
+        );
+        Ok(item)
+    }
+
     /// True when a linked device, not this desktop, is the current player. Mutations from the
     /// control API must be rejected with `remote_linked` in this state.
     pub fn remote_linked(&self) -> bool {
@@ -5252,15 +5344,59 @@ impl AppState {
     /// behind any earlier Play next ([`guest_insert_index`]). "Add to queue" marks them
     /// `queued_end` and puts them at the tail ([`enqueue_at`]). `from` names the album/playlist
     /// they came from, which keeps a walked playlist's later pages with their block.
-    async fn insert_queued(
+    ///
+    /// Returns the final index of the first inserted row, or `0` for an empty input. Callers that
+    /// came from the UI ignore it; the control API uses it as its `position` response field.
+    pub async fn insert_queued(
         self: &std::sync::Arc<Self>,
+        items: Vec<SongItem>,
+        next: bool,
+        from: Option<String>,
+    ) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+        let (index, was_empty) = {
+            let mut q = self.queue.lock().await;
+            self.insert_queued_inner(&mut q, items, next, from).await
+        };
+        self.finish_insert(was_empty).await;
+        index
+    }
+
+    /// Control-API variant: reject a duplicate *and* insert under one queue lock, so two chat
+    /// callers cannot both pass the check against the same pre-insert snapshot. `Ok` is the final
+    /// inserted index; `Err` is the index of the existing copy (including the current track).
+    /// `allow_duplicates` skips only this check — the user's global `prevent_duplicates` setting
+    /// still applies inside [`Self::insert_queued_inner`].
+    pub async fn insert_queued_checked(
+        self: &std::sync::Arc<Self>,
+        item: SongItem,
+        next: bool,
+        from: Option<String>,
+        allow_duplicates: bool,
+    ) -> Result<usize, usize> {
+        let mut q = self.queue.lock().await;
+        if !allow_duplicates {
+            if let Some(existing) = q.items.iter().position(|i| i.video_id == item.video_id) {
+                return Err(existing);
+            }
+        }
+        let (index, was_empty) = self.insert_queued_inner(&mut q, vec![item], next, from).await;
+        drop(q);
+        self.finish_insert(was_empty).await;
+        Ok(index)
+    }
+
+    /// The locked body of [`Self::insert_queued`]. Caller owns the queue guard, which is what lets
+    /// [`Self::insert_queued_checked`] keep its duplicate check and this splice atomic.
+    async fn insert_queued_inner(
+        self: &std::sync::Arc<Self>,
+        q: &mut QueueState,
         mut items: Vec<SongItem>,
         next: bool,
         from: Option<String>,
-    ) {
-        if items.is_empty() {
-            return;
-        }
+    ) -> (usize, bool) {
         for item in &mut items {
             item.queued = next;
             item.queued_end = !next;
@@ -5269,15 +5405,14 @@ impl AppState {
             item.autoplay = false;
         }
         let dedupe = self.db.get_setting("prevent_duplicates").as_deref() == Some("true");
-        let was_empty = {
-            let mut q = self.queue.lock().await;
-            let was_empty = q.items.is_empty();
-            let before = q.items.get(q.current + 1).map(|i| i.video_id.clone());
+        let (index, was_empty) = {
+            let qm = &mut *q;
+            let was_empty = qm.items.is_empty();
+            let before = qm.items.get(qm.current + 1).map(|i| i.video_id.clone());
             // "Prevent duplicates" is a *move*, not a reject: every existing copy goes, then the
             // tracks are spliced in at the target. `at` is computed after, so a copy removed from
             // before the playing track doesn't push the insert one slot too far.
             let ids: HashSet<&str> = items.iter().map(|i| i.video_id.as_str()).collect();
-            let qm = &mut *q; // the guard hands out one borrow; a struct ref splits per field
             let mut removed = dedupe && drop_duplicates(&mut qm.items, &mut qm.current, &ids);
             // Setting or not: a copy already waiting in the manual block is *moved*, never doubled.
             // "Play next" on a row you can see in the queue means move it up, and a second identical
@@ -5314,19 +5449,25 @@ impl AppState {
                     items.shuffle(&mut rand::thread_rng());
                 }
             }
-            if !next && q.shuffle_orig.is_some() && self.shuffle_whole_queue() {
+            let index = if !next && q.shuffle_orig.is_some() && self.shuffle_whole_queue() {
                 // Shuffling the whole queue: an add made while shuffled lands somewhere random in
                 // the mix, between the Play next tracks and autoplay, like the rest of it.
                 use rand::Rng;
                 let lo = guest_insert_index(&q.items, q.current);
+                let mut first = None;
                 for item in items {
                     let hi = enqueue_at(&q).max(lo);
                     let to = rand::thread_rng().gen_range(lo..=hi);
+                    if first.is_none() {
+                        first = Some(to);
+                    }
                     q.items.insert(to, item);
                 }
+                first.unwrap_or(0)
             } else {
                 q.items.splice(at..at, items);
-            }
+                at
+            };
             // Drop the primed lookahead when what plays next moved (an append past the tail
             // retargets a primed repeat-all wrap from index 0 to the new item) or when a different
             // song now sits in the primed slot — otherwise the gapless advance plays the wrong one.
@@ -5340,10 +5481,14 @@ impl AppState {
                 q.lookahead_loaded = None;
                 let _ = self.player.clear_playlist();
             }
-            was_empty
+            (index, was_empty)
         };
-        // Nothing was playing and nothing was queued: an add is the whole queue, so start it —
-        // otherwise the tracks sit there paused and the click looks like it did nothing.
+        (index, was_empty)
+    }
+
+    /// Post-splice side effects shared by both insertion paths. An add to an empty queue is the
+    /// whole queue, so it starts playback; otherwise emit/persist and re-prime the lookahead.
+    async fn finish_insert(self: &std::sync::Arc<Self>, was_empty: bool) {
         if was_empty {
             self.play_index(0).await; // emits + persists + primes on its way
             self.lt_broadcast_queue().await;
@@ -6653,6 +6798,15 @@ pub(crate) fn prefer_version(item: &mut SongItem, video: bool) -> bool {
 /// and Last.fm, and a wrong artist there is worse than a missing one: it scrobbles as another
 /// artist entirely. Rows persisted before this existed are healed the next time they play, because
 /// the caller writes the repaired item back into the queue.
+fn request_resolve_error(error: &innertube::Error) -> crate::control_api::types::ResolveError {
+    use crate::control_api::types::ResolveError;
+    if error.is_not_found() {
+        ResolveError::NotFound
+    } else {
+        ResolveError::ResolveFailed(error.to_string())
+    }
+}
+
 fn backfill_metadata(
     item: &mut SongItem,
     length_seconds: Option<&str>,

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::integrations::parse::{parse_input, ParseError};
 use crate::integrations::token::tokens_equal;
 use axum::{
     extract::{Request, State},
@@ -14,8 +15,8 @@ use axum::{
 
 use super::types::{
     ApiShared, ErrorBody, NowPlayingResponse, OkResponse, PlaybackStateResponse, PreviousResponse,
-    QueueResponse, RemoveRequest, SeekRequest, SeekResponse, StatusResponse, VolumeRequest,
-    VolumeResponse,
+    QueueRequest, QueueRequestResponse, QueueResponse, RemoveRequest, ResolveError, SeekRequest,
+    SeekResponse, SimpleQueueRequest, StatusResponse, VolumeRequest, VolumeResponse,
 };
 
 /// Accept only `Authorization: Bearer <token>`. No query-string fallback, no CORS headers. The
@@ -57,6 +58,9 @@ pub fn router(shared: Arc<ApiShared>) -> Router {
         .route("/api/v1/playback/volume", post(volume))
         .route("/api/v1/queue/remove", post(remove))
         .route("/api/v1/queue/clear-queued", post(clear_queued))
+        .route("/api/v1/queue/request", post(queue_request))
+        .route("/api/v1/queue/add", post(queue_add))
+        .route("/api/v1/queue/play-next", post(queue_play_next))
         .layer(middleware::from_fn_with_state(shared.clone(), require_bearer))
         .with_state(shared)
 }
@@ -247,12 +251,160 @@ async fn clear_queued(State(shared): State<Arc<ApiShared>>) -> Response {
     Json(OkResponse { ok: true }).into_response()
 }
 
+fn parse_error(error: ParseError) -> ErrorBody {
+    match error {
+        ParseError::InvalidInput => bad_request("invalid_input", "input is empty or not a song"),
+        ParseError::UnsupportedUrl => {
+            bad_request("unsupported_url", "only YouTube URLs are accepted")
+        }
+        ParseError::PlaylistNotSupported => bad_request(
+            "playlist_not_supported",
+            "playlists are not supported; use one video or a query",
+        ),
+    }
+}
+
+fn resolve_error(error: ResolveError) -> ErrorBody {
+    match error {
+        ResolveError::NotFound => ErrorBody::not_found(),
+        ResolveError::ResolveFailed(message) => ErrorBody::resolve_failed(message),
+        ResolveError::LiveStream => ErrorBody::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "duration_unknown",
+            "live streams have no normal duration and cannot be queued",
+        ),
+    }
+}
+
+/// Parse a `SongItem.duration` string (`m:ss` / `h:m:ss`) into whole seconds. `None` means the
+/// metadata did not give us a usable length, which is the `duration_unknown` case.
+fn duration_secs(text: Option<&str>) -> Option<u64> {
+    let text = text?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut parts = 0;
+    for part in text.split(':') {
+        parts += 1;
+        if parts > 3 {
+            return None;
+        }
+        total = total.checked_mul(60)?.checked_add(part.parse::<u64>().ok()?)?;
+    }
+    Some(total)
+}
+
+/// `POST /api/v1/queue/request`: resolve one song and add it to the queue. The response is
+/// `{ok, position, item}`; `position` is the final zero-based index and `item` includes `duration`
+/// and `queued_by`.
+///
+/// `max_duration_sec` fails closed with 422 `duration_unknown` unless `allow_unknown_duration` is
+/// true; a known but longer track gets 422 `too_long` with `duration_sec` and `max_duration_sec`.
+/// Duplicate rejection (409 with the existing `position`) is skipped by `allow_duplicates`, but the
+/// app's global `prevent_duplicates` setting still applies inside the insertion. A timeout from a
+/// previous skip never leaves this endpoint guessing: it holds the same mutation lock as other
+/// current-track/queue changes.
+async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Response {
+    let _lock = mutation_lock(&shared).await;
+    if let Err(error) = guard(&shared).await {
+        return error.into_response();
+    }
+    let parsed = match parse_input(&body.input) {
+        Ok(parsed) => parsed,
+        Err(error) => return parse_error(error).into_response(),
+    };
+    let mut item = match shared.context.resolve_input(&parsed).await {
+        Ok(item) => item,
+        Err(error) => return resolve_error(error).into_response(),
+    };
+    if let Some(max) = body.max_duration_sec {
+        match duration_secs(item.duration.as_deref()) {
+            None if !body.allow_unknown_duration => {
+                return ErrorBody::duration_unknown().into_response()
+            }
+            Some(seconds) if seconds > max => {
+                return ErrorBody::too_long(seconds, max).into_response()
+            }
+            _ => {}
+        }
+    }
+    if let Some(by) = body.requested_by {
+        let by = by.trim();
+        if !by.is_empty() {
+            item.queued_by = Some(by.to_string());
+        }
+    }
+    match shared
+        .context
+        .clone()
+        .insert_request(item.clone(), body.play_next, body.allow_duplicates)
+        .await
+    {
+        Ok(position) => Json(QueueRequestResponse {
+            ok: true,
+            position,
+            item: serde_json::to_value(item).unwrap_or(serde_json::Value::Null),
+        })
+        .into_response(),
+        Err(position) => ErrorBody::duplicate(position).into_response(),
+    }
+}
+
+async fn queue_request(
+    State(shared): State<Arc<ApiShared>>,
+    Json(body): Json<QueueRequest>,
+) -> Response {
+    handle_queue_request(shared, body).await
+}
+
+/// `POST /api/v1/queue/add`: thin append variant of `/queue/request` (same defaults as an empty
+/// options object). `play_next` is false and `allow_duplicates` stays at the app default.
+async fn queue_add(
+    State(shared): State<Arc<ApiShared>>,
+    Json(body): Json<SimpleQueueRequest>,
+) -> Response {
+    handle_queue_request(
+        shared,
+        QueueRequest {
+            input: body.input,
+            requested_by: body.requested_by,
+            max_duration_sec: None,
+            allow_duplicates: false,
+            play_next: false,
+            allow_unknown_duration: false,
+        },
+    )
+    .await
+}
+
+/// `POST /api/v1/queue/play-next`: thin Play-next variant of `/queue/request`.
+async fn queue_play_next(
+    State(shared): State<Arc<ApiShared>>,
+    Json(body): Json<SimpleQueueRequest>,
+) -> Response {
+    handle_queue_request(
+        shared,
+        QueueRequest {
+            input: body.input,
+            requested_by: body.requested_by,
+            max_duration_sec: None,
+            allow_duplicates: false,
+            play_next: true,
+            allow_unknown_duration: false,
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::ControlApiContext;
     use super::*;
+    use crate::integrations::parse::ParsedInput;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use innertube::SongItem;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
@@ -262,6 +414,14 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::state::QueueNeighbors;
+
+    #[derive(Debug, Clone)]
+    struct MockRow {
+        id: String,
+        autoplay: bool,
+        queued: bool,
+        queued_by: Option<String>,
+    }
 
     #[derive(Debug)]
     struct MockContext {
@@ -283,6 +443,11 @@ mod tests {
         delay: Duration,
         active: AtomicUsize,
         max_active: AtomicUsize,
+        resolve_item: SongItem,
+        resolve_error: Option<ResolveError>,
+        rows: StdMutex<Vec<MockRow>>,
+        current: AtomicUsize,
+        inserted: StdMutex<Vec<(SongItem, bool, bool)>>,
     }
 
     impl Default for MockContext {
@@ -306,6 +471,26 @@ mod tests {
                 delay: Duration::ZERO,
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
+                resolve_item: SongItem {
+                    video_id: "resolved123".to_string(),
+                    title: "Resolved Song".to_string(),
+                    artists: "Tester".to_string(),
+                    duration: Some("3:00".to_string()),
+                    ..Default::default()
+                },
+                resolve_error: None,
+                rows: StdMutex::new(vec![
+                    MockRow { id: "a".into(), autoplay: false, queued: false, queued_by: None },
+                    MockRow {
+                        id: "b".into(),
+                        autoplay: false,
+                        queued: false,
+                        queued_by: Some("friend".into()),
+                    },
+                    MockRow { id: "c".into(), autoplay: true, queued: false, queued_by: None },
+                ]),
+                current: AtomicUsize::new(0),
+                inserted: StdMutex::new(Vec::new()),
             }
         }
     }
@@ -341,13 +526,24 @@ mod tests {
         }
 
         async fn queue_snapshot(&self) -> Value {
+            let rows = self.rows.lock().unwrap();
+            let items: Vec<Value> = rows
+                .iter()
+                .map(|row| {
+                    let mut item = json!({
+                        "videoId": row.id,
+                        "autoplay": row.autoplay,
+                        "queued": row.queued,
+                    });
+                    if let Some(by) = &row.queued_by {
+                        item.as_object_mut().unwrap().insert("queued_by".into(), json!(by));
+                    }
+                    item
+                })
+                .collect();
             json!({
-                "items": [
-                    { "videoId": "a" },
-                    { "videoId": "b", "queued_by": "friend" },
-                    { "videoId": "c" },
-                ],
-                "currentIndex": 0,
+                "items": items,
+                "currentIndex": self.current.load(Ordering::SeqCst),
                 "prevTrack": { "videoId": "old" },
                 "sourceName": "ui-only",
                 "sourceId": "ui-only",
@@ -415,19 +611,94 @@ mod tests {
         }
 
         async fn queue_len(self: Arc<Self>) -> usize {
-            3
+            self.rows.lock().unwrap().len()
         }
 
         async fn remove_at(self: Arc<Self>, index: usize) {
             self.enter().await;
             self.removals.lock().unwrap().push(index);
+            let mut rows = self.rows.lock().unwrap();
+            if index < rows.len() {
+                rows.remove(index);
+                if index < self.current.load(Ordering::SeqCst) {
+                    self.current.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
             self.exit();
         }
 
         async fn clear_queued(self: Arc<Self>) {
             self.enter().await;
             self.clears.fetch_add(1, Ordering::SeqCst);
+            self.rows.lock().unwrap().retain(|row| !row.queued);
             self.exit();
+        }
+
+        async fn resolve_input(&self, parsed: &ParsedInput) -> Result<SongItem, ResolveError> {
+            if let Some(error) = &self.resolve_error {
+                return Err(error.clone());
+            }
+            if matches!(parsed, ParsedInput::Query(query) if query.contains("next")) {
+                return Ok(resolved("next1234567", Some("3:00")));
+            }
+            Ok(self.resolve_item.clone())
+        }
+
+        async fn insert_request(
+            self: Arc<Self>,
+            item: SongItem,
+            next: bool,
+            allow_duplicates: bool,
+        ) -> Result<usize, usize> {
+            self.enter().await;
+            let result = {
+                let mut rows = self.rows.lock().unwrap();
+                if !allow_duplicates {
+                    if let Some(existing) = rows.iter().position(|row| row.id == item.video_id) {
+                        Err(existing)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| {
+                    let at = if next {
+                        let mut at = self.current.load(Ordering::SeqCst) + 1;
+                        while at < rows.len() && rows[at].queued {
+                            at += 1;
+                        }
+                        at
+                    } else {
+                        rows.iter().position(|row| row.autoplay).unwrap_or(rows.len())
+                    };
+                    rows.insert(
+                        at,
+                        MockRow {
+                            id: item.video_id.clone(),
+                            autoplay: false,
+                            queued: next,
+                            queued_by: item.queued_by.clone(),
+                        },
+                    );
+                    Ok(at)
+                })
+            };
+            if result.is_ok() {
+                self.inserted.lock().unwrap().push((item, next, allow_duplicates));
+            }
+            self.exit();
+            result
+        }
+    }
+
+    fn resolved(id: &str, duration: Option<&str>) -> SongItem {
+        SongItem {
+            video_id: id.to_string(),
+            title: "Resolved Song".to_string(),
+            artists: "Tester".to_string(),
+            duration: duration.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -591,6 +862,9 @@ mod tests {
             ("/api/v1/playback/volume", json!({ "volume": 50 })),
             ("/api/v1/queue/remove", json!({ "index": 1 })),
             ("/api/v1/queue/clear-queued", json!({})),
+            ("/api/v1/queue/request", json!({ "input": "a song" })),
+            ("/api/v1/queue/add", json!({ "input": "a song" })),
+            ("/api/v1/queue/play-next", json!({ "input": "a song" })),
         ]
     }
 
@@ -610,6 +884,7 @@ mod tests {
         assert_eq!(ctx.volume_calls.load(Ordering::SeqCst), 0);
         assert!(ctx.removals.lock().unwrap().is_empty());
         assert_eq!(ctx.clears.load(Ordering::SeqCst), 0);
+        assert!(ctx.inserted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -625,6 +900,7 @@ mod tests {
         assert_eq!(ctx.pause_calls.load(Ordering::SeqCst), 0);
         assert_eq!(ctx.seek_calls.load(Ordering::SeqCst), 0);
         assert_eq!(ctx.volume_calls.load(Ordering::SeqCst), 0);
+        assert!(ctx.inserted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -750,5 +1026,215 @@ mod tests {
         assert_eq!(next.status(), StatusCode::OK);
         assert_eq!(clear.status(), StatusCode::OK);
         assert_eq!(ctx.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_request_maps_parser_errors() {
+        let cases = vec![
+            ("", "invalid_input"),
+            ("https://vimeo.com/123456", "unsupported_url"),
+            ("https://music.youtube.com/playlist?list=PLxxx", "playlist_not_supported"),
+        ];
+        for (input, code) in cases {
+            let response = post("/api/v1/queue/request", json!({ "input": input })).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{input}");
+            let json = json_body(response).await;
+            assert_eq!(json["error"], code, "{input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_request_maps_resolve_errors() {
+        let (app, _) = test_router_with(MockContext {
+            resolve_error: Some(ResolveError::NotFound),
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(response).await["error"], "not_found");
+
+        let (app, _) = test_router_with(MockContext {
+            resolve_error: Some(ResolveError::ResolveFailed("boom".into())),
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(json_body(response).await["error"], "resolve_failed");
+
+        let (app, _) = test_router_with(MockContext {
+            resolve_error: Some(ResolveError::LiveStream),
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json_body(response).await["error"], "duration_unknown");
+    }
+
+    #[tokio::test]
+    async fn queue_request_enforces_duration() {
+        let (app, _) = test_router_with(MockContext {
+            resolve_item: resolved("resolved123", None),
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song", "max_duration_sec": 60 }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json_body(response).await["error"], "duration_unknown");
+
+        let response =
+            post("/api/v1/queue/request", json!({ "input": "song", "max_duration_sec": 60 })).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "too_long");
+        assert_eq!(json["duration_sec"], 180);
+        assert_eq!(json["max_duration_sec"], 60);
+
+        let (app, _) = test_router_with(MockContext {
+            resolve_item: resolved("resolved123", None),
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song", "max_duration_sec": 60, "allow_unknown_duration": true }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn queue_request_rejects_duplicates_and_honours_override() {
+        for (id, expected) in [("a", 0), ("b", 1)] {
+            let (app, _) = test_router_with(MockContext {
+                resolve_item: resolved(id, Some("3:00")),
+                ..Default::default()
+            });
+            let response = request(
+                app,
+                "/api/v1/queue/request",
+                json!({ "input": "song" }),
+                Some("Bearer abc123"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let json = json_body(response).await;
+            assert_eq!(json["error"], "duplicate");
+            assert_eq!(json["position"], expected);
+        }
+
+        let (app, ctx) = test_router_with(MockContext {
+            resolve_item: resolved("b", Some("3:00")),
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song", "allow_duplicates": true }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(ctx.inserted.lock().unwrap()[0].2, true);
+    }
+
+    #[tokio::test]
+    async fn play_next_and_append_use_different_positions() {
+        let (app, ctx) = test_router();
+        let response = request(
+            app.clone(),
+            "/api/v1/queue/add",
+            json!({ "input": "song", "requested_by": "alice" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(response).await;
+        assert_eq!(json["position"], 2); // before the autoplay row at index 2
+        assert_eq!(json["item"]["queued_by"], "alice");
+        assert_eq!(json["item"]["duration"], "3:00");
+
+        let response = request(
+            app,
+            "/api/v1/queue/play-next",
+            json!({ "input": "next song" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["position"], 1); // after the current row
+
+        let inserted = ctx.inserted.lock().unwrap();
+        assert_eq!(inserted.len(), 2);
+        assert_eq!((inserted[0].1, inserted[1].1), (false, true));
+    }
+
+    #[tokio::test]
+    async fn empty_queue_reports_position_zero() {
+        let (app, _) = test_router_with(MockContext {
+            rows: StdMutex::new(Vec::new()),
+            current: AtomicUsize::new(0),
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song", "requested_by": "alice" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(response).await;
+        assert_eq!(json["position"], 0);
+        assert_eq!(json["item"]["queued_by"], "alice");
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_requests_have_one_winner() {
+        let (app, ctx) = test_router_with(MockContext {
+            delay: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let first = request(
+            app.clone(),
+            "/api/v1/queue/request",
+            json!({ "input": "song" }),
+            Some("Bearer abc123"),
+        );
+        let second = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song" }),
+            Some("Bearer abc123"),
+        );
+        let (first, second) = tokio::join!(first, second);
+        let mut codes = [first.status().as_u16(), second.status().as_u16()];
+        codes.sort_unstable();
+        assert_eq!(codes, [200, 409]);
+        assert_eq!(ctx.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.inserted.lock().unwrap().len(), 1);
     }
 }

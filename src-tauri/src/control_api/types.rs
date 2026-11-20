@@ -7,10 +7,12 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use innertube::SongItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::integrations::parse::ParsedInput;
 use crate::state::QueueNeighbors;
 
 /// The standard error envelope. `error` is a stable machine code; `message` is human-readable.
@@ -21,13 +23,28 @@ pub struct ErrorBody {
     /// Present on `next_timeout`: the track that was current when the wait expired.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<Value>,
+    /// Existing queue index on a `duplicate` rejection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_sec: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_duration_sec: Option<u64>,
     #[serde(skip)]
     status: StatusCode,
 }
 
 impl ErrorBody {
     pub fn new(status: StatusCode, error: &'static str, message: impl Into<String>) -> Self {
-        Self { error, message: message.into(), current: None, status }
+        Self {
+            error,
+            message: message.into(),
+            current: None,
+            position: None,
+            duration_sec: None,
+            max_duration_sec: None,
+            status,
+        }
     }
 
     pub fn unauthorized() -> Self {
@@ -66,6 +83,40 @@ impl ErrorBody {
             "queue_changed",
             "the queue row changed before the request was applied",
         )
+    }
+
+    pub fn duplicate(position: usize) -> Self {
+        let mut error =
+            Self::new(StatusCode::CONFLICT, "duplicate", "that video is already in the queue");
+        error.position = Some(position);
+        error
+    }
+
+    pub fn not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", "no matching song was found")
+    }
+
+    pub fn resolve_failed(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, "resolve_failed", message)
+    }
+
+    pub fn duration_unknown() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "duration_unknown",
+            "the track has no known duration; set allow_unknown_duration to accept it",
+        )
+    }
+
+    pub fn too_long(duration_sec: u64, max_duration_sec: u64) -> Self {
+        let mut error = Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "too_long",
+            "the track is longer than max_duration_sec",
+        );
+        error.duration_sec = Some(duration_sec);
+        error.max_duration_sec = Some(max_duration_sec);
+        error
     }
 
     pub fn playback_error(message: impl Into<String>) -> Self {
@@ -252,6 +303,57 @@ pub struct OkResponse {
     pub ok: bool,
 }
 
+/// Body for `POST /api/v1/queue/request`. `input` may be a YouTube URL, an 11-character video id,
+/// or a text query. `requested_by` is stored as `SongItem.queued_by`. See [`ResolveError`] and the
+/// response contract on [`QueueRequestResponse`].
+#[derive(Debug, Deserialize)]
+pub struct QueueRequest {
+    pub input: String,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    /// Maximum accepted track length in whole seconds.
+    #[serde(default)]
+    pub max_duration_sec: Option<u64>,
+    /// Skip this request's duplicate rejection. The app's global `prevent_duplicates` setting still
+    /// applies inside the queue insertion.
+    #[serde(default)]
+    pub allow_duplicates: bool,
+    /// Insert at the Play-next boundary instead of before autoplay filler at the tail.
+    #[serde(default)]
+    pub play_next: bool,
+    /// Accept a track whose duration is missing or unparseable when `max_duration_sec` is set.
+    #[serde(default)]
+    pub allow_unknown_duration: bool,
+}
+
+/// Thin variant body for `/queue/add` and `/queue/play-next`; all other options take their defaults.
+#[derive(Debug, Deserialize)]
+pub struct SimpleQueueRequest {
+    pub input: String,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+}
+
+/// Success body for all three queue-request endpoints. `position` is the final zero-based queue
+/// index of the inserted row, including 0 when an empty queue starts playback. `item` is the full
+/// `SongItem` actually queued, so it carries `duration` and `queued_by` without a second lookup.
+#[derive(Debug, Serialize)]
+pub struct QueueRequestResponse {
+    pub ok: bool,
+    pub position: usize,
+    pub item: Value,
+}
+
+/// Resolution failures that are not plain parser errors. Parser errors are mapped directly from
+/// [`crate::integrations::parse::ParseError`] in the handler.
+#[derive(Debug, Clone)]
+pub enum ResolveError {
+    NotFound,
+    ResolveFailed(String),
+    /// A live broadcast has no normal duration.
+    LiveStream,
+}
+
 /// Everything handlers need from the app. Implemented by `AppState` in production and by a small
 /// mock in tests, which keeps router tests independent of a Tauri handle.
 #[async_trait::async_trait]
@@ -305,6 +407,18 @@ pub trait ControlApiContext: Send + Sync + 'static {
 
     /// Clear manually queued rows through the existing app path.
     async fn clear_queued(self: Arc<Self>);
+
+    /// Resolve a parsed input to one fully-described song, including duration.
+    async fn resolve_input(&self, parsed: &ParsedInput) -> Result<SongItem, ResolveError>;
+
+    /// Check duplicates and insert under one queue lock. `Ok` is the final index; `Err` is the
+    /// index of the existing copy. `allow_duplicates` skips only the API-level check.
+    async fn insert_request(
+        self: Arc<Self>,
+        item: SongItem,
+        next: bool,
+        allow_duplicates: bool,
+    ) -> Result<usize, usize>;
 }
 
 #[async_trait::async_trait]
@@ -372,6 +486,19 @@ impl ControlApiContext for crate::state::AppState {
 
     async fn clear_queued(self: Arc<Self>) {
         crate::state::AppState::clear_queued(&self).await;
+    }
+
+    async fn resolve_input(&self, parsed: &ParsedInput) -> Result<SongItem, ResolveError> {
+        self.resolve_control_input(parsed).await
+    }
+
+    async fn insert_request(
+        self: Arc<Self>,
+        item: SongItem,
+        next: bool,
+        allow_duplicates: bool,
+    ) -> Result<usize, usize> {
+        self.insert_queued_checked(item, next, None, allow_duplicates).await
     }
 }
 
