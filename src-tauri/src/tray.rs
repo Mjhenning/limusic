@@ -91,7 +91,9 @@ fn handle_menu(app: &AppHandle, id: &str) {
             let id = other.to_string();
             tauri::async_runtime::spawn(async move {
                 match id.as_str() {
-                    "play_pause" => state.resume_or_toggle().await,
+                    "play_pause" => {
+                        let _ = state.resume_or_toggle().await;
+                    }
                     "next" => state.next_in_queue().await,
                     "prev" => state.prev_in_queue().await,
                     _ => {}

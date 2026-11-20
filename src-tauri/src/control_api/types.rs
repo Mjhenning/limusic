@@ -377,14 +377,14 @@ pub trait ControlApiContext: Send + Sync + 'static {
     /// True when a Listen Together guest session owns playback policy.
     async fn is_guest(&self) -> bool;
 
-    /// Idempotent Play; starts a restored queue when mpv is idle.
-    async fn play(self: Arc<Self>);
+    /// Idempotent Play; starts a restored queue when mpv is idle. Returns the resulting state.
+    async fn play(self: Arc<Self>) -> bool;
 
-    /// Idempotent Pause; shared with the Tauri pause command.
-    async fn pause(self: Arc<Self>);
+    /// Idempotent Pause; shared with the Tauri pause command. Returns the resulting state.
+    async fn pause(self: Arc<Self>) -> bool;
 
     /// Toggle transport state and report the final state.
-    async fn toggle(self: Arc<Self>);
+    async fn toggle(self: Arc<Self>) -> bool;
 
     /// Skip and return the new current queue item, or `None` on timeout/failure. A timeout does
     /// not guarantee the skip did not complete; callers should re-read `/status` before retrying.
@@ -447,16 +447,16 @@ impl ControlApiContext for crate::state::AppState {
         self.lt.is_guest().await
     }
 
-    async fn play(self: Arc<Self>) {
-        self.play_playback().await;
+    async fn play(self: Arc<Self>) -> bool {
+        self.play_playback().await
     }
 
-    async fn pause(self: Arc<Self>) {
-        self.pause_playback().await;
+    async fn pause(self: Arc<Self>) -> bool {
+        self.pause_playback().await
     }
 
-    async fn toggle(self: Arc<Self>) {
-        self.resume_or_toggle().await;
+    async fn toggle(self: Arc<Self>) -> bool {
+        self.resume_or_toggle().await
     }
 
     async fn next(self: Arc<Self>) -> Option<Value> {

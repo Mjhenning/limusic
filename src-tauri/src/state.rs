@@ -1882,7 +1882,7 @@ impl AppState {
     /// Play/pause toggle that also starts a *restored* (or exhausted) queue: if mpv has nothing
     /// loaded but the queue is non-empty, load the current track (applying any resume position);
     /// otherwise just toggle mpv. Keeps the UI's single play/pause button working after a restart.
-    pub async fn resume_or_toggle(self: &std::sync::Arc<Self>) {
+    pub async fn resume_or_toggle(self: &std::sync::Arc<Self>) -> bool {
         let mut playing = false;
         if self.link_route(|v| {
             playing = !v.playing;
@@ -1890,10 +1890,10 @@ impl AppState {
         }) {
             // Shown at once; the other device's answer follows within a round trip.
             self.emit_ui_event("playback-state", if playing { "playing" } else { "paused" }, true);
-            return;
+            return playing;
         }
         if self.lt.is_guest().await {
-            return; // guest playback is host-driven
+            return self.sync_playback_state(); // guest playback is host-driven
         }
         if self.player.is_idle() {
             let (idx, has_items) = {
@@ -1902,21 +1902,23 @@ impl AppState {
             };
             if has_items {
                 self.play_index(idx).await;
-                return;
+                return true;
             }
+            return self.sync_playback_state();
         }
         let _ = self.player.toggle();
+        self.sync_playback_state()
     }
 
     /// Idempotent Play for external controllers: start the restored/current row if mpv has nothing
     /// loaded, resume it if paused, and do nothing if it is already playing.
-    pub async fn play_playback(self: &std::sync::Arc<Self>) {
+    pub async fn play_playback(self: &std::sync::Arc<Self>) -> bool {
         if self.link_route(|_| Some(RemoteAction::Play)) {
             self.emit_ui_event("playback-state", "playing", true);
-            return;
+            return true;
         }
         if self.lt.is_guest().await {
-            return; // guest playback is host-driven
+            return self.sync_playback_state(); // guest playback is host-driven
         }
         if self.player.is_idle() {
             let (idx, has_items) = {
@@ -1925,25 +1927,40 @@ impl AppState {
             };
             if has_items {
                 self.play_index(idx).await;
+                return true;
             }
-            return;
+            return self.sync_playback_state();
         }
         if self.player.is_paused() {
             let _ = self.player.play();
         }
+        self.sync_playback_state()
     }
 
     /// Idempotent Pause shared by the Tauri command and the control API. A restored or idle queue
     /// has nothing to pause, so that case is a no-op too.
-    pub async fn pause_playback(self: &std::sync::Arc<Self>) {
+    pub async fn pause_playback(self: &std::sync::Arc<Self>) -> bool {
         if self.link_route(|_| Some(RemoteAction::Pause)) {
             self.emit_ui_event("playback-state", "paused", true);
-            return;
+            return false;
         }
         if self.lt.is_guest().await || self.player.is_idle() || self.player.is_paused() {
-            return;
+            return self.sync_playback_state();
         }
         let _ = self.player.pause();
+        self.sync_playback_state()
+    }
+
+    /// Reconcile the `is_playing` mirror with mpv after a transport command. `player.play/pause`
+    /// set libmpv's `pause` property synchronously, but the `Playing` event that normally updates
+    /// the mirror is pumped asynchronously. Reading the property back here makes the API's answer
+    /// (and the OS controls it drives) agree with the player immediately; the later event carries
+    /// the same value and is therefore harmless. `idle-active` is checked too, because mpv reports
+    /// `pause: false` while idle and a paused-but-idle queue must not be described as playing.
+    pub fn sync_playback_state(&self) -> bool {
+        let playing = !self.player.is_idle() && !self.player.is_paused();
+        self.media_set_playing(playing);
+        playing
     }
 
     /// Skip once and wait until the new row is current, returning its queue item. `play_index`

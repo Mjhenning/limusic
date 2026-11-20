@@ -112,20 +112,13 @@ async fn mutation_lock(shared: &ApiShared) -> tokio::sync::MutexGuard<'_, ()> {
     shared.mutation.lock().await
 }
 
-async fn final_playback_state(shared: &ApiShared) -> PlaybackStateResponse {
-    let snap = shared.context.playback_snapshot().await;
-    PlaybackStateResponse {
-        playing: !snap.get("paused").and_then(serde_json::Value::as_bool).unwrap_or(true),
-    }
-}
-
 /// `POST /api/v1/playback/play`: idempotent. Starts a restored queue when mpv is idle.
 async fn play(State(shared): State<Arc<ApiShared>>) -> Response {
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
-    shared.context.clone().play().await;
-    Json(final_playback_state(&shared).await).into_response()
+    let playing = shared.context.clone().play().await;
+    Json(PlaybackStateResponse { playing }).into_response()
 }
 
 /// `POST /api/v1/playback/pause`: idempotent. Safe on an idle or already-paused queue.
@@ -133,8 +126,8 @@ async fn pause(State(shared): State<Arc<ApiShared>>) -> Response {
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
-    shared.context.clone().pause().await;
-    Json(final_playback_state(&shared).await).into_response()
+    let playing = shared.context.clone().pause().await;
+    Json(PlaybackStateResponse { playing }).into_response()
 }
 
 /// `POST /api/v1/playback/toggle`: flips transport state and reports the final state.
@@ -142,8 +135,8 @@ async fn toggle(State(shared): State<Arc<ApiShared>>) -> Response {
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
-    shared.context.clone().toggle().await;
-    Json(final_playback_state(&shared).await).into_response()
+    let playing = shared.context.clone().toggle().await;
+    Json(PlaybackStateResponse { playing }).into_response()
 }
 
 /// `POST /api/v1/playback/next`: waits for the new current row, including a synchronous autoplay
@@ -429,6 +422,9 @@ mod tests {
         linked: bool,
         restarted: bool,
         paused: AtomicBool,
+        /// The mirror read by `playback_snapshot`. Deliberately lags `paused` in the pause test,
+        /// reproducing the async mpv event that made the old handler answer stale state.
+        event_paused: AtomicBool,
         position: f64,
         duration: f64,
         next_item: StdMutex<Option<Value>>,
@@ -457,6 +453,7 @@ mod tests {
                 linked: false,
                 restarted: false,
                 paused: AtomicBool::new(false),
+                event_paused: AtomicBool::new(false),
                 position: 1.0,
                 duration: 10.0,
                 next_item: StdMutex::new(Some(json!({ "videoId": "next" }))),
@@ -515,7 +512,7 @@ mod tests {
         async fn playback_snapshot(&self) -> Value {
             json!({
                 "now": { "videoId": "abc", "queued_by": "friend" },
-                "paused": self.paused.load(Ordering::SeqCst),
+                "paused": self.event_paused.load(Ordering::SeqCst),
                 "position": self.position,
                 "duration": self.duration,
                 "volume": self.volume.load(Ordering::SeqCst),
@@ -569,20 +566,26 @@ mod tests {
             self.guest
         }
 
-        async fn play(self: Arc<Self>) {
+        async fn play(self: Arc<Self>) -> bool {
             self.play_calls.fetch_add(1, Ordering::SeqCst);
             self.paused.store(false, Ordering::SeqCst);
+            self.event_paused.store(false, Ordering::SeqCst);
+            true
         }
 
-        async fn pause(self: Arc<Self>) {
+        async fn pause(self: Arc<Self>) -> bool {
             self.pause_calls.fetch_add(1, Ordering::SeqCst);
             self.paused.store(true, Ordering::SeqCst);
+            // The real mpv `Playing(false)` event arrives on the pump later; leave the mirror
+            // stale on purpose so the endpoint must use the command's returned state.
+            false
         }
 
-        async fn toggle(self: Arc<Self>) {
+        async fn toggle(self: Arc<Self>) -> bool {
             self.toggle_calls.fetch_add(1, Ordering::SeqCst);
             let paused = !self.paused.load(Ordering::SeqCst);
             self.paused.store(paused, Ordering::SeqCst);
+            !paused
         }
 
         async fn next(self: Arc<Self>) -> Option<Value> {
@@ -831,8 +834,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_is_idempotent() {
-        let (app, ctx) = test_router();
+    async fn pause_is_idempotent_even_with_a_stale_state_mirror() {
+        let (app, ctx) = test_router_with(MockContext {
+            event_paused: AtomicBool::new(true), // mpv paused, but its event has not been pumped
+            ..Default::default()
+        });
         for _ in 0..2 {
             let response =
                 request(app.clone(), "/api/v1/playback/pause", json!({}), Some("Bearer abc123"))
@@ -842,6 +848,11 @@ mod tests {
             assert_eq!(json["playing"], false);
         }
         assert_eq!(ctx.pause_calls.load(Ordering::SeqCst), 2);
+        assert!(ctx.event_paused.load(Ordering::SeqCst)); // response did not trust the stale mirror
+
+        let response =
+            request(app, "/api/v1/playback/toggle", json!({}), Some("Bearer abc123")).await;
+        assert_eq!(json_body(response).await["playing"], true);
     }
 
     #[tokio::test]

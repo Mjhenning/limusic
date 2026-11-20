@@ -214,7 +214,9 @@ pub(crate) fn handle_event(app: &AppHandle, event: MediaControlEvent) {
         let Some(state) = app.try_state::<Arc<AppState>>() else { return };
         let state = state.inner().clone();
         match event {
-            MediaControlEvent::Play | MediaControlEvent::Toggle => state.resume_or_toggle().await,
+            MediaControlEvent::Play | MediaControlEvent::Toggle => {
+                let _ = state.resume_or_toggle().await;
+            }
             MediaControlEvent::Pause | MediaControlEvent::Stop => {
                 let _ = state.player.pause();
             }
