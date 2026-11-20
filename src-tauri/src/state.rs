@@ -65,6 +65,11 @@ const AUTO_RESUME_DELAY: Duration = Duration::from_secs(10);
 /// How long the control API waits for a Skip to land a new current row, including an autoplay
 /// fetch. Longer than a normal resolve but short enough to answer a stuck skip with an error.
 const CONTROL_API_NEXT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Control-API song searches are anonymous, like the UI search page. Viewer queries must never be
+/// written into the signed-in account's search history.
+const CONTROL_API_SEARCH_RECORD_HISTORY: bool = false;
+/// How many ordered result ids to include in the debug trace of a control-API search.
+const CONTROL_API_SEARCH_TRACE_IDS: usize = 5;
 
 pub struct AppState {
     pub it: InnerTube,
@@ -3917,9 +3922,18 @@ impl AppState {
         self.queue.lock().await.items.len()
     }
 
+    /// Stable, non-reversible enough for debug logs: never emit the viewer's raw query text.
+    fn hash_query(query: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        query.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
     /// Resolve one control-API request. A bare/URL id is looked up with `/next` first and only
     /// falls back to a songs search when that lookup says not-found; a text query goes straight to
-    /// the songs filter. The chosen row is then enriched from `/player` so duration is authoritative.
+    /// the anonymous songs filter, matching the UI search page, so viewer queries never enter the
+    /// signed-in account's history. The chosen row is then checked for live status and enriched
+    /// from `/player` when metadata is missing.
     pub async fn resolve_control_input(
         &self,
         parsed: &crate::integrations::parse::ParsedInput,
@@ -3968,14 +3982,25 @@ impl AppState {
             .ok_or_else(|| ResolveError::ResolveFailed("metadata client missing".into()))?;
         let result = self
             .it
-            .search_songs(client, query, true)
+            .search_songs(client, query, CONTROL_API_SEARCH_RECORD_HISTORY)
             .await
             .map_err(|e| request_resolve_error(&e))?;
-        result
+        let chosen = result.items.iter().find(|item| !item.is_video && !item.is_episode).cloned();
+        let top_ids: Vec<String> = result
             .items
-            .into_iter()
-            .find(|item| !item.is_video && !item.is_episode)
-            .ok_or(ResolveError::NotFound)
+            .iter()
+            .take(CONTROL_API_SEARCH_TRACE_IDS)
+            .map(|item| item.video_id.clone())
+            .collect();
+        tracing::debug!(
+            query_hash = %Self::hash_query(query),
+            filter = innertube::endpoints::FILTER_SONG,
+            record_history = CONTROL_API_SEARCH_RECORD_HISTORY,
+            top_ids = ?top_ids,
+            chosen_id = chosen.as_ref().map(|item| item.video_id.as_str()),
+            "control API song search"
+        );
+        chosen.ok_or(ResolveError::NotFound)
     }
 
     async fn fill_request_metadata(
@@ -7100,8 +7125,9 @@ mod tests {
         persist_fingerprint, playlist_context, prefer_version, prev_track_title, put_url,
         queue_fingerprint, queue_neighbors_from_snapshot, radio_seed_for, remote_list,
         retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into, swap_version,
-        trim_played, twin_position, unshuffled, upcoming_queued, QueueState, RepeatMode, VideoUrls,
-        KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
+        trim_played, twin_position, unshuffled, upcoming_queued, AppState, QueueState, RepeatMode,
+        VideoUrls, CONTROL_API_SEARCH_RECORD_HISTORY, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX,
+        MAX_BOOST_DB,
     };
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
@@ -8282,5 +8308,19 @@ mod tests {
         let mut q = QueueState::default();
         q.keep_context(0.0);
         assert!(q.prev_context.is_none());
+    }
+
+    #[test]
+    fn control_api_searches_do_not_record_history() {
+        assert!(!CONTROL_API_SEARCH_RECORD_HISTORY);
+    }
+
+    #[test]
+    fn query_hash_does_not_leak_the_query() {
+        let hash = AppState::hash_query("private viewer query");
+        assert_eq!(hash.len(), 16);
+        assert_eq!(hash, AppState::hash_query("private viewer query"));
+        assert_ne!(hash, AppState::hash_query("another viewer query"));
+        assert!(!hash.contains("private"));
     }
 }
