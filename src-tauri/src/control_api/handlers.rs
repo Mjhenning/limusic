@@ -370,7 +370,7 @@ async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Res
             item: ApiTrack::from_song_item(&inserted, false),
         })
         .into_response(),
-        Err(position) => ErrorBody::duplicate(position).into_response(),
+        Err(matched) => ErrorBody::duplicate(matched).into_response(),
     }
 }
 
@@ -443,6 +443,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct MockRow {
         id: String,
+        counterpart: Option<String>,
         autoplay: bool,
         queued: bool,
         queued_by: Option<String>,
@@ -509,14 +510,27 @@ mod tests {
                 },
                 resolve_error: None,
                 rows: StdMutex::new(vec![
-                    MockRow { id: "a".into(), autoplay: false, queued: false, queued_by: None },
+                    MockRow {
+                        id: "a".into(),
+                        counterpart: None,
+                        autoplay: false,
+                        queued: false,
+                        queued_by: None,
+                    },
                     MockRow {
                         id: "b".into(),
+                        counterpart: None,
                         autoplay: false,
                         queued: false,
                         queued_by: Some("friend".into()),
                     },
-                    MockRow { id: "c".into(), autoplay: true, queued: false, queued_by: None },
+                    MockRow {
+                        id: "c".into(),
+                        counterpart: None,
+                        autoplay: true,
+                        queued: false,
+                        queued_by: None,
+                    },
                 ]),
                 current: AtomicUsize::new(0),
                 inserted: StdMutex::new(Vec::new()),
@@ -561,6 +575,7 @@ mod tests {
                 .map(|row| {
                     let mut item = json!({
                         "videoId": row.id,
+                        "counterpart": row.counterpart,
                         "autoplay": row.autoplay,
                         "queued": row.queued,
                     });
@@ -684,16 +699,21 @@ mod tests {
             item: SongItem,
             next: bool,
             allow_duplicates: bool,
-        ) -> Result<(usize, SongItem), usize> {
+        ) -> Result<(usize, SongItem), super::super::types::DuplicateMatch> {
             self.enter().await;
             let result = {
                 let mut rows = self.rows.lock().unwrap();
                 if !allow_duplicates {
-                    if let Some(existing) = rows.iter().position(|row| row.id == item.video_id) {
-                        Err(existing)
-                    } else {
-                        Ok(())
-                    }
+                    let queue: Vec<SongItem> = rows
+                        .iter()
+                        .map(|row| SongItem {
+                            video_id: row.id.clone(),
+                            counterpart: row.counterpart.clone(),
+                            ..Default::default()
+                        })
+                        .collect();
+                    super::super::types::find_request_duplicate(&item, queue.iter())
+                        .map_or(Ok(()), Err)
                 } else {
                     Ok(())
                 }
@@ -712,6 +732,7 @@ mod tests {
                         at,
                         MockRow {
                             id: item.video_id.clone(),
+                            counterpart: item.counterpart.clone(),
                             autoplay: false,
                             queued: next,
                             queued_by: item.queued_by.clone(),
@@ -1191,6 +1212,8 @@ mod tests {
             let json = json_body(response).await;
             assert_eq!(json["error"], "duplicate");
             assert_eq!(json["position"], expected);
+            assert_eq!(json["matched"]["video_id"], id);
+            assert_eq!(json["matched"]["matched_by"], "video_id");
         }
 
         let (app, ctx) = test_router_with(MockContext {
@@ -1402,5 +1425,63 @@ mod tests {
         let json = json_body(response).await;
         assert_eq!(json["ok"], true);
         assert_eq!(json["position_sec"], 5.0);
+    }
+
+    #[tokio::test]
+    async fn counterpart_matches_are_duplicates_in_both_directions() {
+        let audio = |id: &str, twin: Option<&str>| SongItem {
+            counterpart: twin.map(str::to_owned),
+            ..resolved(id, Some("3:00"))
+        };
+        let row = |id: &str, twin: Option<&str>| MockRow {
+            id: id.into(),
+            counterpart: twin.map(str::to_owned),
+            autoplay: false,
+            queued: false,
+            queued_by: None,
+        };
+        let cases = vec![
+            // requested video_id == queue counterpart
+            (audio("audio1", None), row("video1", Some("audio1")), "video_id"),
+            // requested video_id == queue counterpart, roles reversed
+            (
+                SongItem { is_video: true, ..audio("video2", Some("audio2")) },
+                row("audio2", Some("video2")),
+                "video_id",
+            ),
+            // requested counterpart == queue video_id
+            (
+                SongItem { is_video: true, ..audio("audio3", Some("video3")) },
+                row("video3", None),
+                "counterpart",
+            ),
+            // requested counterpart == queue counterpart
+            (
+                SongItem { is_video: true, ..audio("video4", Some("audio4")) },
+                row("other4", Some("audio4")),
+                "counterpart",
+            ),
+        ];
+        for (resolve_item, existing, matched_by) in cases {
+            let (app, ctx) = test_router_with(MockContext {
+                resolve_item,
+                rows: StdMutex::new(vec![existing]),
+                ..Default::default()
+            });
+            let response = request(
+                app,
+                "/api/v1/queue/request",
+                json!({ "input": "song" }),
+                Some("Bearer abc123"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let json = json_body(response).await;
+            assert_eq!(json["error"], "duplicate");
+            assert_eq!(json["position"], 0);
+            assert_eq!(json["matched"]["matched_by"], matched_by);
+            assert!(json["matched"]["video_id"].as_str().is_some());
+            assert!(ctx.inserted.lock().unwrap().is_empty());
+        }
     }
 }

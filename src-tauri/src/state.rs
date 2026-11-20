@@ -5434,21 +5434,24 @@ impl AppState {
     }
 
     /// Control-API variant: reject a duplicate *and* insert under one queue lock, so two chat
-    /// callers cannot both pass the check against the same pre-insert snapshot. `Ok` is the final
-    /// inserted index; `Err` is the index of the existing copy (including the current track).
-    /// `allow_duplicates` skips only this check — the user's global `prevent_duplicates` setting
-    /// still applies inside [`Self::insert_queued_inner`].
+    /// callers cannot both pass the check against the same pre-insert snapshot. A counterpart is
+    /// the same song as its twin, in either direction; the current row counts too. `Ok` is the
+    /// final inserted index; `Err` names the existing row. `allow_duplicates` skips only this
+    /// check — the user's global `prevent_duplicates` setting still applies inside
+    /// [`Self::insert_queued_inner`].
     pub async fn insert_queued_checked(
         self: &std::sync::Arc<Self>,
         item: SongItem,
         next: bool,
         from: Option<String>,
         allow_duplicates: bool,
-    ) -> Result<(usize, SongItem), usize> {
+    ) -> Result<(usize, SongItem), crate::control_api::types::DuplicateMatch> {
         let mut q = self.queue.lock().await;
         if !allow_duplicates {
-            if let Some(existing) = q.items.iter().position(|i| i.video_id == item.video_id) {
-                return Err(existing);
+            if let Some(matched) =
+                crate::control_api::types::find_request_duplicate(&item, q.items.iter())
+            {
+                return Err(matched);
             }
         }
         let (index, was_empty, inserted) =

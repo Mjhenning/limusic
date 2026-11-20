@@ -16,6 +16,45 @@ use tokio::sync::{Mutex, RwLock};
 use crate::integrations::parse::ParsedInput;
 use crate::state::QueueNeighbors;
 
+/// The existing queue row that made a request a duplicate. `matched_by` names the requested field:
+/// `video_id` or `counterpart`. The row is identified by both its id and its twin so a client can
+/// see that an audio request collided with a music video's counterpart (or vice versa).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DuplicateMatch {
+    pub position: usize,
+    pub video_id: String,
+    pub counterpart: Option<String>,
+    pub matched_by: String,
+}
+
+/// Compare one requested item with the full queue, including the current row. Either side's
+/// `video_id` or `counterpart` counts, so an audio id and its paired music video are one song.
+pub fn find_request_duplicate<'a>(
+    item: &SongItem,
+    queue: impl IntoIterator<Item = &'a SongItem>,
+) -> Option<DuplicateMatch> {
+    let requested = [
+        ("video_id", Some(item.video_id.as_str())),
+        ("counterpart", item.counterpart.as_deref().filter(|id| !id.is_empty())),
+    ];
+    let queue: Vec<&SongItem> = queue.into_iter().collect();
+    for (matched_by, wanted) in requested {
+        let Some(wanted) = wanted else { continue };
+        for (position, row) in queue.iter().copied().enumerate() {
+            let row_counterpart = row.counterpart.as_deref().filter(|id| !id.is_empty());
+            if row.video_id == wanted || row_counterpart == Some(wanted) {
+                return Some(DuplicateMatch {
+                    position,
+                    video_id: row.video_id.clone(),
+                    counterpart: row_counterpart.map(str::to_owned),
+                    matched_by: matched_by.to_owned(),
+                });
+            }
+        }
+    }
+    None
+}
+
 /// The standard error envelope. `error` is a stable machine code; `message` is human-readable.
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
@@ -27,6 +66,9 @@ pub struct ErrorBody {
     /// Existing queue index on a `duplicate` rejection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<usize>,
+    /// The row that matched, on a `duplicate` rejection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched: Option<DuplicateMatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_sec: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,6 +84,7 @@ impl ErrorBody {
             message: message.into(),
             current: None,
             position: None,
+            matched: None,
             duration_sec: None,
             max_duration_sec: None,
             status,
@@ -86,10 +129,14 @@ impl ErrorBody {
         )
     }
 
-    pub fn duplicate(position: usize) -> Self {
-        let mut error =
-            Self::new(StatusCode::CONFLICT, "duplicate", "that video is already in the queue");
-        error.position = Some(position);
+    pub fn duplicate(matched: DuplicateMatch) -> Self {
+        let mut error = Self::new(
+            StatusCode::CONFLICT,
+            "duplicate",
+            "that song is already in the queue (counterparts count as the same song)",
+        );
+        error.position = Some(matched.position);
+        error.matched = Some(matched);
         error
     }
 
@@ -673,14 +720,14 @@ pub trait ControlApiContext: Send + Sync + 'static {
     async fn resolve_input(&self, parsed: &ParsedInput) -> Result<SongItem, ResolveError>;
 
     /// Check duplicates and insert under one queue lock. `Ok` is the final index and the row as it
-    /// exists after insertion (so callers see `queued`/`queued_end`); `Err` is the existing index.
-    /// `allow_duplicates` skips only the API-level check.
+    /// exists after insertion (so callers see `queued`/`queued_end`); `Err` names the existing row,
+    /// including a counterpart match. `allow_duplicates` skips only the API-level check.
     async fn insert_request(
         self: Arc<Self>,
         item: SongItem,
         next: bool,
         allow_duplicates: bool,
-    ) -> Result<(usize, SongItem), usize>;
+    ) -> Result<(usize, SongItem), DuplicateMatch>;
 }
 
 #[async_trait::async_trait]
@@ -759,7 +806,7 @@ impl ControlApiContext for crate::state::AppState {
         item: SongItem,
         next: bool,
         allow_duplicates: bool,
-    ) -> Result<(usize, SongItem), usize> {
+    ) -> Result<(usize, SongItem), DuplicateMatch> {
         self.insert_queued_checked(item, next, None, allow_duplicates).await
     }
 }
