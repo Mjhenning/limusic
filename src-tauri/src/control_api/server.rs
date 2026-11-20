@@ -38,6 +38,7 @@ pub struct IntegrationsManager {
     context: Arc<dyn ControlApiContext>,
     inner: Arc<Mutex<Inner>>,
     token: Arc<RwLock<String>>,
+    mutation: Arc<Mutex<()>>,
 }
 
 impl IntegrationsManager {
@@ -48,11 +49,16 @@ impl IntegrationsManager {
             context: state,
             inner: Arc::new(Mutex::new(Inner::default())),
             token: Arc::new(RwLock::new(token)),
+            mutation: Arc::new(Mutex::new(())),
         }
     }
 
     fn shared(&self) -> Arc<ApiShared> {
-        Arc::new(ApiShared { token: self.token.clone(), context: self.context.clone() })
+        Arc::new(ApiShared {
+            token: self.token.clone(),
+            context: self.context.clone(),
+            mutation: self.mutation.clone(),
+        })
     }
 
     /// Called from Tauri setup. A bad saved setting is reported through `last_error`, never by

@@ -101,6 +101,13 @@ fn bad_request(error: &'static str, message: impl Into<String>) -> ErrorBody {
     ErrorBody::new(StatusCode::BAD_REQUEST, error, message)
 }
 
+/// One lock for every endpoint that changes the current track or the queue. Callers hold the guard
+/// across their state read and mutation so two simultaneous requests cannot both act on the same
+/// pre-change snapshot.
+async fn mutation_lock(shared: &ApiShared) -> tokio::sync::MutexGuard<'_, ()> {
+    shared.mutation.lock().await
+}
+
 async fn final_playback_state(shared: &ApiShared) -> PlaybackStateResponse {
     let snap = shared.context.playback_snapshot().await;
     PlaybackStateResponse {
@@ -136,20 +143,27 @@ async fn toggle(State(shared): State<Arc<ApiShared>>) -> Response {
 }
 
 /// `POST /api/v1/playback/next`: waits for the new current row, including a synchronous autoplay
-/// fetch, and returns that queue item. A miss is a `next_timeout`, not a silent success.
+/// fetch, and returns that queue item. A `next_timeout` includes the track that was current when
+/// the wait expired; it does not guarantee the skip did not complete, so re-read `/status` before
+/// retrying.
 async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
+    let _lock = mutation_lock(&shared).await;
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
     match shared.context.clone().next().await {
         Some(item) => Json(item).into_response(),
-        None => ErrorBody::next_timeout().into_response(),
+        None => {
+            let current = shared.context.playback_snapshot().await.get("now").cloned();
+            ErrorBody::next_timeout(current).into_response()
+        }
     }
 }
 
 /// `POST /api/v1/playback/previous`: uses the UI's rewind-then-step rule. `restarted` reports which
 /// branch ran; the read-only queue `previous` field is always current-1.
 async fn previous(State(shared): State<Arc<ApiShared>>) -> Response {
+    let _lock = mutation_lock(&shared).await;
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -195,8 +209,10 @@ async fn volume(State(shared): State<Arc<ApiShared>>, Json(body): Json<VolumeReq
 }
 
 /// `POST /api/v1/queue/remove`: removes an upcoming row only; out-of-range and current indices are
-/// rejected instead of silently ignored.
+/// rejected instead of silently ignored. An optional `video_id` makes the removal conditional: a
+/// stale id gets `queue_changed` without touching the queue.
 async fn remove(State(shared): State<Arc<ApiShared>>, Json(body): Json<RemoveRequest>) -> Response {
+    let _lock = mutation_lock(&shared).await;
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -206,12 +222,24 @@ async fn remove(State(shared): State<Arc<ApiShared>>, Json(body): Json<RemoveReq
     if body.index >= shared.context.clone().queue_len().await || body.index == current {
         return bad_request("invalid_index", "index is not an upcoming queue row").into_response();
     }
+    if let Some(expected) = &body.video_id {
+        let actual = snap
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| rows.get(body.index))
+            .and_then(|row| row.get("videoId"))
+            .and_then(serde_json::Value::as_str);
+        if actual != Some(expected.as_str()) {
+            return ErrorBody::queue_changed().into_response();
+        }
+    }
     shared.context.clone().remove_at(body.index).await;
     Json(OkResponse { ok: true }).into_response()
 }
 
 /// `POST /api/v1/queue/clear-queued`: clears manually queued rows via the existing app path.
 async fn clear_queued(State(shared): State<Arc<ApiShared>>) -> Response {
+    let _lock = mutation_lock(&shared).await;
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -228,7 +256,9 @@ mod tests {
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
     use tokio::sync::RwLock;
+    use tokio::time::sleep;
     use tower::ServiceExt;
 
     use crate::state::QueueNeighbors;
@@ -250,6 +280,9 @@ mod tests {
         volume_calls: AtomicUsize,
         removals: StdMutex<Vec<usize>>,
         clears: AtomicUsize,
+        delay: Duration,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
     }
 
     impl Default for MockContext {
@@ -270,7 +303,25 @@ mod tests {
                 volume_calls: AtomicUsize::new(0),
                 removals: StdMutex::new(Vec::new()),
                 clears: AtomicUsize::new(0),
+                delay: Duration::ZERO,
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
             }
+        }
+    }
+
+    impl MockContext {
+        async fn enter(&self) {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                // Sleep while still counted, so overlapping calls are visible to the test.
+                sleep(self.delay).await;
+            }
+        }
+
+        fn exit(&self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -339,11 +390,17 @@ mod tests {
         }
 
         async fn next(self: Arc<Self>) -> Option<Value> {
-            self.next_item.lock().unwrap().clone()
+            self.enter().await;
+            let item = self.next_item.lock().unwrap().clone();
+            self.exit();
+            item
         }
 
         async fn previous(self: Arc<Self>) -> bool {
-            self.restarted
+            self.enter().await;
+            let restarted = self.restarted;
+            self.exit();
+            restarted
         }
 
         async fn seek(self: Arc<Self>, position: f64) -> Result<f64, String> {
@@ -362,11 +419,15 @@ mod tests {
         }
 
         async fn remove_at(self: Arc<Self>, index: usize) {
+            self.enter().await;
             self.removals.lock().unwrap().push(index);
+            self.exit();
         }
 
         async fn clear_queued(self: Arc<Self>) {
+            self.enter().await;
             self.clears.fetch_add(1, Ordering::SeqCst);
+            self.exit();
         }
     }
 
@@ -375,6 +436,7 @@ mod tests {
         let shared = Arc::new(ApiShared {
             token: Arc::new(RwLock::new("abc123".to_string())),
             context: context.clone(),
+            mutation: Arc::new(tokio::sync::Mutex::new(())),
         });
         (router(shared), context)
     }
@@ -612,7 +674,10 @@ mod tests {
         let response =
             request(app, "/api/v1/playback/next", json!({}), Some("Bearer abc123")).await;
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(json_body(response).await["error"], "next_timeout");
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "next_timeout");
+        assert_eq!(json["current"]["videoId"], "abc");
+        assert!(json["message"].as_str().unwrap().contains("may still have completed"));
     }
 
     #[tokio::test]
@@ -645,5 +710,45 @@ mod tests {
         assert_eq!(json_body(response).await["ok"], true);
         assert_eq!(*ctx.removals.lock().unwrap(), vec![1]);
         assert_eq!(ctx.clears.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_refuses_stale_video_id() {
+        let (app, ctx) = test_router();
+        let response = request(
+            app.clone(),
+            "/api/v1/queue/remove",
+            json!({ "index": 1, "video_id": "stale" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "queue_changed");
+        assert!(ctx.removals.lock().unwrap().is_empty());
+
+        let response = request(
+            app,
+            "/api/v1/queue/remove",
+            json!({ "index": 1, "video_id": "b" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*ctx.removals.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn current_track_and_queue_mutations_are_serialized() {
+        let (app, ctx) = test_router_with(MockContext {
+            delay: Duration::from_millis(80),
+            ..Default::default()
+        });
+        let next = request(app.clone(), "/api/v1/playback/next", json!({}), Some("Bearer abc123"));
+        let clear = request(app, "/api/v1/queue/clear-queued", json!({}), Some("Bearer abc123"));
+        let (next, clear) = tokio::join!(next, clear);
+        assert_eq!(next.status(), StatusCode::OK);
+        assert_eq!(clear.status(), StatusCode::OK);
+        assert_eq!(ctx.max_active.load(Ordering::SeqCst), 1);
     }
 }

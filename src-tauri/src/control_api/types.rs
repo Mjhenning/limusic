@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::state::QueueNeighbors;
 
@@ -18,13 +18,16 @@ use crate::state::QueueNeighbors;
 pub struct ErrorBody {
     pub error: &'static str,
     pub message: String,
+    /// Present on `next_timeout`: the track that was current when the wait expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<Value>,
     #[serde(skip)]
     status: StatusCode,
 }
 
 impl ErrorBody {
     pub fn new(status: StatusCode, error: &'static str, message: impl Into<String>) -> Self {
-        Self { error, message: message.into(), status }
+        Self { error, message: message.into(), current: None, status }
     }
 
     pub fn unauthorized() -> Self {
@@ -47,11 +50,21 @@ impl ErrorBody {
         Self::new(StatusCode::CONFLICT, "remote_linked", "another linked device is the player")
     }
 
-    pub fn next_timeout() -> Self {
-        Self::new(
+    pub fn next_timeout(current: Option<Value>) -> Self {
+        let mut error = Self::new(
             StatusCode::GATEWAY_TIMEOUT,
             "next_timeout",
-            "the next track did not become current",
+            "the next track did not become current; the skip may still have completed",
+        );
+        error.current = current;
+        error
+    }
+
+    pub fn queue_changed() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "queue_changed",
+            "the queue row changed before the request was applied",
         )
     }
 
@@ -197,10 +210,13 @@ pub struct VolumeRequest {
     pub volume: i64,
 }
 
-/// `POST /api/v1/queue/remove` body. `index` is zero-based in the displayed queue.
+/// `POST /api/v1/queue/remove` body. `index` is zero-based in the displayed queue. When
+/// `video_id` is supplied, the row must still match or the request is refused with `queue_changed`.
 #[derive(Debug, Deserialize)]
 pub struct RemoveRequest {
     pub index: usize,
+    #[serde(default)]
+    pub video_id: Option<String>,
 }
 
 /// Final transport state returned by Play, Pause, and Toggle.
@@ -268,7 +284,8 @@ pub trait ControlApiContext: Send + Sync + 'static {
     /// Toggle transport state and report the final state.
     async fn toggle(self: Arc<Self>);
 
-    /// Skip and return the new current queue item, or `None` on timeout/failure.
+    /// Skip and return the new current queue item, or `None` on timeout/failure. A timeout does
+    /// not guarantee the skip did not complete; callers should re-read `/status` before retrying.
     async fn next(self: Arc<Self>) -> Option<Value>;
 
     /// Step back; returns whether the current track was rewound.
@@ -363,4 +380,6 @@ impl ControlApiContext for crate::state::AppState {
 pub struct ApiShared {
     pub token: Arc<RwLock<String>>,
     pub context: Arc<dyn ControlApiContext>,
+    /// Serializes current-track/queue mutations so chat-driven callers see each other's results.
+    pub mutation: Arc<Mutex<()>>,
 }
