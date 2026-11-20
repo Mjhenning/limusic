@@ -17,21 +17,52 @@ use crate::state::QueueNeighbors;
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub error: &'static str,
-    pub message: &'static str,
+    pub message: String,
+    #[serde(skip)]
+    status: StatusCode,
 }
 
 impl ErrorBody {
+    pub fn new(status: StatusCode, error: &'static str, message: impl Into<String>) -> Self {
+        Self { error, message: message.into(), status }
+    }
+
     pub fn unauthorized() -> Self {
-        Self {
-            error: "unauthorized",
-            message: "a valid Authorization: Bearer <token> header is required",
-        }
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "a valid Authorization: Bearer <token> header is required",
+        )
+    }
+
+    pub fn listen_together_guest() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "listen_together_guest",
+            "the Listen Together host controls playback",
+        )
+    }
+
+    pub fn remote_linked() -> Self {
+        Self::new(StatusCode::CONFLICT, "remote_linked", "another linked device is the player")
+    }
+
+    pub fn next_timeout() -> Self {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "next_timeout",
+            "the next track did not become current",
+        )
+    }
+
+    pub fn playback_error(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "playback_error", message)
     }
 }
 
 impl IntoResponse for ErrorBody {
     fn into_response(self) -> Response {
-        (StatusCode::UNAUTHORIZED, Json(self)).into_response()
+        (self.status, Json(self)).into_response()
     }
 }
 
@@ -154,6 +185,57 @@ impl QueueResponse {
     }
 }
 
+/// `POST /api/v1/playback/seek` body. `position` is seconds from the start of the track.
+#[derive(Debug, Deserialize)]
+pub struct SeekRequest {
+    pub position: f64,
+}
+
+/// `POST /api/v1/playback/volume` body. `volume` is an integer 0–100.
+#[derive(Debug, Deserialize)]
+pub struct VolumeRequest {
+    pub volume: i64,
+}
+
+/// `POST /api/v1/queue/remove` body. `index` is zero-based in the displayed queue.
+#[derive(Debug, Deserialize)]
+pub struct RemoveRequest {
+    pub index: usize,
+}
+
+/// Final transport state returned by Play, Pause, and Toggle.
+#[derive(Debug, Serialize)]
+pub struct PlaybackStateResponse {
+    pub playing: bool,
+}
+
+/// Result of Previous. `restarted` is true when the three-second rewind rule fired instead of
+/// stepping to another row; the queue's `previous` field is independent of this rule.
+#[derive(Debug, Serialize)]
+pub struct PreviousResponse {
+    pub ok: bool,
+    pub restarted: bool,
+}
+
+/// Effective seek target in seconds, echoed after validation and any clamp applied by the player.
+#[derive(Debug, Serialize)]
+pub struct SeekResponse {
+    /// Effective playback position in seconds.
+    pub position: f64,
+}
+
+/// Applied volume, an integer 0–100.
+#[derive(Debug, Serialize)]
+pub struct VolumeResponse {
+    pub volume: i64,
+}
+
+/// Generic success body for queue edits.
+#[derive(Debug, Serialize)]
+pub struct OkResponse {
+    pub ok: bool,
+}
+
 /// Everything handlers need from the app. Implemented by `AppState` in production and by a small
 /// mock in tests, which keeps router tests independent of a Tauri handle.
 #[async_trait::async_trait]
@@ -173,16 +255,49 @@ pub trait ControlApiContext: Send + Sync + 'static {
 
     /// `"none"`, `"host"`, or `"guest"`, matching the UI's Listen Together status.
     async fn listen_together_role(&self) -> String;
+
+    /// True when a Listen Together guest session owns playback policy.
+    async fn is_guest(&self) -> bool;
+
+    /// Idempotent Play; starts a restored queue when mpv is idle.
+    async fn play(self: Arc<Self>);
+
+    /// Idempotent Pause; shared with the Tauri pause command.
+    async fn pause(self: Arc<Self>);
+
+    /// Toggle transport state and report the final state.
+    async fn toggle(self: Arc<Self>);
+
+    /// Skip and return the new current queue item, or `None` on timeout/failure.
+    async fn next(self: Arc<Self>) -> Option<Value>;
+
+    /// Step back; returns whether the current track was rewound.
+    async fn previous(self: Arc<Self>) -> bool;
+
+    /// Apply a validated seek and return the effective position in seconds.
+    async fn seek(self: Arc<Self>, position: f64) -> Result<f64, String>;
+
+    /// Apply a validated volume, an integer 0–100.
+    async fn set_volume(self: Arc<Self>, volume: i64) -> Result<(), String>;
+
+    /// Number of rows in the displayed queue, for index validation.
+    async fn queue_len(self: Arc<Self>) -> usize;
+
+    /// Remove an upcoming queue row through the existing app path.
+    async fn remove_at(self: Arc<Self>, index: usize);
+
+    /// Clear manually queued rows through the existing app path.
+    async fn clear_queued(self: Arc<Self>);
 }
 
 #[async_trait::async_trait]
 impl ControlApiContext for crate::state::AppState {
     async fn playback_snapshot(&self) -> serde_json::Value {
-        self.playback_snapshot().await
+        crate::state::AppState::playback_snapshot(self).await
     }
 
     async fn queue_snapshot(&self) -> serde_json::Value {
-        self.queue_snapshot().await
+        crate::state::AppState::queue_snapshot(self).await
     }
 
     async fn queue_neighbors(&self) -> QueueNeighbors {
@@ -190,11 +305,56 @@ impl ControlApiContext for crate::state::AppState {
     }
 
     fn remote_linked(&self) -> bool {
-        self.remote_linked()
+        crate::state::AppState::remote_linked(self)
     }
 
     async fn listen_together_role(&self) -> String {
         self.lt_role().await
+    }
+
+    async fn is_guest(&self) -> bool {
+        self.lt.is_guest().await
+    }
+
+    async fn play(self: Arc<Self>) {
+        self.play_playback().await;
+    }
+
+    async fn pause(self: Arc<Self>) {
+        self.pause_playback().await;
+    }
+
+    async fn toggle(self: Arc<Self>) {
+        self.resume_or_toggle().await;
+    }
+
+    async fn next(self: Arc<Self>) -> Option<Value> {
+        self.next_with_current().await
+    }
+
+    async fn previous(self: Arc<Self>) -> bool {
+        self.previous_with_restart().await
+    }
+
+    async fn seek(self: Arc<Self>, position: f64) -> Result<f64, String> {
+        self.user_seek(position).await?;
+        Ok(position.max(0.0))
+    }
+
+    async fn set_volume(self: Arc<Self>, volume: i64) -> Result<(), String> {
+        self.set_volume_with_effects(volume)
+    }
+
+    async fn queue_len(self: Arc<Self>) -> usize {
+        crate::state::AppState::queue_len(self.as_ref()).await
+    }
+
+    async fn remove_at(self: Arc<Self>, index: usize) {
+        self.remove_from_queue(index).await;
+    }
+
+    async fn clear_queued(self: Arc<Self>) {
+        crate::state::AppState::clear_queued(&self).await;
     }
 }
 

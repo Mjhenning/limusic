@@ -4,7 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::sync::Arc;
 
@@ -62,6 +62,9 @@ struct Listen {
 /// delay has to outlast that, plus up to a second each way for the watcher's polling.
 const AUTO_PAUSE_DELAY: Duration = Duration::from_secs(1);
 const AUTO_RESUME_DELAY: Duration = Duration::from_secs(10);
+/// How long the control API waits for a Skip to land a new current row, including an autoplay
+/// fetch. Longer than a normal resolve but short enough to answer a stuck skip with an error.
+const CONTROL_API_NEXT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct AppState {
     pub it: InnerTube,
@@ -1903,6 +1906,93 @@ impl AppState {
             }
         }
         let _ = self.player.toggle();
+    }
+
+    /// Idempotent Play for external controllers: start the restored/current row if mpv has nothing
+    /// loaded, resume it if paused, and do nothing if it is already playing.
+    pub async fn play_playback(self: &std::sync::Arc<Self>) {
+        if self.link_route(|_| Some(RemoteAction::Play)) {
+            self.emit_ui_event("playback-state", "playing", true);
+            return;
+        }
+        if self.lt.is_guest().await {
+            return; // guest playback is host-driven
+        }
+        if self.player.is_idle() {
+            let (idx, has_items) = {
+                let q = self.queue.lock().await;
+                (q.current, !q.items.is_empty())
+            };
+            if has_items {
+                self.play_index(idx).await;
+            }
+            return;
+        }
+        if self.player.is_paused() {
+            let _ = self.player.play();
+        }
+    }
+
+    /// Idempotent Pause shared by the Tauri command and the control API. A restored or idle queue
+    /// has nothing to pause, so that case is a no-op too.
+    pub async fn pause_playback(self: &std::sync::Arc<Self>) {
+        if self.link_route(|_| Some(RemoteAction::Pause)) {
+            self.emit_ui_event("playback-state", "paused", true);
+            return;
+        }
+        if self.lt.is_guest().await || self.player.is_idle() || self.player.is_paused() {
+            return;
+        }
+        let _ = self.player.pause();
+    }
+
+    /// Skip once and wait until the new row is current, returning its queue item. `play_index`
+    /// bumps `generation` before resolving, so a repeat-one advance to the same index still
+    /// counts; an autoplay fetch that produces nothing leaves it unchanged and times out.
+    pub async fn next_with_current(self: &std::sync::Arc<Self>) -> Option<serde_json::Value> {
+        let before = self.generation.load(Ordering::SeqCst);
+        self.next_in_queue().await;
+        let deadline = Instant::now() + CONTROL_API_NEXT_TIMEOUT;
+        loop {
+            if self.generation.load(Ordering::SeqCst) > before {
+                let snap = self.queue_snapshot().await;
+                let current =
+                    snap.get("currentIndex").and_then(serde_json::Value::as_u64).unwrap_or(0)
+                        as usize;
+                if let Some(item) = snap
+                    .get("items")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|rows| rows.get(current))
+                {
+                    return Some(item.clone());
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Previous for the control API. `true` means the transport rewound the current track rather
+    /// than stepping to another row; the number is the three-second rule the UI button uses.
+    pub async fn previous_with_restart(self: &std::sync::Arc<Self>) -> bool {
+        let restarted = self.current_position() > PREV_REWIND_SECS && !self.lt.is_guest().await;
+        self.prev_in_queue().await;
+        restarted
+    }
+
+    /// Every volume change from the UI, hotkeys, and the control API lands here: mpv, the saved
+    /// setting, the mute-toggle memory, both windows, OS media controls, and a linked phone.
+    pub fn set_volume_with_effects(&self, volume: i64) -> Result<(), String> {
+        self.player.set_volume(volume).map_err(|e| e.to_string())?;
+        if volume > 0 {
+            crate::hotkeys::LAST_NONZERO_VOLUME.store(volume, Ordering::Relaxed);
+        }
+        self.db.set_setting("volume", &volume.to_string());
+        self.emit_ui_event("volume", volume, true);
+        self.media_set_volume(volume);
+        Ok(())
     }
 
     /// Jump to a specific queue index.
@@ -3776,6 +3866,11 @@ impl AppState {
     /// `queue_snapshot()` has already applied it.
     pub async fn queue_navigation(&self) -> QueueNeighbors {
         queue_neighbors_from_snapshot(&self.queue_snapshot().await)
+    }
+
+    /// Number of rows in the displayed queue, for external index validation.
+    pub async fn queue_len(&self) -> usize {
+        self.queue.lock().await.items.len()
     }
 
     /// True when a linked device, not this desktop, is the current player. Mutations from the

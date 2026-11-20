@@ -1372,6 +1372,7 @@ pub fn run() {
             commands::toggle_shuffle,
             commands::set_repeat,
             commands::toggle_pause,
+            commands::pause,
             commands::seek,
             commands::playback_clock,
             commands::set_volume,

@@ -203,6 +203,14 @@ pub async fn toggle_pause(state: St<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// Idempotent Pause, exposed for controllers that have separate Play and Pause buttons. Shares the
+/// exact path the control API uses.
+#[tauri::command]
+pub async fn pause(state: St<'_>) -> Result<(), String> {
+    state.inner().clone().pause_playback().await;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn seek(state: St<'_>, position: f64) -> Result<(), String> {
     // Routed through AppState so a Listen Together host broadcasts the seek and a guest is blocked.
@@ -211,15 +219,7 @@ pub async fn seek(state: St<'_>, position: f64) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn set_volume(state: St<'_>, volume: i64) -> Result<(), String> {
-    state.player.set_volume(volume).map_err(|e| e.to_string())?;
-    if volume > 0 {
-        crate::hotkeys::LAST_NONZERO_VOLUME.store(volume, std::sync::atomic::Ordering::Relaxed);
-    }
-    // There is one volume and there can be two windows (the mini player). Without this the one
-    // that didn't move the slider keeps showing the old level and lies about what you're hearing.
-    state.emit_ui_event("volume", volume, true);
-    state.media_set_volume(volume);
-    Ok(())
+    state.set_volume_with_effects(volume)
 }
 
 /// A fresh position and when it was read (`AppState::playback_clock`). Async, so the read of mpv
