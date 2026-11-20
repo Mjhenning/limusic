@@ -316,11 +316,13 @@ fn resolve_error(error: ResolveError) -> ErrorBody {
 }
 
 /// `POST /api/v1/queue/request`: resolve one song and add it to the queue. The response is
-/// `{ok, position, item}`; `position` is the final zero-based index and `item` includes `duration`
-/// and `queued_by`.
+/// `{ok, position, item}`; `position` is the final zero-based index and `item` is the queued
+/// [`ApiTrack`], including `is_video`, `duration_sec` and `queued_by`.
 ///
-/// `max_duration_sec` fails closed with 422 `duration_unknown` unless `allow_unknown_duration` is
-/// true; a known but longer track gets 422 `too_long` with `duration_sec` and `max_duration_sec`.
+/// `max_duration_sec` measures the version that will actually play: the queued `video_id`'s own
+/// duration, never its counterpart's. No extra `/player` lookup is made. It fails closed with 422
+/// `duration_unknown` unless `allow_unknown_duration` is true; a known but longer track gets 422
+/// `too_long` with `duration_sec` and `max_duration_sec`.
 /// Duplicate rejection (409 with the existing `position`) is skipped by `allow_duplicates`, but the
 /// app's global `prevent_duplicates` setting still applies inside the insertion. A timeout from a
 /// previous skip never leaves this endpoint guessing: it holds the same mutation lock as other
@@ -1388,6 +1390,7 @@ mod tests {
         assert_eq!(json["item"]["queued"], true);
         assert_eq!(json["item"]["queued_end"], false);
         assert_eq!(json["item"]["duration_sec"], 180);
+        assert_eq!(json["item"]["is_video"], false);
         assert_eq!(json["item"]["artist_list"][0], "Tester");
         assert_eq!(ctx.inserted.lock().unwrap()[0].1, true);
     }
@@ -1483,5 +1486,29 @@ mod tests {
             assert!(json["matched"]["video_id"].as_str().is_some());
             assert!(ctx.inserted.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn request_response_reports_the_queued_video_version() {
+        let (app, _) = test_router_with(MockContext {
+            resolve_item: SongItem {
+                is_video: true,
+                counterpart: Some("audio123".into()),
+                ..resolved("video123", Some("5:00"))
+            },
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song", "max_duration_sec": 360 }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(response).await;
+        assert_eq!(json["item"]["video_id"], "video123");
+        assert_eq!(json["item"]["is_video"], true);
+        assert_eq!(json["item"]["duration_sec"], 300);
     }
 }

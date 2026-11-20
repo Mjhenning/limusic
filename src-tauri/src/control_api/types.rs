@@ -615,7 +615,9 @@ pub struct QueueRequest {
     pub input: String,
     #[serde(default)]
     pub requested_by: Option<String>,
-    /// Maximum accepted track length in whole seconds.
+    /// Maximum accepted track length in whole seconds. Applies to the version that will actually
+    /// play: the queued `video_id`'s own duration, never its counterpart's. No extra `/player`
+    /// lookup is made; unknown durations fail closed unless `allow_unknown_duration` is set.
     #[serde(default)]
     pub max_duration_sec: Option<u64>,
     /// Skip this request's duplicate rejection. The app's global `prevent_duplicates` setting still
@@ -643,8 +645,9 @@ pub struct SimpleQueueRequest {
 }
 
 /// Success body for all three queue-request endpoints. `position` is the final zero-based queue
-/// index of the inserted row, including 0 when an empty queue starts playback. `item` is the full
-/// `SongItem` actually queued, so it carries `duration` and `queued_by` without a second lookup.
+/// index of the inserted row, including 0 when an empty queue starts playback. `item` is the slim
+/// [`ApiTrack`] actually queued, so `is_video` and `duration_sec` describe the exact version that
+/// will play without a second lookup.
 #[derive(Debug, Serialize)]
 pub struct QueueRequestResponse {
     pub ok: bool,
