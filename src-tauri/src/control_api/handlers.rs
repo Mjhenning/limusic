@@ -140,9 +140,9 @@ async fn toggle(State(shared): State<Arc<ApiShared>>) -> Response {
 }
 
 /// `POST /api/v1/playback/next`: waits for the new current row, including a synchronous autoplay
-/// fetch, and returns that queue item. A `next_timeout` includes the track that was current when
-/// the wait expired; it does not guarantee the skip did not complete, so re-read `/status` before
-/// retrying.
+/// fetch, and returns that queue item. The wait ends when the queue's current index or video id
+/// changes, not when audio starts. A `next_timeout` includes the track that was current when the
+/// wait expired; it does not guarantee the skip failed, so re-read `/status` before retrying.
 async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
     let _lock = mutation_lock(&shared).await;
     if let Err(error) = guard(&shared).await {

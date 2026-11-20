@@ -387,7 +387,7 @@ pub trait ControlApiContext: Send + Sync + 'static {
     async fn toggle(self: Arc<Self>) -> bool;
 
     /// Skip and return the new current queue item, or `None` on timeout/failure. A timeout does
-    /// not guarantee the skip did not complete; callers should re-read `/status` before retrying.
+    /// not guarantee the skip failed; callers should re-read `/status` before retrying.
     async fn next(self: Arc<Self>) -> Option<Value>;
 
     /// Step back; returns whether the current track was rewound.

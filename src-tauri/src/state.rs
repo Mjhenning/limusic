@@ -64,7 +64,7 @@ const AUTO_PAUSE_DELAY: Duration = Duration::from_secs(1);
 const AUTO_RESUME_DELAY: Duration = Duration::from_secs(10);
 /// How long the control API waits for a Skip to land a new current row, including an autoplay
 /// fetch. Longer than a normal resolve but short enough to answer a stuck skip with an error.
-const CONTROL_API_NEXT_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_API_NEXT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct AppState {
     pub it: InnerTube,
@@ -1963,23 +1963,49 @@ impl AppState {
         playing
     }
 
-    /// Skip once and wait until the new row is current, returning its queue item. `play_index`
-    /// bumps `generation` before resolving, so a repeat-one advance to the same index still
-    /// counts; an autoplay fetch that produces nothing leaves it unchanged and times out.
+    /// Skip once and wait until the new row is current, returning its queue item.
+    ///
+    /// Readiness is a queue fact: the current index or video id changed. It deliberately does not
+    /// wait for mpv to start audio, which can lag a network resolve by seconds. The deadline starts
+    /// before the skip so a synchronous autoplay fetch is covered too; a repeat-one advance keeps
+    /// the same row but bumps `generation`, which is the other acceptable signal. An autoplay fetch
+    /// that produces nothing leaves both unchanged and times out.
     pub async fn next_with_current(self: &std::sync::Arc<Self>) -> Option<serde_json::Value> {
-        let before = self.generation.load(Ordering::SeqCst);
-        self.next_in_queue().await;
+        let before_gen = self.generation.load(Ordering::SeqCst);
+        let (before_index, before_id) = {
+            let snap = self.queue_snapshot().await;
+            let index =
+                snap.get("currentIndex").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+            let id = snap
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|rows| rows.get(index))
+                .and_then(|row| row.get("videoId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            (index, id)
+        };
         let deadline = Instant::now() + CONTROL_API_NEXT_TIMEOUT;
+        self.next_in_queue().await;
         loop {
-            if self.generation.load(Ordering::SeqCst) > before {
-                let snap = self.queue_snapshot().await;
-                let current =
-                    snap.get("currentIndex").and_then(serde_json::Value::as_u64).unwrap_or(0)
-                        as usize;
+            let snap = self.queue_snapshot().await;
+            let index =
+                snap.get("currentIndex").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+            let id = snap
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|rows| rows.get(index))
+                .and_then(|row| row.get("videoId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let advanced = index != before_index
+                || id != before_id
+                || self.generation.load(Ordering::SeqCst) > before_gen;
+            if advanced {
                 if let Some(item) = snap
                     .get("items")
                     .and_then(serde_json::Value::as_array)
-                    .and_then(|rows| rows.get(current))
+                    .and_then(|rows| rows.get(index))
                 {
                     return Some(item.clone());
                 }
