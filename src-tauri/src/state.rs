@@ -3429,15 +3429,19 @@ impl AppState {
     /// window that asks for the current track can't be told a different shape than one that
     /// listened for it.
     fn now_playing_json(item: &SongItem, stream_client: &str, live: bool) -> serde_json::Value {
+        let artist_list = crate::control_api::types::artist_list(item);
+        let duration_sec = crate::control_api::types::duration_secs(item.duration.as_deref());
         let mut value = serde_json::json!({
             "videoId": item.video_id,
             "title": item.title,
             "artists": item.artists,
+            "artist_list": artist_list,
             "artistId": item.artist_id,
             // Per-artist links, so a collab in the player bar navigates like it does in a row.
             "artistRuns": item.artist_runs,
             "thumbnail": item.thumbnail,
             "duration": item.duration,
+            "duration_sec": duration_sec,
             // The lyrics fetch needs it on a gapless advance, where the queue event that would
             // carry it lands after this one.
             "album": item.album,
@@ -5399,7 +5403,7 @@ impl AppState {
         if items.is_empty() {
             return 0;
         }
-        let (index, was_empty) = {
+        let (index, was_empty, _) = {
             let mut q = self.queue.lock().await;
             self.insert_queued_inner(&mut q, items, next, from).await
         };
@@ -5418,17 +5422,18 @@ impl AppState {
         next: bool,
         from: Option<String>,
         allow_duplicates: bool,
-    ) -> Result<usize, usize> {
+    ) -> Result<(usize, SongItem), usize> {
         let mut q = self.queue.lock().await;
         if !allow_duplicates {
             if let Some(existing) = q.items.iter().position(|i| i.video_id == item.video_id) {
                 return Err(existing);
             }
         }
-        let (index, was_empty) = self.insert_queued_inner(&mut q, vec![item], next, from).await;
+        let (index, was_empty, inserted) =
+            self.insert_queued_inner(&mut q, vec![item], next, from).await;
         drop(q);
         self.finish_insert(was_empty).await;
-        Ok(index)
+        Ok((index, inserted))
     }
 
     /// The locked body of [`Self::insert_queued`]. Caller owns the queue guard, which is what lets
@@ -5439,7 +5444,7 @@ impl AppState {
         mut items: Vec<SongItem>,
         next: bool,
         from: Option<String>,
-    ) -> (usize, bool) {
+    ) -> (usize, bool, SongItem) {
         for item in &mut items {
             item.queued = next;
             item.queued_end = !next;
@@ -5448,6 +5453,7 @@ impl AppState {
             item.autoplay = false;
         }
         let dedupe = self.db.get_setting("prevent_duplicates").as_deref() == Some("true");
+        let first_item = items.first().cloned().unwrap_or_default();
         let (index, was_empty) = {
             let qm = &mut *q;
             let was_empty = qm.items.is_empty();
@@ -5526,7 +5532,7 @@ impl AppState {
             }
             (index, was_empty)
         };
-        (index, was_empty)
+        (index, was_empty, first_item)
     }
 
     /// Post-splice side effects shared by both insertion paths. An add to an empty queue is the

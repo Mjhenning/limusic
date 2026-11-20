@@ -120,6 +120,14 @@ impl ErrorBody {
         error
     }
 
+    pub fn explicit_content() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "explicit_content",
+            "the resolved track is explicit and reject_explicit is set",
+        )
+    }
+
     pub fn playback_error(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "playback_error", message)
     }
@@ -196,6 +204,148 @@ where
     }
 }
 
+/// Query extractor that keeps malformed query strings in the error envelope too.
+#[derive(Debug, Clone, Copy)]
+pub struct ApiQuery<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ErrorBody;
+
+    fn from_request(
+        req: AxumRequest,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        async move {
+            let query = req.uri().query().unwrap_or("");
+            let value = serde_urlencoded::from_str(query)
+                .map_err(|_| ErrorBody::invalid_input("invalid query string"))?;
+            Ok(Self(value))
+        }
+    }
+}
+
+/// Parse a `SongItem.duration` string (`m:ss` / `h:m:ss`) into whole seconds. `None` means the
+/// metadata gave no usable length, which is the `duration_unknown` case.
+pub fn duration_secs(text: Option<&str>) -> Option<u64> {
+    let text = text?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut parts = 0;
+    for part in text.split(':') {
+        parts += 1;
+        if parts > 3 {
+            return None;
+        }
+        total = total.checked_mul(60)?.checked_add(part.parse::<u64>().ok()?)?;
+    }
+    Some(total)
+}
+
+/// Per-artist names that link to an artist page. Separator runs (`", "`, `" & "`) have no id and
+/// are skipped; when the row carries no linked runs the display string is the only safe array.
+pub fn artist_list(item: &SongItem) -> Vec<String> {
+    let linked: Vec<String> = item
+        .artist_runs
+        .iter()
+        .filter(|run| run.id.as_deref().is_some_and(|id| !id.is_empty()))
+        .map(|run| run.text.clone())
+        .collect();
+    if linked.is_empty() {
+        vec![item.artists.clone()]
+    } else {
+        linked
+    }
+}
+
+/// The stable, slim track shape exposed by the control API. Optional metadata may be `null` — a
+/// URL-resolved row often has no album or thumbnail — but library tokens, play count, rating and
+/// added_at are never exposed. `duration_sec` is parsed from `duration` for convenience.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApiTrack {
+    pub video_id: String,
+    pub title: String,
+    pub artists: Option<String>,
+    pub artist_list: Vec<String>,
+    pub album: Option<String>,
+    pub album_id: Option<String>,
+    pub duration: Option<String>,
+    pub duration_sec: Option<u64>,
+    pub thumbnail: Option<String>,
+    pub explicit: bool,
+    pub is_video: bool,
+    pub live: bool,
+    pub queued_by: Option<String>,
+    pub queued: bool,
+    pub queued_end: bool,
+}
+
+impl ApiTrack {
+    pub fn from_song_item(item: &SongItem, live: bool) -> Self {
+        Self {
+            video_id: item.video_id.clone(),
+            title: item.title.clone(),
+            artists: Some(item.artists.clone()),
+            artist_list: artist_list(item),
+            album: item.album.clone(),
+            album_id: item.album_id.clone(),
+            duration: item.duration.clone(),
+            duration_sec: duration_secs(item.duration.as_deref()),
+            thumbnail: item.thumbnail.clone(),
+            explicit: item.explicit,
+            is_video: item.is_video,
+            live,
+            queued_by: item.queued_by.clone(),
+            queued: item.queued,
+            queued_end: item.queued_end,
+        }
+    }
+
+    /// Accepts both the app's snake_case `SongItem` rows and older `videoId` shaped snapshots from
+    /// tests and remote-device payloads. Missing fields stay `null`/empty rather than failing.
+    pub fn from_value(value: &Value) -> Self {
+        if let Ok(item) = serde_json::from_value::<SongItem>(value.clone()) {
+            let live = value.get("live").and_then(Value::as_bool).unwrap_or(false);
+            return Self::from_song_item(&item, live);
+        }
+        let get = |snake: &str, camel: &str| field(value, snake, camel);
+        let duration = get("duration", "duration").and_then(Value::as_str).map(str::to_owned);
+        let artists = get("artists", "artists").and_then(Value::as_str).map(str::to_owned);
+        let artist_list = get("artist_list", "artistList")
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_else(|| artists.clone().into_iter().collect());
+        Self {
+            video_id: get("video_id", "videoId").and_then(Value::as_str).unwrap_or_default().into(),
+            title: get("title", "title").and_then(Value::as_str).unwrap_or_default().into(),
+            artists,
+            artist_list,
+            album: get("album", "album").and_then(Value::as_str).map(str::to_owned),
+            album_id: get("album_id", "albumId").and_then(Value::as_str).map(str::to_owned),
+            duration_sec: get("duration_sec", "durationSec")
+                .and_then(Value::as_u64)
+                .or_else(|| duration_secs(duration.as_deref())),
+            duration,
+            thumbnail: get("thumbnail", "thumbnail").and_then(Value::as_str).map(str::to_owned),
+            explicit: get("explicit", "explicit").and_then(Value::as_bool).unwrap_or(false),
+            is_video: get("is_video", "isVideo").and_then(Value::as_bool).unwrap_or(false),
+            live: get("live", "live").and_then(Value::as_bool).unwrap_or(false),
+            queued_by: get("queued_by", "queuedBy").and_then(Value::as_str).map(str::to_owned),
+            queued: get("queued", "queued").and_then(Value::as_bool).unwrap_or(false),
+            queued_end: get("queued_end", "queuedEnd").and_then(Value::as_bool).unwrap_or(false),
+        }
+    }
+}
+
+fn field<'a>(value: &'a Value, snake: &str, camel: &str) -> Option<&'a Value> {
+    value.get(snake).or_else(|| value.get(camel))
+}
+
 /// `GET /api/v1/status`. The full playback snapshot plus device context; never the bearer token.
 ///
 /// `now` mirrors the UI's `now-playing` object and carries `queued_by` when the current row was
@@ -264,61 +414,89 @@ impl NowPlayingResponse {
     }
 }
 
-/// `GET /api/v1/queue`. A defined projection of the UI queue, not the raw snapshot.
+/// `GET /api/v1/queue`. A defined projection of the displayed queue, not the raw snapshot.
 ///
-/// Item objects are unchanged, including `queued_by` on attributed rows. `current_index` is the
-/// zero-based playing row; `next` and `previous` are the whole item objects (or `null`) at
-/// `next_index` / `previous_index`. Those indices follow the displayed, possibly shuffled order.
-/// `next_is_autoplay_fetch` is true only when `next` is absent because a repeat-off tail would
-/// fetch autoplay. `shuffle`, `repeat` (`"off"`, `"all"`, or `"one"`), and `autoplay` are the
-/// queue's current modes. No field here has a time unit.
+/// Items, `next` and `previous` are [`ApiTrack`] values. `current_index`, `next_index` and
+/// `previous_index` are zero-based indices into the full queue; `total` is its length before any
+/// `limit`/`offset` slicing. `next_is_autoplay_fetch` is true only when `next` is absent because a
+/// repeat-off tail would fetch autoplay. No field here has a time unit except `duration_sec` on a
+/// track, which is seconds.
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct QueueResponse {
-    pub items: Vec<Value>,
-    /// Zero-based index of the playing row in `items`.
+    pub items: Vec<ApiTrack>,
+    /// Zero-based index of the playing row in the full queue.
     pub current_index: usize,
     pub shuffle: bool,
     pub repeat: String,
     pub autoplay: bool,
-    pub next: Option<Value>,
-    pub previous: Option<Value>,
+    pub next: Option<ApiTrack>,
+    pub previous: Option<ApiTrack>,
     pub next_index: Option<usize>,
     pub previous_index: Option<usize>,
     pub next_is_autoplay_fetch: bool,
+    pub total: usize,
 }
 
 impl QueueResponse {
     pub fn from_snapshot(mut snap: Value, neighbors: QueueNeighbors) -> Self {
+        let current_index = snap.get("currentIndex").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let raw_items = snap.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+        let items: Vec<ApiTrack> = raw_items.iter().map(ApiTrack::from_value).collect();
+        let track = |index: Option<usize>| -> Option<ApiTrack> {
+            index.and_then(|i| items.get(i)).cloned()
+        };
+        let total = items.len();
         if let Some(object) = snap.as_object_mut() {
+            object.insert("items".into(), serde_json::to_value(&items).unwrap_or(Value::Null));
+            object.insert("current_index".into(), serde_json::json!(current_index));
             object.insert(
-                "current_index".into(),
-                object.get("currentIndex").cloned().unwrap_or(serde_json::json!(0)),
+                "next".into(),
+                serde_json::to_value(track(neighbors.next)).unwrap_or(Value::Null),
             );
-            let items = object.get("items").and_then(Value::as_array).cloned();
-            let track = |index: Option<usize>| -> Value {
-                index
-                    .and_then(|i| items.as_ref().and_then(|rows| rows.get(i)))
-                    .cloned()
-                    .unwrap_or(Value::Null)
-            };
-            object.insert("next".into(), track(neighbors.next));
-            object.insert("previous".into(), track(neighbors.previous));
+            object.insert(
+                "previous".into(),
+                serde_json::to_value(track(neighbors.previous)).unwrap_or(Value::Null),
+            );
             object.insert("next_index".into(), serde_json::json!(neighbors.next));
             object.insert("previous_index".into(), serde_json::json!(neighbors.previous));
             object.insert(
                 "next_is_autoplay_fetch".into(),
                 serde_json::json!(neighbors.next_is_autoplay_fetch),
             );
+            object.insert("total".into(), serde_json::json!(total));
         }
         serde_json::from_value(snap).unwrap_or_default()
     }
+
+    /// Slice only the page of rows; `total` and the navigation fields still describe the full
+    /// queue. With no parameters this is a clone of the unmodified response.
+    pub fn page(mut self, limit: Option<usize>, offset: Option<usize>) -> Self {
+        if limit.is_some() || offset.is_some() {
+            let start = offset.unwrap_or(0).min(self.items.len());
+            let end =
+                limit.map_or(self.items.len(), |n| start.saturating_add(n).min(self.items.len()));
+            self.items = self.items[start..end.max(start)].to_vec();
+        }
+        self
+    }
 }
 
-/// `POST /api/v1/playback/seek` body. `position` is seconds from the start of the track.
+/// Optional `limit`/`offset` paging for `GET /api/v1/queue`.
+#[derive(Debug, Deserialize)]
+pub struct QueueQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// `POST /api/v1/playback/seek` body. `position_sec` is seconds from the start of the track;
+/// `position` remains accepted as a serde alias for older clients.
 #[derive(Debug, Deserialize)]
 pub struct SeekRequest {
-    pub position: f64,
+    #[serde(alias = "position")]
+    pub position_sec: f64,
 }
 
 /// `POST /api/v1/playback/volume` body. `volume` is an integer 0–100.
@@ -336,30 +514,43 @@ pub struct RemoveRequest {
     pub video_id: Option<String>,
 }
 
-/// Final transport state returned by Play, Pause, and Toggle.
+/// Final transport state returned by Play, Pause and Toggle. `playing` is the state after the
+/// command; `ok` is always true on success.
 #[derive(Debug, Serialize)]
 pub struct PlaybackStateResponse {
+    pub ok: bool,
     pub playing: bool,
 }
 
+/// Result of Next. `current` is the queue row that became current after the skip.
+#[derive(Debug, Serialize)]
+pub struct NextResponse {
+    pub ok: bool,
+    pub current: ApiTrack,
+}
+
 /// Result of Previous. `restarted` is true when the three-second rewind rule fired instead of
-/// stepping to another row; the queue's `previous` field is independent of this rule.
+/// stepping to another row; `current` is the row current after the action. The read-only queue
+/// `previous` field is independent of this rule.
 #[derive(Debug, Serialize)]
 pub struct PreviousResponse {
     pub ok: bool,
     pub restarted: bool,
+    pub current: ApiTrack,
 }
 
-/// Effective seek target in seconds, echoed after validation and any clamp applied by the player.
+/// Effective seek target in seconds, echoed after validation.
 #[derive(Debug, Serialize)]
 pub struct SeekResponse {
+    pub ok: bool,
     /// Effective playback position in seconds.
-    pub position: f64,
+    pub position_sec: f64,
 }
 
 /// Applied volume, an integer 0–100.
 #[derive(Debug, Serialize)]
 pub struct VolumeResponse {
+    pub ok: bool,
     pub volume: i64,
 }
 
@@ -384,12 +575,16 @@ pub struct QueueRequest {
     /// applies inside the queue insertion.
     #[serde(default)]
     pub allow_duplicates: bool,
-    /// Insert at the Play-next boundary instead of before autoplay filler at the tail.
+    /// Insert at the FIFO Play-next block instead of before autoplay filler at the tail. Omitted on
+    /// `/queue/request` means true; the thin `/queue/add` variant sets false explicitly.
     #[serde(default)]
-    pub play_next: bool,
+    pub play_next: Option<bool>,
     /// Accept a track whose duration is missing or unparseable when `max_duration_sec` is set.
     #[serde(default)]
     pub allow_unknown_duration: bool,
+    /// Refuse explicit tracks with 422 `explicit_content`.
+    #[serde(default)]
+    pub reject_explicit: bool,
 }
 
 /// Thin variant body for `/queue/add` and `/queue/play-next`; all other options take their defaults.
@@ -407,7 +602,7 @@ pub struct SimpleQueueRequest {
 pub struct QueueRequestResponse {
     pub ok: bool,
     pub position: usize,
-    pub item: Value,
+    pub item: ApiTrack,
 }
 
 /// Resolution failures that are not plain parser errors. Parser errors are mapped directly from
@@ -477,14 +672,15 @@ pub trait ControlApiContext: Send + Sync + 'static {
     /// Resolve a parsed input to one fully-described song, including duration.
     async fn resolve_input(&self, parsed: &ParsedInput) -> Result<SongItem, ResolveError>;
 
-    /// Check duplicates and insert under one queue lock. `Ok` is the final index; `Err` is the
-    /// index of the existing copy. `allow_duplicates` skips only the API-level check.
+    /// Check duplicates and insert under one queue lock. `Ok` is the final index and the row as it
+    /// exists after insertion (so callers see `queued`/`queued_end`); `Err` is the existing index.
+    /// `allow_duplicates` skips only the API-level check.
     async fn insert_request(
         self: Arc<Self>,
         item: SongItem,
         next: bool,
         allow_duplicates: bool,
-    ) -> Result<usize, usize>;
+    ) -> Result<(usize, SongItem), usize>;
 }
 
 #[async_trait::async_trait]
@@ -563,7 +759,7 @@ impl ControlApiContext for crate::state::AppState {
         item: SongItem,
         next: bool,
         allow_duplicates: bool,
-    ) -> Result<usize, usize> {
+    ) -> Result<(usize, SongItem), usize> {
         self.insert_queued_checked(item, next, None, allow_duplicates).await
     }
 }
@@ -575,4 +771,30 @@ pub struct ApiShared {
     pub context: Arc<dyn ControlApiContext>,
     /// Serializes current-track/queue mutations so chat-driven callers see each other's results.
     pub mutation: Arc<Mutex<()>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innertube::models::metadata::ArtistRun;
+
+    #[test]
+    fn duration_and_artist_helpers_cover_display_metadata() {
+        assert_eq!(duration_secs(Some("3:04")), Some(184));
+        assert_eq!(duration_secs(Some("1:02:03")), Some(3723));
+        assert_eq!(duration_secs(Some("nope")), None);
+        assert_eq!(duration_secs(None), None);
+
+        let item = SongItem {
+            artists: "A & B".into(),
+            artist_runs: vec![
+                ArtistRun { text: "A".into(), id: Some("a".into()) },
+                ArtistRun { text: " & ".into(), id: None },
+                ArtistRun { text: "B".into(), id: Some("b".into()) },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(artist_list(&item), vec!["A", "B"]);
+        assert_eq!(artist_list(&SongItem::default()), vec![""]);
+    }
 }

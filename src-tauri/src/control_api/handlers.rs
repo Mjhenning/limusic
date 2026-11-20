@@ -14,10 +14,10 @@ use axum::{
 };
 
 use super::types::{
-    ApiJson, ApiShared, ErrorBody, NowPlayingResponse, OkResponse, PlaybackStateResponse,
-    PreviousResponse, QueueRequest, QueueRequestResponse, QueueResponse, RemoveRequest,
-    ResolveError, SeekRequest, SeekResponse, SimpleQueueRequest, StatusResponse, VolumeRequest,
-    VolumeResponse,
+    duration_secs, ApiJson, ApiQuery, ApiShared, ApiTrack, ErrorBody, NextResponse,
+    NowPlayingResponse, OkResponse, PlaybackStateResponse, PreviousResponse, QueueQuery,
+    QueueRequest, QueueRequestResponse, QueueResponse, RemoveRequest, ResolveError, SeekRequest,
+    SeekResponse, SimpleQueueRequest, StatusResponse, VolumeRequest, VolumeResponse,
 };
 
 /// Accept only `Authorization: Bearer <token>`. No query-string fallback, no CORS headers. The
@@ -93,11 +93,16 @@ async fn now_playing(State(shared): State<Arc<ApiShared>>) -> Response {
 }
 
 /// `GET /api/v1/queue`: a defined projection of the displayed queue. UI-only fields such as
-/// `currentIndex` and `prevTrack` are deliberately absent. See [`QueueResponse`] for the contract.
-async fn queue(State(shared): State<Arc<ApiShared>>) -> Response {
+/// `currentIndex` and `prevTrack` are deliberately absent. `limit` and `offset` page `items` only;
+/// `total` and the navigation indices still describe the full queue. See [`QueueResponse`].
+async fn queue(
+    State(shared): State<Arc<ApiShared>>,
+    ApiQuery(query): ApiQuery<QueueQuery>,
+) -> Response {
     let snap = shared.context.queue_snapshot().await;
     let neighbors = shared.context.queue_neighbors().await;
-    Json(QueueResponse::from_snapshot(snap, neighbors)).into_response()
+    Json(QueueResponse::from_snapshot(snap, neighbors).page(query.limit, query.offset))
+        .into_response()
 }
 
 /// Guest first, then remote link, before any handler touches playback or queue state. The order is
@@ -129,7 +134,7 @@ async fn play(State(shared): State<Arc<ApiShared>>) -> Response {
         return error.into_response();
     }
     let playing = shared.context.clone().play().await;
-    Json(PlaybackStateResponse { playing }).into_response()
+    Json(PlaybackStateResponse { ok: true, playing }).into_response()
 }
 
 /// `POST /api/v1/playback/pause`: idempotent. Safe on an idle or already-paused queue.
@@ -138,7 +143,7 @@ async fn pause(State(shared): State<Arc<ApiShared>>) -> Response {
         return error.into_response();
     }
     let playing = shared.context.clone().pause().await;
-    Json(PlaybackStateResponse { playing }).into_response()
+    Json(PlaybackStateResponse { ok: true, playing }).into_response()
 }
 
 /// `POST /api/v1/playback/toggle`: flips transport state and reports the final state.
@@ -147,20 +152,23 @@ async fn toggle(State(shared): State<Arc<ApiShared>>) -> Response {
         return error.into_response();
     }
     let playing = shared.context.clone().toggle().await;
-    Json(PlaybackStateResponse { playing }).into_response()
+    Json(PlaybackStateResponse { ok: true, playing }).into_response()
 }
 
 /// `POST /api/v1/playback/next`: waits for the new current row, including a synchronous autoplay
-/// fetch, and returns that queue item. The wait ends when the queue's current index or video id
-/// changes, not when audio starts. A `next_timeout` includes the track that was current when the
-/// wait expired; it does not guarantee the skip failed, so re-read `/status` before retrying.
+/// fetch, and returns `{ok, current}` with that queue item. The wait ends when the queue's current
+/// index or video id changes, not when audio starts. A `next_timeout` includes the track that was
+/// current when the wait expired; it does not guarantee the skip failed, so re-read `/status`
+/// before retrying.
 async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
     let _lock = mutation_lock(&shared).await;
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
     match shared.context.clone().next().await {
-        Some(item) => Json(item).into_response(),
+        Some(item) => {
+            Json(NextResponse { ok: true, current: ApiTrack::from_value(&item) }).into_response()
+        }
         None => {
             let current = shared.context.playback_snapshot().await.get("now").cloned();
             ErrorBody::next_timeout(current).into_response()
@@ -168,19 +176,33 @@ async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
     }
 }
 
-/// `POST /api/v1/playback/previous`: uses the UI's rewind-then-step rule. `restarted` reports which
-/// branch ran; the read-only queue `previous` field is always current-1.
+/// `POST /api/v1/playback/previous`: uses the UI's rewind-then-step rule. The body has `ok`,
+/// `restarted` (which branch ran) and `current` (the row now playing). The read-only queue
+/// `previous` field is always current-1.
 async fn previous(State(shared): State<Arc<ApiShared>>) -> Response {
     let _lock = mutation_lock(&shared).await;
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
     let restarted = shared.context.clone().previous().await;
-    Json(PreviousResponse { ok: true, restarted }).into_response()
+    Json(PreviousResponse { ok: true, restarted, current: current_api_track(&shared).await })
+        .into_response()
 }
 
-/// `POST /api/v1/playback/seek`: validates a finite position in seconds from 0 to the reported
-/// duration, then echoes the effective position.
+/// The current row after a transport action, read from the queue projection rather than the raw UI
+/// snapshot. A stale or empty queue is represented by a default (empty) track instead of an error.
+async fn current_api_track(shared: &ApiShared) -> ApiTrack {
+    let snap = shared.context.queue_snapshot().await;
+    let index = snap.get("currentIndex").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+    snap.get("items")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rows| rows.get(index))
+        .map(ApiTrack::from_value)
+        .unwrap_or_default()
+}
+
+/// `POST /api/v1/playback/seek`: validates a finite `position_sec` (alias `position`) from 0 to the
+/// reported duration, then echoes the effective value as `position_sec`.
 async fn seek(
     State(shared): State<Arc<ApiShared>>,
     ApiJson(body): ApiJson<SeekRequest>,
@@ -188,18 +210,18 @@ async fn seek(
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
-    if !body.position.is_finite() || body.position < 0.0 {
+    if !body.position_sec.is_finite() || body.position_sec < 0.0 {
         return bad_request("invalid_position", "position must be finite and non-negative")
             .into_response();
     }
     let snap = shared.context.playback_snapshot().await;
     let duration = snap.get("duration").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-    if !duration.is_finite() || body.position > duration {
+    if !duration.is_finite() || body.position_sec > duration {
         return bad_request("invalid_position", "position exceeds the current duration")
             .into_response();
     }
-    match shared.context.clone().seek(body.position).await {
-        Ok(position) => Json(SeekResponse { position }).into_response(),
+    match shared.context.clone().seek(body.position_sec).await {
+        Ok(position) => Json(SeekResponse { ok: true, position_sec: position }).into_response(),
         Err(message) => ErrorBody::playback_error(message).into_response(),
     }
 }
@@ -217,9 +239,13 @@ async fn volume(
             .into_response();
     }
     match shared.context.clone().set_volume(body.volume).await {
-        Ok(()) => Json(VolumeResponse { volume: body.volume }).into_response(),
+        Ok(()) => Json(VolumeResponse { ok: true, volume: body.volume }).into_response(),
         Err(message) => ErrorBody::playback_error(message).into_response(),
     }
+}
+
+fn row_video_id(row: &serde_json::Value) -> Option<&serde_json::Value> {
+    row.get("video_id").or_else(|| row.get("videoId"))
 }
 
 /// `POST /api/v1/queue/remove`: removes an upcoming row only; out-of-range and current indices are
@@ -244,7 +270,7 @@ async fn remove(
             .get("items")
             .and_then(serde_json::Value::as_array)
             .and_then(|rows| rows.get(body.index))
-            .and_then(|row| row.get("videoId"))
+            .and_then(row_video_id)
             .and_then(serde_json::Value::as_str);
         if actual != Some(expected.as_str()) {
             return ErrorBody::queue_changed().into_response();
@@ -289,25 +315,6 @@ fn resolve_error(error: ResolveError) -> ErrorBody {
     }
 }
 
-/// Parse a `SongItem.duration` string (`m:ss` / `h:m:ss`) into whole seconds. `None` means the
-/// metadata did not give us a usable length, which is the `duration_unknown` case.
-fn duration_secs(text: Option<&str>) -> Option<u64> {
-    let text = text?.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let mut total = 0u64;
-    let mut parts = 0;
-    for part in text.split(':') {
-        parts += 1;
-        if parts > 3 {
-            return None;
-        }
-        total = total.checked_mul(60)?.checked_add(part.parse::<u64>().ok()?)?;
-    }
-    Some(total)
-}
-
 /// `POST /api/v1/queue/request`: resolve one song and add it to the queue. The response is
 /// `{ok, position, item}`; `position` is the final zero-based index and `item` includes `duration`
 /// and `queued_by`.
@@ -331,6 +338,9 @@ async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Res
         Ok(item) => item,
         Err(error) => return resolve_error(error).into_response(),
     };
+    if body.reject_explicit && item.explicit {
+        return ErrorBody::explicit_content().into_response();
+    }
     if let Some(max) = body.max_duration_sec {
         match duration_secs(item.duration.as_deref()) {
             None if !body.allow_unknown_duration => {
@@ -351,13 +361,13 @@ async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Res
     match shared
         .context
         .clone()
-        .insert_request(item.clone(), body.play_next, body.allow_duplicates)
+        .insert_request(item.clone(), body.play_next.unwrap_or(true), body.allow_duplicates)
         .await
     {
-        Ok(position) => Json(QueueRequestResponse {
+        Ok((position, inserted)) => Json(QueueRequestResponse {
             ok: true,
             position,
-            item: serde_json::to_value(item).unwrap_or(serde_json::Value::Null),
+            item: ApiTrack::from_song_item(&inserted, false),
         })
         .into_response(),
         Err(position) => ErrorBody::duplicate(position).into_response(),
@@ -384,8 +394,9 @@ async fn queue_add(
             requested_by: body.requested_by,
             max_duration_sec: None,
             allow_duplicates: false,
-            play_next: false,
+            play_next: Some(false),
             allow_unknown_duration: false,
+            reject_explicit: false,
         },
     )
     .await
@@ -403,8 +414,9 @@ async fn queue_play_next(
             requested_by: body.requested_by,
             max_duration_sec: None,
             allow_duplicates: false,
-            play_next: true,
+            play_next: Some(true),
             allow_unknown_duration: false,
+            reject_explicit: false,
         },
     )
     .await
@@ -672,7 +684,7 @@ mod tests {
             item: SongItem,
             next: bool,
             allow_duplicates: bool,
-        ) -> Result<usize, usize> {
+        ) -> Result<(usize, SongItem), usize> {
             self.enter().await;
             let result = {
                 let mut rows = self.rows.lock().unwrap();
@@ -694,7 +706,8 @@ mod tests {
                         at
                     } else {
                         rows.iter().position(|row| row.autoplay).unwrap_or(rows.len())
-                    };
+                    }
+                    .min(rows.len());
                     rows.insert(
                         at,
                         MockRow {
@@ -704,11 +717,14 @@ mod tests {
                             queued_by: item.queued_by.clone(),
                         },
                     );
-                    Ok(at)
+                    let mut inserted = item.clone();
+                    inserted.queued = next;
+                    inserted.queued_end = at + 1 == rows.len();
+                    Ok((at, inserted))
                 })
             };
-            if result.is_ok() {
-                self.inserted.lock().unwrap().push((item, next, allow_duplicates));
+            if let Ok((_, ref inserted)) = result {
+                self.inserted.lock().unwrap().push((inserted.clone(), next, allow_duplicates));
             }
             self.exit();
             result
@@ -821,7 +837,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = json_body(response).await;
         assert_eq!(json["current_index"], 0);
-        assert_eq!(json["next"]["videoId"], "b");
+        assert_eq!(json["next"]["video_id"], "b");
         assert_eq!(json["next"]["queued_by"], "friend");
         assert_eq!(json["next_is_autoplay_fetch"], false);
         assert!(json["previous"].is_null());
@@ -960,7 +976,7 @@ mod tests {
     async fn seek_and_volume_echo_applied_values() {
         let response = post("/api/v1/playback/seek", json!({ "position": 5.0 })).await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(json_body(response).await["position"], 5.0);
+        assert_eq!(json_body(response).await["position_sec"], 5.0);
 
         let response = post("/api/v1/playback/volume", json!({ "volume": 42 })).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -971,7 +987,7 @@ mod tests {
     async fn next_returns_new_current_item() {
         let response = post("/api/v1/playback/next", json!({})).await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(json_body(response).await["videoId"], "next");
+        assert_eq!(json_body(response).await["current"]["video_id"], "next");
     }
 
     #[tokio::test]
@@ -1315,5 +1331,76 @@ mod tests {
             request(app, "/api/v1/playback/volume", Value::Null, Some("Bearer abc123")).await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(json_body(response).await["error"], "method_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn queue_paging_keeps_full_queue_context() {
+        let (app, _) = test_router();
+        let response =
+            request(app, "/api/v1/queue?limit=1&offset=1", Value::Null, Some("Bearer abc123"))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(response).await;
+        assert_eq!(json["items"].as_array().unwrap().len(), 1);
+        assert_eq!(json["items"][0]["video_id"], "b");
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["current_index"], 0);
+        assert_eq!(json["next_index"], 1);
+    }
+
+    #[tokio::test]
+    async fn queue_request_defaults_to_play_next_and_returns_final_row() {
+        let (app, ctx) = test_router();
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song", "requested_by": "alice" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(response).await;
+        assert_eq!(json["position"], 1);
+        assert_eq!(json["item"]["video_id"], "resolved123");
+        assert_eq!(json["item"]["queued"], true);
+        assert_eq!(json["item"]["queued_end"], false);
+        assert_eq!(json["item"]["duration_sec"], 180);
+        assert_eq!(json["item"]["artist_list"][0], "Tester");
+        assert_eq!(ctx.inserted.lock().unwrap()[0].1, true);
+    }
+
+    #[tokio::test]
+    async fn reject_explicit_refuses_before_insertion() {
+        let explicit = SongItem { explicit: true, ..resolved("explicit123", Some("3:00")) };
+        let (app, ctx) =
+            test_router_with(MockContext { resolve_item: explicit, ..Default::default() });
+        let response = request(
+            app.clone(),
+            "/api/v1/queue/request",
+            json!({ "input": "song", "reject_explicit": true }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json_body(response).await["error"], "explicit_content");
+        assert!(ctx.inserted.lock().unwrap().is_empty());
+
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn seek_accepts_canonical_seconds_field() {
+        let response = post("/api/v1/playback/seek", json!({ "position_sec": 5.0 })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(response).await;
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["position_sec"], 5.0);
     }
 }
