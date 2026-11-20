@@ -14,9 +14,10 @@ use axum::{
 };
 
 use super::types::{
-    ApiShared, ErrorBody, NowPlayingResponse, OkResponse, PlaybackStateResponse, PreviousResponse,
-    QueueRequest, QueueRequestResponse, QueueResponse, RemoveRequest, ResolveError, SeekRequest,
-    SeekResponse, SimpleQueueRequest, StatusResponse, VolumeRequest, VolumeResponse,
+    ApiJson, ApiShared, ErrorBody, NowPlayingResponse, OkResponse, PlaybackStateResponse,
+    PreviousResponse, QueueRequest, QueueRequestResponse, QueueResponse, RemoveRequest,
+    ResolveError, SeekRequest, SeekResponse, SimpleQueueRequest, StatusResponse, VolumeRequest,
+    VolumeResponse,
 };
 
 /// Accept only `Authorization: Bearer <token>`. No query-string fallback, no CORS headers. The
@@ -61,8 +62,18 @@ pub fn router(shared: Arc<ApiShared>) -> Router {
         .route("/api/v1/queue/request", post(queue_request))
         .route("/api/v1/queue/add", post(queue_add))
         .route("/api/v1/queue/play-next", post(queue_play_next))
+        .fallback(route_not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(shared.clone(), require_bearer))
         .with_state(shared)
+}
+
+async fn route_not_found() -> Response {
+    ErrorBody::route_not_found().into_response()
+}
+
+async fn method_not_allowed() -> Response {
+    ErrorBody::method_not_allowed().into_response()
 }
 
 /// `GET /api/v1/status`: the full playback snapshot plus device and Listen Together context.
@@ -170,7 +181,10 @@ async fn previous(State(shared): State<Arc<ApiShared>>) -> Response {
 
 /// `POST /api/v1/playback/seek`: validates a finite position in seconds from 0 to the reported
 /// duration, then echoes the effective position.
-async fn seek(State(shared): State<Arc<ApiShared>>, Json(body): Json<SeekRequest>) -> Response {
+async fn seek(
+    State(shared): State<Arc<ApiShared>>,
+    ApiJson(body): ApiJson<SeekRequest>,
+) -> Response {
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -191,7 +205,10 @@ async fn seek(State(shared): State<Arc<ApiShared>>, Json(body): Json<SeekRequest
 }
 
 /// `POST /api/v1/playback/volume`: validates an integer 0–100 before touching the player.
-async fn volume(State(shared): State<Arc<ApiShared>>, Json(body): Json<VolumeRequest>) -> Response {
+async fn volume(
+    State(shared): State<Arc<ApiShared>>,
+    ApiJson(body): ApiJson<VolumeRequest>,
+) -> Response {
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -208,7 +225,10 @@ async fn volume(State(shared): State<Arc<ApiShared>>, Json(body): Json<VolumeReq
 /// `POST /api/v1/queue/remove`: removes an upcoming row only; out-of-range and current indices are
 /// rejected instead of silently ignored. An optional `video_id` makes the removal conditional: a
 /// stale id gets `queue_changed` without touching the queue.
-async fn remove(State(shared): State<Arc<ApiShared>>, Json(body): Json<RemoveRequest>) -> Response {
+async fn remove(
+    State(shared): State<Arc<ApiShared>>,
+    ApiJson(body): ApiJson<RemoveRequest>,
+) -> Response {
     let _lock = mutation_lock(&shared).await;
     if let Err(error) = guard(&shared).await {
         return error.into_response();
@@ -346,7 +366,7 @@ async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Res
 
 async fn queue_request(
     State(shared): State<Arc<ApiShared>>,
-    Json(body): Json<QueueRequest>,
+    ApiJson(body): ApiJson<QueueRequest>,
 ) -> Response {
     handle_queue_request(shared, body).await
 }
@@ -355,7 +375,7 @@ async fn queue_request(
 /// options object). `play_next` is false and `allow_duplicates` stays at the app default.
 async fn queue_add(
     State(shared): State<Arc<ApiShared>>,
-    Json(body): Json<SimpleQueueRequest>,
+    ApiJson(body): ApiJson<SimpleQueueRequest>,
 ) -> Response {
     handle_queue_request(
         shared,
@@ -374,7 +394,7 @@ async fn queue_add(
 /// `POST /api/v1/queue/play-next`: thin Play-next variant of `/queue/request`.
 async fn queue_play_next(
     State(shared): State<Arc<ApiShared>>,
-    Json(body): Json<SimpleQueueRequest>,
+    ApiJson(body): ApiJson<SimpleQueueRequest>,
 ) -> Response {
     handle_queue_request(
         shared,
@@ -1247,5 +1267,53 @@ mod tests {
         assert_eq!(codes, [200, 409]);
         assert_eq!(ctx.max_active.load(Ordering::SeqCst), 1);
         assert_eq!(ctx.inserted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_bodies_use_the_error_envelope() {
+        let (app, _) = test_router();
+        for (body, field) in [(json!({}), "volume"), (json!({ "volume": "loud" }), "volume")] {
+            let response =
+                request(app.clone(), "/api/v1/playback/volume", body, Some("Bearer abc123")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("application/json")));
+            let json = json_body(response).await;
+            assert_eq!(json["error"], "invalid_input");
+            assert!(json["message"].as_str().unwrap().contains(field));
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_content_type_uses_the_error_envelope() {
+        let req = Request::builder()
+            .uri("/api/v1/playback/volume")
+            .method("POST")
+            .header(AUTHORIZATION, "Bearer abc123")
+            .header("content-type", "text/plain")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = test_router().0.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "unsupported_media_type");
+        assert_eq!(json["message"], "request bodies must use application/json");
+    }
+
+    #[tokio::test]
+    async fn routing_failures_use_the_error_envelope() {
+        let (app, _) = test_router();
+        let response =
+            request(app.clone(), "/api/v1/nope", Value::Null, Some("Bearer abc123")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(response).await["error"], "not_found");
+
+        let response =
+            request(app, "/api/v1/playback/volume", Value::Null, Some("Bearer abc123")).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(json_body(response).await["error"], "method_not_allowed");
     }
 }

@@ -3,12 +3,13 @@
 use std::sync::Arc;
 
 use axum::{
-    http::StatusCode,
+    extract::{FromRequest, Request as AxumRequest},
+    http::{header::CONTENT_TYPE, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use innertube::SongItem;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
@@ -122,11 +123,76 @@ impl ErrorBody {
     pub fn playback_error(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "playback_error", message)
     }
+
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_input", message)
+    }
+
+    pub fn unsupported_media_type() -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "request bodies must use application/json",
+        )
+    }
+
+    pub fn route_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", "no such API route")
+    }
+
+    pub fn method_not_allowed() -> Self {
+        Self::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", "method not allowed")
+    }
 }
 
 impl IntoResponse for ErrorBody {
     fn into_response(self) -> Response {
         (self.status, Json(self)).into_response()
+    }
+}
+
+/// JSON body extractor that puts every failure in the API's error envelope. `serde_path_to_error`
+/// names the offending field, so a missing or mistyped field gets a useful 400 `invalid_input`
+/// instead of axum's plain-text 422. A non-JSON `Content-Type` gets 415.
+#[derive(Debug, Clone, Copy)]
+pub struct ApiJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ErrorBody;
+
+    fn from_request(
+        req: AxumRequest,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        async move {
+            let is_json =
+                req.headers().get(CONTENT_TYPE).and_then(|value| value.to_str().ok()).is_some_and(
+                    |value| value.to_ascii_lowercase().starts_with("application/json"),
+                );
+            if !is_json {
+                return Err(ErrorBody::unsupported_media_type());
+            }
+            let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .map_err(|_| ErrorBody::invalid_input("could not read the JSON body"))?;
+            let value = serde_path_to_error::deserialize::<_, T>(
+                &mut serde_json::Deserializer::from_slice(&bytes),
+            )
+            .map_err(|error| {
+                let path = error.path().to_string();
+                let field = path.trim_start_matches('.').split('.').next().unwrap_or("body");
+                ErrorBody::invalid_input(format!(
+                    "invalid field '{}': {}",
+                    if field.is_empty() { "body" } else { field },
+                    error.inner()
+                ))
+            })?;
+            Ok(Self(value))
+        }
     }
 }
 
