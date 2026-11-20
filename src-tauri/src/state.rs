@@ -1971,19 +1971,22 @@ impl AppState {
     /// the same row but bumps `generation`, which is the other acceptable signal. An autoplay fetch
     /// that produces nothing leaves both unchanged and times out.
     pub async fn next_with_current(self: &std::sync::Arc<Self>) -> Option<serde_json::Value> {
+        // The app serializes SongItem as `video_id`; older snapshots and remote payloads use
+        // `videoId`. Readiness must recognize either spelling or it would miss an id-only advance.
+        let id_at = |snap: &serde_json::Value, index: usize| -> Option<String> {
+            snap.get("items")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|rows| rows.get(index))
+                .and_then(|row| row.get("video_id").or_else(|| row.get("videoId")))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
         let before_gen = self.generation.load(Ordering::SeqCst);
         let (before_index, before_id) = {
             let snap = self.queue_snapshot().await;
             let index =
                 snap.get("currentIndex").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
-            let id = snap
-                .get("items")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|rows| rows.get(index))
-                .and_then(|row| row.get("videoId"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
-            (index, id)
+            (index, id_at(&snap, index))
         };
         let deadline = Instant::now() + CONTROL_API_NEXT_TIMEOUT;
         self.next_in_queue().await;
@@ -1991,13 +1994,7 @@ impl AppState {
             let snap = self.queue_snapshot().await;
             let index =
                 snap.get("currentIndex").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
-            let id = snap
-                .get("items")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|rows| rows.get(index))
-                .and_then(|row| row.get("videoId"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
+            let id = id_at(&snap, index);
             let advanced = index != before_index
                 || id != before_id
                 || self.generation.load(Ordering::SeqCst) > before_gen;
