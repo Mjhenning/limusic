@@ -16,9 +16,10 @@ use tokio::sync::{Mutex, RwLock};
 use crate::integrations::parse::ParsedInput;
 use crate::state::QueueNeighbors;
 
-/// The existing queue row that made a request a duplicate. `matched_by` names the requested field:
-/// `video_id` or `counterpart`. The row is identified by both its id and its twin so a client can
-/// see that an audio request collided with a music video's counterpart (or vice versa).
+/// The existing queue row that made a request a duplicate. `matched_by` is `video_id` only for a
+/// direct `video_id`-to-`video_id` hit; any hit involving a counterpart id on either side is
+/// `counterpart`. The row is identified by both its id and its twin so a client can see that an
+/// audio request collided with a music video's counterpart (or vice versa).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DuplicateMatch {
     pub position: usize,
@@ -38,16 +39,18 @@ pub fn find_request_duplicate<'a>(
         ("counterpart", item.counterpart.as_deref().filter(|id| !id.is_empty())),
     ];
     let queue: Vec<&SongItem> = queue.into_iter().collect();
-    for (matched_by, wanted) in requested {
+    for (requested_field, wanted) in requested {
         let Some(wanted) = wanted else { continue };
         for (position, row) in queue.iter().copied().enumerate() {
             let row_counterpart = row.counterpart.as_deref().filter(|id| !id.is_empty());
             if row.video_id == wanted || row_counterpart == Some(wanted) {
+                let via_counterpart =
+                    requested_field == "counterpart" || row_counterpart == Some(wanted);
                 return Some(DuplicateMatch {
                     position,
                     video_id: row.video_id.clone(),
                     counterpart: row_counterpart.map(str::to_owned),
-                    matched_by: matched_by.to_owned(),
+                    matched_by: if via_counterpart { "counterpart" } else { "video_id" }.to_owned(),
                 });
             }
         }
@@ -465,9 +468,10 @@ impl NowPlayingResponse {
 ///
 /// Items, `next` and `previous` are [`ApiTrack`] values. `current_index`, `next_index` and
 /// `previous_index` are zero-based indices into the full queue; `total` is its length before any
-/// `limit`/`offset` slicing. `next_is_autoplay_fetch` is true only when `next` is absent because a
-/// repeat-off tail would fetch autoplay. No field here has a time unit except `duration_sec` on a
-/// track, which is seconds.
+/// `limit`/`offset` slicing. `offset` is the zero-based full-queue index the returned `items`
+/// window starts at; it is 0 when no window was requested. `next_is_autoplay_fetch` is true only
+/// when `next` is absent because a repeat-off tail would fetch autoplay. No field here has a time
+/// unit except `duration_sec` on a track, which is seconds.
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct QueueResponse {
@@ -483,6 +487,8 @@ pub struct QueueResponse {
     pub previous_index: Option<usize>,
     pub next_is_autoplay_fetch: bool,
     pub total: usize,
+    /// Full-queue index where the returned `items` window starts.
+    pub offset: usize,
 }
 
 impl QueueResponse {
@@ -512,15 +518,18 @@ impl QueueResponse {
                 serde_json::json!(neighbors.next_is_autoplay_fetch),
             );
             object.insert("total".into(), serde_json::json!(total));
+            object.insert("offset".into(), serde_json::json!(0));
         }
         serde_json::from_value(snap).unwrap_or_default()
     }
 
     /// Slice only the page of rows; `total` and the navigation fields still describe the full
-    /// queue. With no parameters this is a clone of the unmodified response.
+    /// queue and `offset` reports the full-queue start index that was used. With no parameters the
+    /// items are unchanged and `offset` is 0.
     pub fn page(mut self, limit: Option<usize>, offset: Option<usize>) -> Self {
+        let start = offset.unwrap_or(0).min(self.items.len());
+        self.offset = start;
         if limit.is_some() || offset.is_some() {
-            let start = offset.unwrap_or(0).min(self.items.len());
             let end =
                 limit.map_or(self.items.len(), |n| start.saturating_add(n).min(self.items.len()));
             self.items = self.items[start..end.max(start)].to_vec();
@@ -529,13 +538,17 @@ impl QueueResponse {
     }
 }
 
-/// Optional `limit`/`offset` paging for `GET /api/v1/queue`.
+/// Optional paging for `GET /api/v1/queue`. `from=current` is shorthand for
+/// `offset=current_index`; an explicit `offset` still wins when both are supplied. Any other
+/// `from` value is rejected with 400 `invalid_input`.
 #[derive(Debug, Deserialize)]
 pub struct QueueQuery {
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: Option<usize>,
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 /// `POST /api/v1/playback/seek` body. `position_sec` is seconds from the start of the track;

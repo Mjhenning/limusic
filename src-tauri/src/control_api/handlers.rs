@@ -94,15 +94,22 @@ async fn now_playing(State(shared): State<Arc<ApiShared>>) -> Response {
 
 /// `GET /api/v1/queue`: a defined projection of the displayed queue. UI-only fields such as
 /// `currentIndex` and `prevTrack` are deliberately absent. `limit` and `offset` page `items` only;
-/// `total` and the navigation indices still describe the full queue. See [`QueueResponse`].
+/// `total` and the navigation indices still describe the full queue. `from=current` starts the
+/// window at the current row so a client can fetch it plus upcoming tracks in one call; the
+/// effective full-queue start is echoed as `offset`. See [`QueueResponse`].
 async fn queue(
     State(shared): State<Arc<ApiShared>>,
     ApiQuery(query): ApiQuery<QueueQuery>,
 ) -> Response {
     let snap = shared.context.queue_snapshot().await;
     let neighbors = shared.context.queue_neighbors().await;
-    Json(QueueResponse::from_snapshot(snap, neighbors).page(query.limit, query.offset))
-        .into_response()
+    let response = QueueResponse::from_snapshot(snap, neighbors);
+    let offset = match query.from.as_deref() {
+        Some("current") => query.offset.or(Some(response.current_index)),
+        Some(_) => return bad_request("invalid_input", "from must be 'current'").into_response(),
+        None => query.offset,
+    };
+    Json(response.page(query.limit, offset)).into_response()
 }
 
 /// Guest first, then remote link, before any handler touches playback or queue state. The order is
@@ -860,6 +867,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = json_body(response).await;
         assert_eq!(json["current_index"], 0);
+        assert_eq!(json["offset"], 0);
         assert_eq!(json["next"]["video_id"], "b");
         assert_eq!(json["next"]["queued_by"], "friend");
         assert_eq!(json["next_is_autoplay_fetch"], false);
@@ -1370,6 +1378,7 @@ mod tests {
         assert_eq!(json["items"][0]["video_id"], "b");
         assert_eq!(json["total"], 3);
         assert_eq!(json["current_index"], 0);
+        assert_eq!(json["offset"], 1);
         assert_eq!(json["next_index"], 1);
     }
 
@@ -1445,12 +1454,12 @@ mod tests {
         };
         let cases = vec![
             // requested video_id == queue counterpart
-            (audio("audio1", None), row("video1", Some("audio1")), "video_id"),
+            (audio("audio1", None), row("video1", Some("audio1")), "counterpart"),
             // requested video_id == queue counterpart, roles reversed
             (
                 SongItem { is_video: true, ..audio("video2", Some("audio2")) },
                 row("audio2", Some("video2")),
-                "video_id",
+                "counterpart",
             ),
             // requested counterpart == queue video_id
             (
@@ -1510,5 +1519,76 @@ mod tests {
         assert_eq!(json["item"]["video_id"], "video123");
         assert_eq!(json["item"]["is_video"], true);
         assert_eq!(json["item"]["duration_sec"], 300);
+    }
+
+    #[tokio::test]
+    async fn audio_request_hitting_music_video_counterpart_reports_counterpart() {
+        let (app, _) = test_router_with(MockContext {
+            resolve_item: resolved("audio123", Some("3:00")),
+            rows: StdMutex::new(vec![MockRow {
+                id: "video123".into(),
+                counterpart: Some("audio123".into()),
+                autoplay: false,
+                queued: false,
+                queued_by: None,
+            }]),
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "song" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "duplicate");
+        assert_eq!(json["position"], 0);
+        assert_eq!(json["matched"]["video_id"], "video123");
+        assert_eq!(json["matched"]["counterpart"], "audio123");
+        assert_eq!(json["matched"]["matched_by"], "counterpart");
+    }
+
+    #[tokio::test]
+    async fn queue_from_current_starts_at_the_current_track() {
+        let (app, _) =
+            test_router_with(MockContext { current: AtomicUsize::new(1), ..Default::default() });
+        let response =
+            request(app, "/api/v1/queue?from=current&limit=2", Value::Null, Some("Bearer abc123"))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(response).await;
+        assert_eq!(json["offset"], 1);
+        assert_eq!(json["current_index"], 1);
+        assert_eq!(json["total"], 3);
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["video_id"], "b");
+        assert_eq!(items[1]["video_id"], "c");
+    }
+
+    #[tokio::test]
+    async fn queue_from_current_yields_to_an_explicit_offset() {
+        let (app, _) =
+            test_router_with(MockContext { current: AtomicUsize::new(1), ..Default::default() });
+        let response =
+            request(app, "/api/v1/queue?from=current&offset=2", Value::Null, Some("Bearer abc123"))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(response).await;
+        assert_eq!(json["offset"], 2);
+        assert_eq!(json["items"][0]["video_id"], "c");
+    }
+
+    #[tokio::test]
+    async fn queue_rejects_an_unknown_from_value() {
+        let (app, _) = test_router();
+        let response =
+            request(app, "/api/v1/queue?from=previous", Value::Null, Some("Bearer abc123")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "invalid_input");
+        assert_eq!(json["message"], "from must be 'current'");
     }
 }
