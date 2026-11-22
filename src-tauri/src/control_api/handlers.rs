@@ -1,6 +1,7 @@
 //! HTTP handlers and bearer-token middleware for the local control API.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::integrations::parse::{parse_input, ParseError};
 use crate::integrations::token::tokens_equal;
@@ -19,6 +20,13 @@ use super::types::{
     QueueRequest, QueueRequestResponse, QueueResponse, RemoveRequest, ResolveError, SeekRequest,
     SeekResponse, SimpleQueueRequest, StatusResponse, VolumeRequest, VolumeResponse,
 };
+
+/// A mutation waits at most this long for the shared lock; longer waits answer `503 busy` with
+/// `Retry-After: 10` instead of tying up an HTTP worker behind a stuck skip.
+const CONTROL_API_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The HTTP-side deadline for `POST /playback/next`. The underlying skip is detached, not aborted.
+const CONTROL_API_NEXT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Accept only `Authorization: Bearer <token>`. No query-string fallback, no CORS headers. The
 /// header and token are never logged, including on failure.
@@ -130,9 +138,17 @@ fn bad_request(error: &'static str, message: impl Into<String>) -> ErrorBody {
 
 /// One lock for every endpoint that changes the current track or the queue. Callers hold the guard
 /// across their state read and mutation so two simultaneous requests cannot both act on the same
-/// pre-change snapshot.
-async fn mutation_lock(shared: &ApiShared) -> tokio::sync::MutexGuard<'_, ()> {
-    shared.mutation.lock().await
+/// pre-change snapshot. A wait longer than 10 s is rejected as `busy`; the caller must not proceed
+/// without the guard, otherwise ordering would be lost.
+async fn mutation_lock(shared: &ApiShared) -> Result<tokio::sync::OwnedMutexGuard<()>, ErrorBody> {
+    // `lock_owned` ties the guard to the Arc, not to this borrow, so the next handler can hand it
+    // to the detached skip task and still be sure the lock is held until that task finishes.
+    tokio::time::timeout(
+        CONTROL_API_MUTATION_LOCK_TIMEOUT,
+        Arc::clone(&shared.mutation).lock_owned(),
+    )
+    .await
+    .map_err(|_| ErrorBody::busy())
 }
 
 /// `POST /api/v1/playback/play`: idempotent. Starts a restored queue when mpv is idle.
@@ -162,24 +178,40 @@ async fn toggle(State(shared): State<Arc<ApiShared>>) -> Response {
     Json(PlaybackStateResponse { ok: true, playing }).into_response()
 }
 
-/// `POST /api/v1/playback/next`: waits for the new current row, including a synchronous autoplay
-/// fetch, and returns `{ok, current}` with that queue item. The wait ends when the queue's current
-/// index or video id changes, not when audio starts. A `next_timeout` includes the track that was
-/// current when the wait expired; it does not guarantee the skip failed, so re-read `/status`
-/// before retrying.
+/// `POST /api/v1/playback/next`: waits up to 15 s for the new current row, including a synchronous
+/// autoplay fetch, and returns `{ok, current}` with that queue item. The wait ends when the queue's
+/// current index or video id changes, not when audio starts. The skip itself is never cancelled: it
+/// runs in a spawned task that carries the mutation lock to completion, so a following mutation
+/// cannot observe a half-applied skip (new track armed but autoplay fetch unfinished). On expiry the
+/// response is `next_timeout` with the track that was current when the request began. That response
+/// does **not** guarantee the skip failed; clients should use an HTTP timeout of at least 20 s and
+/// re-read `/status` before retrying.
 async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
-    let _lock = mutation_lock(&shared).await;
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
-    match shared.context.clone().next().await {
-        Some(item) => {
+    let lock = match mutation_lock(&shared).await {
+        Ok(lock) => lock,
+        Err(error) => return error.into_response(),
+    };
+    // Read before handing the guard to the task: after the deadline the handler must answer with
+    // the track that was current at request time, not with a later snapshot.
+    let current = shared.context.playback_snapshot().await.get("now").cloned();
+    let task_shared = Arc::clone(&shared);
+    let task = tokio::spawn(async move {
+        let _lock = lock;
+        task_shared.context.clone().next().await
+    });
+    match tokio::time::timeout(CONTROL_API_NEXT_TIMEOUT, task).await {
+        Ok(Ok(Some(item))) => {
             Json(NextResponse { ok: true, current: ApiTrack::from_value(&item) }).into_response()
         }
-        None => {
-            let current = shared.context.playback_snapshot().await.get("now").cloned();
-            ErrorBody::next_timeout(current).into_response()
+        Ok(Ok(None)) => ErrorBody::next_timeout(current).into_response(),
+        Ok(Err(join_error)) => {
+            tracing::warn!("control API skip task failed: {join_error}");
+            ErrorBody::playback_error("the skip task failed").into_response()
         }
+        Err(_) => ErrorBody::next_timeout(current).into_response(),
     }
 }
 
@@ -187,7 +219,10 @@ async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
 /// `restarted` (which branch ran) and `current` (the row now playing). The read-only queue
 /// `previous` field is always current-1.
 async fn previous(State(shared): State<Arc<ApiShared>>) -> Response {
-    let _lock = mutation_lock(&shared).await;
+    let _lock = match mutation_lock(&shared).await {
+        Ok(lock) => lock,
+        Err(error) => return error.into_response(),
+    };
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -262,7 +297,10 @@ async fn remove(
     State(shared): State<Arc<ApiShared>>,
     ApiJson(body): ApiJson<RemoveRequest>,
 ) -> Response {
-    let _lock = mutation_lock(&shared).await;
+    let _lock = match mutation_lock(&shared).await {
+        Ok(lock) => lock,
+        Err(error) => return error.into_response(),
+    };
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -289,7 +327,10 @@ async fn remove(
 
 /// `POST /api/v1/queue/clear-queued`: clears manually queued rows via the existing app path.
 async fn clear_queued(State(shared): State<Arc<ApiShared>>) -> Response {
-    let _lock = mutation_lock(&shared).await;
+    let _lock = match mutation_lock(&shared).await {
+        Ok(lock) => lock,
+        Err(error) => return error.into_response(),
+    };
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -335,7 +376,10 @@ fn resolve_error(error: ResolveError) -> ErrorBody {
 /// previous skip never leaves this endpoint guessing: it holds the same mutation lock as other
 /// current-track/queue changes.
 async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Response {
-    let _lock = mutation_lock(&shared).await;
+    let _lock = match mutation_lock(&shared).await {
+        Ok(lock) => lock,
+        Err(error) => return error.into_response(),
+    };
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -771,14 +815,19 @@ mod tests {
         }
     }
 
-    fn test_router_with(context: MockContext) -> (Router, Arc<MockContext>) {
+    fn test_router_shared(context: MockContext) -> (Router, Arc<MockContext>, Arc<ApiShared>) {
         let context = Arc::new(context);
         let shared = Arc::new(ApiShared {
             token: Arc::new(RwLock::new("abc123".to_string())),
             context: context.clone(),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
         });
-        (router(shared), context)
+        (router(Arc::clone(&shared)), context, shared)
+    }
+
+    fn test_router_with(context: MockContext) -> (Router, Arc<MockContext>) {
+        let (app, context, _) = test_router_shared(context);
+        (app, context)
     }
 
     fn test_router() -> (Router, Arc<MockContext>) {
@@ -1032,6 +1081,62 @@ mod tests {
         assert_eq!(json["error"], "next_timeout");
         assert_eq!(json["current"]["videoId"], "abc");
         assert!(json["message"].as_str().unwrap().contains("may still have completed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_wait_timeout_returns_busy_with_retry_after() {
+        let (app, _, shared) = test_router_shared(MockContext::default());
+        let held = shared.mutation.lock().await;
+        let response =
+            request(app, "/api/v1/queue/clear-queued", json!({}), Some("Bearer abc123")).await;
+        drop(held);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(axum::http::header::RETRY_AFTER).unwrap(), "10");
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "busy");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_deadline_reports_current_track_and_keeps_the_skip_running() {
+        let (app, ctx) = test_router_with(MockContext {
+            delay: Duration::from_secs(20),
+            next_item: StdMutex::new(Some(json!({ "videoId": "late" }))),
+            ..Default::default()
+        });
+        let response =
+            request(app, "/api/v1/playback/next", json!({}), Some("Bearer abc123")).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "next_timeout");
+        assert_eq!(json["current"]["videoId"], "abc");
+        assert!(json["message"].as_str().unwrap().contains("at least 20 s"));
+        // The detached task still owns the lock; it has not been cancelled at the deadline.
+        assert_eq!(ctx.active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_mutation_waits_for_the_first_skip() {
+        let (app, ctx) =
+            test_router_with(MockContext { delay: Duration::from_secs(5), ..Default::default() });
+        let first_app = app.clone();
+        let first = tokio::spawn(async move {
+            request(first_app, "/api/v1/playback/next", json!({}), Some("Bearer abc123")).await
+        });
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(ctx.active.load(Ordering::SeqCst), 1);
+
+        let second = tokio::spawn(async move {
+            request(app, "/api/v1/queue/clear-queued", json!({}), Some("Bearer abc123")).await
+        });
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!second.is_finished());
+        assert_eq!(ctx.clears.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let second = second.await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(ctx.clears.load(Ordering::SeqCst), 1);
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]

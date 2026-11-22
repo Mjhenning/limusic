@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use axum::{
     extract::{FromRequest, Request as AxumRequest},
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CONTENT_TYPE, RETRY_AFTER},
+        HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
@@ -76,6 +79,10 @@ pub struct ErrorBody {
     pub duration_sec: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_duration_sec: Option<u64>,
+    /// Seconds a client should wait before retrying a `busy` rejection. Header only; the JSON
+    /// envelope stays exactly `error`/`message` plus documented extras.
+    #[serde(skip)]
+    pub retry_after: Option<u64>,
     #[serde(skip)]
     status: StatusCode,
 }
@@ -90,8 +97,21 @@ impl ErrorBody {
             matched: None,
             duration_sec: None,
             max_duration_sec: None,
+            retry_after: None,
             status,
         }
+    }
+
+    /// The shared mutation lock stayed busy for the full 10 s wait. `Retry-After` is set by
+    /// [`IntoResponse`] so callers can back off without parsing the envelope.
+    pub fn busy() -> Self {
+        let mut error = Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "another control request is still mutating the player; retry after 10 seconds",
+        );
+        error.retry_after = Some(10);
+        error
     }
 
     pub fn unauthorized() -> Self {
@@ -114,11 +134,14 @@ impl ErrorBody {
         Self::new(StatusCode::CONFLICT, "remote_linked", "another linked device is the player")
     }
 
+    /// The 15 s wait ended before the queue fact changed. This does **not** guarantee the skip
+    /// failed: the underlying task keeps running under the mutation lock. Clients should allow at
+    /// least 20 s before assuming the request was lost.
     pub fn next_timeout(current: Option<Value>) -> Self {
         let mut error = Self::new(
             StatusCode::GATEWAY_TIMEOUT,
             "next_timeout",
-            "the next track did not become current; the skip may still have completed",
+            "the next track did not become current; the skip may still have completed; allow at least 20 s before retrying",
         );
         error.current = current;
         error
@@ -205,7 +228,14 @@ impl ErrorBody {
 
 impl IntoResponse for ErrorBody {
     fn into_response(self) -> Response {
-        (self.status, Json(self)).into_response()
+        let retry_after = self.retry_after;
+        let mut response = (self.status, Json(self)).into_response();
+        if let Some(secs) = retry_after {
+            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 

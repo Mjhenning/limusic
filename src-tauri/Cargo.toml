@@ -94,6 +94,8 @@ unicode-normalization = "0.1"
 # Mock runtime for the IPC guard test (lib.rs `only_ui`).
 tauri = { version = "2", features = ["test"] }
 tower = { version = "0.5", features = ["util"] }
+# Virtual time for the 10 s lock-wait and 15 s next-deadline tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 # Letting a song notification show while Limusic is frontmost (notify.rs, #94). Same objc2 that
 # mac-notification-sys and tao already pull in.
