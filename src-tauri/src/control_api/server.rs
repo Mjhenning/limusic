@@ -9,9 +9,11 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::db::Db;
 use crate::integrations::settings::{
-    ControlApiSettings, ControlApiStatus, CONTROL_API_SETTINGS_KEY, CONTROL_API_TOKEN_KEY,
+    ControlApiSettings, ControlApiStatus, TunaSettings, TunaStatus, CONTROL_API_SETTINGS_KEY,
+    CONTROL_API_TOKEN_KEY, TUNA_SETTINGS_KEY,
 };
 use crate::integrations::token::{generate_token, is_well_formed};
+use crate::integrations::tuna::TunaOutput;
 use crate::state::AppState;
 
 use super::handlers::router;
@@ -41,18 +43,22 @@ pub struct IntegrationsManager {
     token: Arc<RwLock<String>>,
     mutation: Arc<Mutex<()>>,
     ws: Arc<WsConnections>,
+    tuna: TunaOutput,
 }
 
 impl IntegrationsManager {
     pub fn new(state: Arc<AppState>) -> Self {
         let token = load_token(&state.db);
+        let context: Arc<dyn ControlApiContext> = state.clone();
+        let tuna = TunaOutput::for_context(context.clone());
         Self {
             db: state.db.clone(),
-            context: state,
+            context,
             inner: Arc::new(Mutex::new(Inner::default())),
             token: Arc::new(RwLock::new(token)),
             mutation: Arc::new(Mutex::new(())),
             ws: Arc::new(WsConnections::default()),
+            tuna,
         }
     }
 
@@ -70,11 +76,25 @@ impl IntegrationsManager {
     /// crashing startup.
     pub async fn start_from_settings(&self) {
         self.apply(load_settings(&self.db)).await;
+        self.tuna.apply(load_tuna_settings(&self.db)).await;
     }
 
     /// Apply already-validated settings from the settings command.
     pub async fn apply_settings(&self, settings: ControlApiSettings) {
         self.apply(settings).await;
+    }
+
+    /// Apply Tuna settings live: start, stop, or restart with a new URL.
+    pub async fn apply_tuna_settings(&self, settings: TunaSettings) {
+        self.tuna.apply(settings).await;
+    }
+
+    pub async fn tuna_status(&self) -> TunaStatus {
+        self.tuna.status().await
+    }
+
+    pub async fn tuna_test_push(&self) -> TunaStatus {
+        self.tuna.test_push().await
     }
 
     /// Replace the token in shared state, persist it, and restart so every WS connection is
@@ -100,9 +120,15 @@ impl IntegrationsManager {
         status
     }
 
-    /// Stop the listener and wait for its task to finish. Called on app exit and on every apply.
+    /// Stop every optional output. Called on app exit only; a control-API rebind must not stop Tuna.
     pub async fn stop(&self) {
-        // Token regeneration, disable, rebind and exit all come through here. Close sockets before
+        self.stop_control_api().await;
+        self.tuna.stop().await;
+    }
+
+    /// Stop the listener and wait for its task to finish. Called on every control-API apply.
+    async fn stop_control_api(&self) {
+        // Token regeneration, disable and rebind all come through here. Close sockets before
         // aborting the server task so clients get a frame instead of a bare TCP reset.
         self.ws.close_all();
         let mut inner = self.inner.lock().await;
@@ -118,7 +144,7 @@ impl IntegrationsManager {
     }
 
     async fn apply(&self, settings: ControlApiSettings) {
-        self.stop().await;
+        self.stop_control_api().await;
         let mut status = ControlApiStatus {
             enabled: settings.enabled,
             running: false,
@@ -174,6 +200,12 @@ impl IntegrationsManager {
 
 fn load_settings(db: &Db) -> ControlApiSettings {
     db.get_setting(CONTROL_API_SETTINGS_KEY)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+fn load_tuna_settings(db: &Db) -> TunaSettings {
+    db.get_setting(TUNA_SETTINGS_KEY)
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default()
 }

@@ -1467,6 +1467,7 @@ pub fn run() {
             commands::get_integration_settings,
             commands::set_integration_settings,
             commands::get_integration_status,
+            commands::tuna_test_push,
             commands::regenerate_control_api_token,
             commands::get_global_hotkeys,
             commands::global_hotkeys_on_wayland,

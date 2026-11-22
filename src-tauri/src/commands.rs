@@ -3786,30 +3786,27 @@ pub async fn set_integration_settings(
         &serde_json::to_string(&tuna).map_err(|e| e.to_string())?,
     );
     manager.apply_settings(control_api).await;
+    manager.apply_tuna_settings(tuna).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn get_integration_status(
-    state: St<'_>,
     manager: State<'_, Arc<IntegrationsManager>>,
 ) -> Result<serde_json::Value, String> {
-    let tuna_json = state.db.get_setting(crate::integrations::settings::TUNA_SETTINGS_KEY);
-    let tuna: crate::integrations::settings::TunaSettings = match tuna_json {
-        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
-        None => Default::default(),
-    };
     let status = crate::integrations::settings::IntegrationStatus {
         control_api: manager.control_api_status().await,
-        tuna: crate::integrations::settings::TunaStatus {
-            enabled: tuna.enabled,
-            url: tuna.url.clone(),
-            last_ok_at_ms: None,
-            last_error: None,
-            backoff_secs: None,
-        },
+        tuna: manager.tuna_status().await,
     };
     serde_json::to_value(status).map_err(|e| e.to_string())
+}
+
+/// Send one Tuna payload outside the normal timer, useful for checking the configured URL.
+#[tauri::command]
+pub async fn tuna_test_push(
+    manager: State<'_, Arc<IntegrationsManager>>,
+) -> Result<serde_json::Value, String> {
+    serde_json::to_value(manager.tuna_test_push().await).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
