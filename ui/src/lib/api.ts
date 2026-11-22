@@ -605,6 +605,9 @@ export const releaseNotes = () => invoke<ReleaseNote[]>('release_notes');
 /** False on Linux builds that aren't the AppImage (.rpm, the AUR package): they update through the
  *  package manager, so the UI offers a download link instead of an install button. */
 export const canSelfUpdate = () => invoke<boolean>('can_self_update');
+
+/** Whether this fork build has updater checks and installs disabled. */
+export const updatesDisabled = () => invoke<boolean>('updates_disabled');
 /** The updater plugin's `check()` against the beta channel's manifest, as the metadata the
  *  plugin's `Update` class is built from. `null` when this build is what the channel offers. */
 export const checkBetaUpdate = () =>

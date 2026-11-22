@@ -63,6 +63,7 @@
 	import { initErrorLog } from '$lib/errlog';
 	import {
 		updateState,
+		updateFlags,
 		availableMessage,
 		installUpdate,
 		openDownloadPage,
@@ -336,7 +337,7 @@
 	     Both are centred by a full-width flex row, never left-1/2 + -translate-x-1/2: an odd width
 	     makes that a half-pixel offset and WebKitGTK resamples the layer, so the text goes soft
 	     (the dialog fix in #75). -->
-	{#if updateState.available}
+	{#if !updateFlags.disabled && updateState.available}
 		<div
 			transition:fly={{ y: 16, duration: 220, easing: cubicOut }}
 			class="pointer-events-none fixed inset-x-0 bottom-24 z-[100] flex justify-center px-4"

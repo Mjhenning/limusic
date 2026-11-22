@@ -7,7 +7,14 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { toast } from './player.svelte';
 import { t } from './i18n.svelte';
 import { friendlyNetError } from './neterr';
-import { canSelfUpdate, checkBetaUpdate, getSettings, openExternal, releaseNotes } from './api';
+import {
+	canSelfUpdate,
+	checkBetaUpdate,
+	getSettings,
+	openExternal,
+	releaseNotes,
+	updatesDisabled as readUpdatesDisabled
+} from './api';
 import { isNewer, isPrerelease } from './version';
 import { getVersion } from '@tauri-apps/api/app';
 
@@ -28,7 +35,14 @@ export const updateState = $state({
 // The resolved handle to download; kept out of reactive state (it's not serializable/renderable).
 let pending: Update | null = null;
 
+/** Mirrors `commands::UPDATES_DISABLED`. Starts disabled so no banner can flash before IPC answers. */
+export const updateFlags = $state({ disabled: true });
+void readUpdatesDisabled()
+	.then((disabled) => (updateFlags.disabled = disabled))
+	.catch(() => {});
+
 async function look(): Promise<boolean> {
+	if (updateFlags.disabled) return false;
 	let u: Update | null;
 	const beta = (await getSettings()).update_channel === 'beta';
 	const current = await getVersion();
@@ -113,6 +127,7 @@ export function availableMessage(a: { version: string; rollback: boolean }): str
  *  leaving Settings > About > Check for updates as the only way to find one. */
 export async function checkForUpdatesQuiet() {
 	try {
+		if (updateFlags.disabled) return;
 		if (updateState.available) return; // one is already on screen; don't re-fetch behind it
 		if ((await getSettings()).update_banner === 'false') return;
 		await look();
@@ -125,12 +140,16 @@ export async function checkForUpdatesQuiet() {
 export async function recheckForUpdates() {
 	pending = null;
 	updateState.available = null;
+	if (updateFlags.disabled) return;
 	await checkForUpdatesQuiet();
 }
 
 /** From Settings: return the outcome so the modal can show it inline (a toast renders behind the
  *  dialog). `error` picks the Alert variant. */
 export async function checkForUpdatesInteractive(): Promise<{ message: string; error: boolean }> {
+	if (updateFlags.disabled) {
+		return { message: t('settings.about.updates_disabled'), error: false };
+	}
 	updateState.checking = true;
 	try {
 		if (await look()) return { message: availableMessage(updateState.available!), error: false };
@@ -153,7 +172,7 @@ export function openDownloadPage() {
 
 /** Download + install the pending update, then relaunch into the new version. */
 export async function installUpdate() {
-	if (!pending) return;
+	if (updateFlags.disabled || !pending) return;
 	updateState.installing = true;
 	try {
 		// Re-read the manifest first. A banner can sit on screen for hours, and an installer replaced

@@ -3070,11 +3070,24 @@ pub fn can_self_update(app: tauri::AppHandle) -> bool {
     }
 }
 
-/// The beta channel's manifest. `beta` is a permanent prerelease holding nothing but this file, and
-/// the release workflows move it to the newest release candidate, or to the newest release once that
-/// is ahead, so the URL never changes.
-const BETA_MANIFEST: &str =
-    "https://github.com/SimoHypers/limusic/releases/download/beta/latest.json";
+/// Fork build flag: this build must never install an upstream release. Flip this to `false`,
+/// restore the stable endpoint and pubkey in `tauri.conf.json`, and restore `BETA_MANIFEST` below
+/// to re-enable updater checks. The UI reads the same flag through `updates_disabled`.
+pub(crate) const UPDATES_DISABLED: bool = true;
+
+/// The beta channel's manifest, neutralized while [`UPDATES_DISABLED`] is set. Port 9 is the
+/// discard service, so even a stray check cannot reach GitHub.
+const BETA_MANIFEST: &str = if UPDATES_DISABLED {
+    "http://127.0.0.1:9/limusic-updates-disabled/latest.json"
+} else {
+    "https://github.com/SimoHypers/limusic/releases/download/beta/latest.json"
+};
+
+/// Exposes the build flag to the UI so the banner, manual check and Install action all agree.
+#[tauri::command]
+pub fn updates_disabled() -> bool {
+    UPDATES_DISABLED
+}
 
 /// What the updater plugin's own `check` command returns, so the UI can wrap it in the plugin's
 /// `Update` class and install it the usual way.

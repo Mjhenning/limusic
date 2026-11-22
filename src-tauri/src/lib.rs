@@ -896,6 +896,12 @@ pub fn run() {
         );
     }
 
+    // Fork builds omit the updater plugin entirely: no JS check can fetch or install an upstream
+    // release, even if a future UI path forgets to consult `updates_disabled`.
+    if !commands::UPDATES_DISABLED {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+
     builder
         // The hidden cipher webview's document (webview.rs). A registered scheme, because a
         // `data:` URL is not a document WebView2 will navigate to.
@@ -905,7 +911,6 @@ pub fn run() {
                 .body(webview::HARNESS_HTML.as_bytes())
                 .expect("static harness response")
         })
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         // Folder picker for the local-music library (local.rs).
         .plugin(tauri_plugin_dialog::init())
@@ -1629,6 +1634,7 @@ pub fn run() {
             commands::theater_fullscreen,
             commands::release_notes,
             commands::can_self_update,
+            commands::updates_disabled,
             commands::check_beta_update,
             commands::open_external,
             commands::quit_app,

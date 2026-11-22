@@ -50,6 +50,7 @@
 	import DevicesSettings from '$lib/components/DevicesSettings.svelte';
 	import {
 		updateState,
+		updateFlags,
 		availableMessage,
 		checkForUpdatesInteractive,
 		installUpdate,
@@ -1325,11 +1326,13 @@
 							<div data-settings-card class={CARD}>
 								{@render row({
 									title: t('settings.about.check_updates'),
-									desc: updateState.available && !updateState.canInstall
-										? `${availableMessage(updateState.available)} ${t('settings.about.update_packaged')}`
-										: updateState.available
-											? availableMessage(updateState.available)
-											: t('settings.about.up_to_date'),
+									desc: updateFlags.disabled
+										? t('settings.about.updates_disabled')
+										: updateState.available && !updateState.canInstall
+											? `${availableMessage(updateState.available)} ${t('settings.about.update_packaged')}`
+											: updateState.available
+												? availableMessage(updateState.available)
+												: t('settings.about.up_to_date'),
 									control: updateButton,
 									below: updateResult && !updateState.available ? updateAlert : undefined
 								})}
@@ -1670,7 +1673,9 @@
 {/snippet}
 
 {#snippet updateButton()}
-	{#if updateState.available && !updateState.canInstall}
+	{#if updateFlags.disabled}
+		<Button size="sm" variant="outline" disabled>{t('settings.about.updates_disabled')}</Button>
+	{:else if updateState.available && !updateState.canInstall}
 		<Button size="sm" onclick={openDownloadPage}>{t('settings.about.download_page')}</Button>
 	{:else if updateState.available}
 		<Button size="sm" onclick={installUpdate} disabled={updateState.installing}>
