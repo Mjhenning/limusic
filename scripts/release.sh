@@ -13,7 +13,7 @@
 # here starts nowhere else. The deb is the worse of the two, because Tauri writes its Depends
 # verbatim from tauri.conf.json and never emits a libc6 constraint: a Fedora-built deb installs
 # cleanly on Debian and then dies at startup on a missing GLIBC symbol. Both are built by
-# .github/workflows/linux-release.yml on a pinned ubuntu-24.04 runner, which also attaches them,
+# .github/workflows/linux-release.yml in a pinned debian:bookworm container, which also attaches them,
 # adds the linux-x86_64 entry to latest.json and marks the release "Latest". Windows and macOS do
 # the same for their own entries. So this script publishes the release NOT-latest on purpose: until
 # CI has attached the binaries, the updater endpoint (.../releases/latest/download/latest.json)
@@ -219,6 +219,16 @@ else
   # (e.g. an old 0.1.1 rpm uploaded to the 0.1.2 release).
   RPM="$(ls target/release/bundle/rpm/limusic-${VERSION}-*.rpm 2>/dev/null | head -1)"
   [ -n "$RPM" ] || die "no rpm for $VERSION in target/release/bundle/rpm"
+  # The rpm requires only what tauri.conf.json lists, and the binary links OpenSSL by soname (reqwest's
+  # native-tls, switched on by rustypipe-botguard). Fedora 45 moved libssl.so.3 out of the default
+  # install, so an rpm that doesn't ask for it installs and then can't start (#707). A build host on
+  # OpenSSL 4 links .so.4 and makes the list in tauri.conf.json wrong: stop before that ships.
+  for so in $(readelf -d target/release/limusic-app | sed -n 's/.*\[\(lib\(ssl\|crypto\)\.so\.[0-9]*\)\]/\1/p'); do
+    rpm -qpR "$RPM" | grep -qxF "$so()(64bit)" || die "the binary links $so but $(basename "$RPM") \
+doesn't require it. Fix bundle.linux.rpm.depends in src-tauri/tauri.conf.json, rebuild with
+  cargo tauri build --bundles rpm
+and attach it by hand: gh release upload $TAG $RPM --clobber --repo $REPO"
+  done
   gh release upload "$TAG" "$RPM" --clobber --repo "$REPO"
   echo "    attached $(basename "$RPM")"
 fi
