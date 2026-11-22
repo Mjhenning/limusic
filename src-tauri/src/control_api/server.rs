@@ -16,6 +16,7 @@ use crate::state::AppState;
 
 use super::handlers::router;
 use super::types::{ApiShared, ControlApiContext};
+use super::ws::WsConnections;
 
 struct RunningServer {
     addr: SocketAddr,
@@ -39,6 +40,7 @@ pub struct IntegrationsManager {
     inner: Arc<Mutex<Inner>>,
     token: Arc<RwLock<String>>,
     mutation: Arc<Mutex<()>>,
+    ws: Arc<WsConnections>,
 }
 
 impl IntegrationsManager {
@@ -50,6 +52,7 @@ impl IntegrationsManager {
             inner: Arc::new(Mutex::new(Inner::default())),
             token: Arc::new(RwLock::new(token)),
             mutation: Arc::new(Mutex::new(())),
+            ws: Arc::new(WsConnections::default()),
         }
     }
 
@@ -58,6 +61,8 @@ impl IntegrationsManager {
             token: self.token.clone(),
             context: self.context.clone(),
             mutation: self.mutation.clone(),
+            hub: self.context.ui_events(),
+            ws: self.ws.clone(),
         })
     }
 
@@ -86,6 +91,7 @@ impl IntegrationsManager {
         let settings = load_settings(&self.db);
         let inner = self.inner.lock().await;
         let mut status = inner.status.clone();
+        status.ws_clients = self.ws.count();
         status.enabled = settings.enabled;
         if !status.running {
             status.bind_addr = settings.enabled.then(|| settings.bind.clone());
@@ -96,6 +102,9 @@ impl IntegrationsManager {
 
     /// Stop the listener and wait for its task to finish. Called on app exit and on every apply.
     pub async fn stop(&self) {
+        // Token regeneration, disable, rebind and exit all come through here. Close sockets before
+        // aborting the server task so clients get a frame instead of a bare TCP reset.
+        self.ws.close_all();
         let mut inner = self.inner.lock().await;
         if let Some(server) = inner.server.take() {
             tracing::info!(addr = %server.addr, "stopping control API");
@@ -116,6 +125,7 @@ impl IntegrationsManager {
             bind_addr: None,
             port: None,
             last_error: None,
+            ws_clients: 0,
         };
         if !settings.enabled {
             self.inner.lock().await.status = status;

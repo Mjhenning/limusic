@@ -96,6 +96,9 @@ tauri = { version = "2", features = ["test"] }
 tower = { version = "0.5", features = ["util"] }
 # Virtual time for the 10 s lock-wait and 15 s next-deadline tests.
 tokio = { workspace = true, features = ["test-util"] }
+# WebSocket client for the control API's ephemeral-port tests. Aliased because axum 0.8 already
+# brings 0.26 while another dependency still uses 0.24; an unaliased dev-dep is ambiguous.
+tokio-tungstenite-026 = { package = "tokio-tungstenite", version = "0.26", features = ["connect"] }
 
 # Letting a song notification show while Limusic is frontmost (notify.rs, #94). Same objc2 that
 # mac-notification-sys and tao already pull in.

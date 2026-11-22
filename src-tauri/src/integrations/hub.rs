@@ -23,7 +23,11 @@ pub enum HubEvent {
     Volume(i64),
     TrackLoading(String),
     TrackFailed(String),
-    PlaybackError(String),
+    /// `video_id` is the culprit when the emitting player event named one.
+    PlaybackError {
+        message: String,
+        video_id: Option<String>,
+    },
 }
 
 impl HubEvent {
@@ -54,10 +58,18 @@ impl HubEvent {
                 .get("message")
                 .and_then(serde_json::Value::as_str)
                 .map(|s| Self::TrackFailed(s.to_string())),
-            "playback-error" => payload
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .map(|s| Self::PlaybackError(s.to_string())),
+            "playback-error" => {
+                payload.get("message").and_then(serde_json::Value::as_str).map(|s| {
+                    Self::PlaybackError {
+                        message: s.to_string(),
+                        video_id: payload
+                            .get("videoId")
+                            .or_else(|| payload.get("video_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    }
+                })
+            }
             _ => None,
         }
     }

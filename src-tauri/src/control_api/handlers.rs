@@ -7,7 +7,7 @@ use crate::integrations::parse::{parse_input, ParseError};
 use crate::integrations::token::tokens_equal;
 use axum::{
     extract::{Request, State},
-    http::{header::AUTHORIZATION, StatusCode},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -29,26 +29,31 @@ const CONTROL_API_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_API_NEXT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Accept only `Authorization: Bearer <token>`. No query-string fallback, no CORS headers. The
-/// header and token are never logged, including on failure.
+/// header and token are never logged, including on failure. Also used by the WebSocket handler to
+/// reject before it calls `on_upgrade`.
+pub(crate) async fn bearer_authorized(
+    shared: &ApiShared,
+    headers: &HeaderMap,
+) -> Result<(), ErrorBody> {
+    let supplied = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    match supplied {
+        Some(value) if tokens_equal(&value, &shared.token.read().await) => Ok(()),
+        _ => Err(ErrorBody::unauthorized()),
+    }
+}
+
 async fn require_bearer(
     State(shared): State<Arc<ApiShared>>,
     req: Request,
     next: Next,
 ) -> Response {
-    let supplied = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let authorized = match supplied {
-        Some(value) => tokens_equal(&value, &shared.token.read().await),
-        None => false,
-    };
-    if authorized {
-        next.run(req).await
-    } else {
-        ErrorBody::unauthorized().into_response()
+    match bearer_authorized(&shared, req.headers()).await {
+        Ok(()) => next.run(req).await,
+        Err(error) => error.into_response(),
     }
 }
 
@@ -70,6 +75,7 @@ pub fn router(shared: Arc<ApiShared>) -> Router {
         .route("/api/v1/queue/request", post(queue_request))
         .route("/api/v1/queue/add", post(queue_add))
         .route("/api/v1/queue/play-next", post(queue_play_next))
+        .route("/api/v1/ws", get(super::ws::ws_handler))
         .fallback(route_not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(shared.clone(), require_bearer))
@@ -479,16 +485,22 @@ async fn queue_play_next(
 mod tests {
     use super::super::types::ControlApiContext;
     use super::*;
+    use crate::integrations::hub::HubEvent;
     use crate::integrations::parse::ParsedInput;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{header::AUTHORIZATION, HeaderValue, Request, StatusCode};
+    use futures_util::StreamExt;
     use innertube::SongItem;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+    use tokio::net::TcpListener;
     use tokio::sync::RwLock;
     use tokio::time::sleep;
+    use tokio_tungstenite_026::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite_026::tungstenite::Message as ClientMessage;
+    use tokio_tungstenite_026::{connect_async, MaybeTlsStream, WebSocketStream};
     use tower::ServiceExt;
 
     use crate::state::QueueNeighbors;
@@ -507,6 +519,7 @@ mod tests {
         guest: bool,
         linked: bool,
         restarted: bool,
+        hub: tokio::sync::broadcast::Sender<HubEvent>,
         paused: AtomicBool,
         /// The mirror read by `playback_snapshot`. Deliberately lags `paused` in the pause test,
         /// reproducing the async mpv event that made the old handler answer stale state.
@@ -534,10 +547,12 @@ mod tests {
 
     impl Default for MockContext {
         fn default() -> Self {
+            let (hub, _) = tokio::sync::broadcast::channel(64);
             Self {
                 guest: false,
                 linked: false,
                 restarted: false,
+                hub,
                 paused: AtomicBool::new(false),
                 event_paused: AtomicBool::new(false),
                 position: 1.0,
@@ -660,6 +675,10 @@ mod tests {
 
         async fn listen_together_role(&self) -> String {
             if self.guest { "guest" } else { "none" }.to_string()
+        }
+
+        fn ui_events(&self) -> tokio::sync::broadcast::Sender<HubEvent> {
+            self.hub.clone()
         }
 
         async fn is_guest(&self) -> bool {
@@ -821,6 +840,8 @@ mod tests {
             token: Arc::new(RwLock::new("abc123".to_string())),
             context: context.clone(),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
+            hub: context.hub.clone(),
+            ws: Arc::new(super::super::ws::WsConnections::default()),
         });
         (router(Arc::clone(&shared)), context, shared)
     }
@@ -865,6 +886,40 @@ mod tests {
     async fn json_body(response: Response) -> Value {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn spawn_ws_server(
+    ) -> (String, Arc<ApiShared>, Arc<MockContext>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (app, context, shared) = test_router_shared(MockContext::default());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("ws://{addr}/api/v1/ws"), shared, context, task)
+    }
+
+    async fn connect_ws(
+        url: &str,
+        auth: bool,
+    ) -> Result<ClientSocket, tokio_tungstenite_026::tungstenite::Error> {
+        let mut request = url.into_client_request().unwrap();
+        if auth {
+            request.headers_mut().insert(AUTHORIZATION, HeaderValue::from_static("Bearer abc123"));
+        }
+        connect_async(request).await.map(|(socket, _)| socket)
+    }
+
+    async fn next_json(socket: &mut ClientSocket) -> Value {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+                ClientMessage::Ping(_) | ClientMessage::Pong(_) => {}
+                other => panic!("expected a text frame, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1695,5 +1750,119 @@ mod tests {
         let json = json_body(response).await;
         assert_eq!(json["error"], "invalid_input");
         assert_eq!(json["message"], "from must be 'current'");
+    }
+
+    #[tokio::test]
+    async fn ws_rejects_a_missing_bearer_header_before_upgrade() {
+        let (url, _, _, task) = spawn_ws_server().await;
+        match connect_ws(&url, false).await {
+            Err(tokio_tungstenite_026::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                let body = response.into_body().unwrap_or_default();
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"], "unauthorized");
+            }
+            other => panic!("expected a 401 handshake, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_ignores_a_query_string_token() {
+        let (url, _, _, task) = spawn_ws_server().await;
+        match connect_ws(&format!("{url}?token=abc123"), false).await {
+            Err(tokio_tungstenite_026::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+            other => panic!("expected a query token to be ignored, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_hello_carries_the_slim_snapshot() {
+        let (url, shared, _, task) = spawn_ws_server().await;
+        let mut socket = connect_ws(&url, true).await.unwrap();
+        assert_eq!(shared.ws.count(), 1);
+        let hello = next_json(&mut socket).await;
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["current"]["video_id"], "abc");
+        assert_eq!(hello["position_sec"], 1.0);
+        assert_eq!(hello["duration_sec"], 10.0);
+        assert_eq!(hello["playing"], true);
+        assert_eq!(hello["volume"], 100);
+        assert_eq!(hello["current_index"], 0);
+        assert_eq!(hello["total"], 3);
+        assert_eq!(hello["listen_together_role"], "none");
+        assert!(hello.get("next_is_autoplay_fetch").is_some());
+        socket.close(None).await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_delivers_a_hub_event() {
+        let (url, _, context, task) = spawn_ws_server().await;
+        let mut socket = connect_ws(&url, true).await.unwrap();
+        next_json(&mut socket).await;
+        context.hub.send(HubEvent::Volume(42)).unwrap();
+        let event = next_json(&mut socket).await;
+        assert_eq!(event["type"], "volume");
+        assert_eq!(event["volume"], 42);
+        socket.close(None).await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_lagged_subscriber_gets_a_resync() {
+        let (url, _, context, task) = spawn_ws_server().await;
+        let mut socket = connect_ws(&url, true).await.unwrap();
+        next_json(&mut socket).await;
+        for volume in 0..100 {
+            context.hub.send(HubEvent::Volume(volume)).unwrap();
+        }
+        let resync = next_json(&mut socket).await;
+        assert_eq!(resync["type"], "resync");
+        assert_eq!(resync["current"]["video_id"], "abc");
+        assert_eq!(resync["total"], 3);
+        socket.close(None).await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_caps_connections_at_eight() {
+        let (url, shared, _, task) = spawn_ws_server().await;
+        let mut sockets = Vec::new();
+        for _ in 0..8 {
+            let mut socket = connect_ws(&url, true).await.unwrap();
+            assert_eq!(next_json(&mut socket).await["type"], "hello");
+            sockets.push(socket);
+        }
+        assert_eq!(shared.ws.count(), 8);
+        match connect_ws(&url, true).await {
+            Err(tokio_tungstenite_026::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = response.into_body().unwrap_or_default();
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"], "too_many_clients");
+            }
+            other => panic!("expected a 503 handshake, got {other:?}"),
+        }
+        for mut socket in sockets {
+            let _ = socket.close(None).await;
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_closes_on_token_regeneration_signal() {
+        let (url, shared, _, task) = spawn_ws_server().await;
+        let mut socket = connect_ws(&url, true).await.unwrap();
+        next_json(&mut socket).await;
+        shared.ws.close_all();
+        match socket.next().await.unwrap().unwrap() {
+            ClientMessage::Close(_) => {}
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+        task.abort();
     }
 }

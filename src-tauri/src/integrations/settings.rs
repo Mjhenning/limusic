@@ -36,6 +36,9 @@ pub struct ControlApiStatus {
     pub bind_addr: Option<String>,
     pub port: Option<u16>,
     pub last_error: Option<String>,
+    /// Live WebSocket clients. Defaults for old saved status payloads.
+    #[serde(default)]
+    pub ws_clients: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

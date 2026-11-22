@@ -14,8 +14,10 @@ use axum::{
 use innertube::SongItem;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
+use super::ws::WsConnections;
+use crate::integrations::hub::HubEvent;
 use crate::integrations::parse::ParsedInput;
 use crate::state::QueueNeighbors;
 
@@ -112,6 +114,16 @@ impl ErrorBody {
         );
         error.retry_after = Some(10);
         error
+    }
+
+    /// The eight-socket cap was reached. The WebSocket upgrade is refused with this JSON envelope
+    /// instead of accepting a connection that could not be served fairly.
+    pub fn too_many_clients() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too_many_clients",
+            "the control API already has eight WebSocket clients",
+        )
     }
 
     pub fn unauthorized() -> Self {
@@ -568,6 +580,114 @@ impl QueueResponse {
     }
 }
 
+/// Flattened payload of `hello` and `resync`. Every duration and position is seconds; `current`,
+/// `next` and `previous` are slim [`ApiTrack`] values, so no webview-only queue fields leak.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsSnapshot {
+    /// The track playing when the snapshot was read, including `queued_by` when known.
+    pub current: ApiTrack,
+    /// Effective playback position in seconds, not a raw mpv tick.
+    pub position_sec: f64,
+    /// Track length in seconds; `0.0` until mpv reports one.
+    pub duration_sec: f64,
+    /// True when the transport is not paused.
+    pub playing: bool,
+    /// Integer volume 0–100.
+    pub volume: i64,
+    pub shuffle: bool,
+    /// `"off"`, `"all"` or `"one"`, matching `QueueResponse`.
+    pub repeat: String,
+    /// Zero-based index of the playing row in the full queue.
+    pub current_index: usize,
+    /// Number of rows in the full queue.
+    pub total: usize,
+    pub next: Option<ApiTrack>,
+    pub previous: Option<ApiTrack>,
+    /// True when Skip will fetch autoplay rather than step to a queued row.
+    pub next_is_autoplay_fetch: bool,
+    /// `"none"`, `"host"` or `"guest"`.
+    pub listen_together_role: String,
+}
+
+/// Every frame sent on `GET /api/v1/ws` is one of these tagged JSON messages. Incoming frames are
+/// ignored: this is a read-only event stream, and all mutations still go through the HTTP API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsMessage {
+    /// First frame after a successful upgrade.
+    Hello {
+        #[serde(flatten)]
+        snapshot: WsSnapshot,
+    },
+    /// A fresh full snapshot after the hub subscriber lagged. Nothing was inferred from the gap.
+    Resync {
+        #[serde(flatten)]
+        snapshot: WsSnapshot,
+    },
+    /// The current row changed. Position and duration are included only when the UI supplied them.
+    NowPlaying {
+        current: ApiTrack,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        position_sec: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_sec: Option<f64>,
+    },
+    /// Transport state changed; `state` is the UI word and `playing` is its boolean projection.
+    PlaybackState {
+        playing: bool,
+        state: String,
+    },
+    /// Queue rows changed, without sending the rows. Clients refetch `/api/v1/queue`.
+    QueueChanged {
+        current_index: Option<usize>,
+        total: usize,
+    },
+    ShuffleChanged {
+        shuffle: bool,
+    },
+    RepeatChanged {
+        repeat: String,
+    },
+    Volume {
+        volume: i64,
+    },
+    /// A player failure. `video_id` is omitted when the emitting event did not name a track.
+    PlaybackError {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        video_id: Option<String>,
+    },
+    /// Per-connection ~1 Hz position update, emitted only while playing and read from the
+    /// authoritative snapshot, never from the hub.
+    Position {
+        position_sec: f64,
+    },
+}
+
+/// Build the full hello/resync projection from authoritative snapshots.
+pub async fn ws_snapshot(shared: &ApiShared) -> WsSnapshot {
+    let snap = shared.context.playback_snapshot().await;
+    let queue = QueueResponse::from_snapshot(
+        shared.context.queue_snapshot().await,
+        shared.context.queue_neighbors().await,
+    );
+    WsSnapshot {
+        current: ApiTrack::from_value(snap.get("now").unwrap_or(&Value::Null)),
+        position_sec: snap.get("position").and_then(Value::as_f64).unwrap_or(0.0),
+        duration_sec: snap.get("duration").and_then(Value::as_f64).unwrap_or(0.0),
+        playing: !snap.get("paused").and_then(Value::as_bool).unwrap_or(false),
+        volume: snap.get("volume").and_then(Value::as_i64).unwrap_or(0),
+        shuffle: queue.shuffle,
+        repeat: queue.repeat,
+        current_index: queue.current_index,
+        total: queue.total,
+        next: queue.next,
+        previous: queue.previous,
+        next_is_autoplay_fetch: queue.next_is_autoplay_fetch,
+        listen_together_role: shared.context.listen_together_role().await,
+    }
+}
+
 /// Optional paging for `GET /api/v1/queue`. `from=current` is shorthand for
 /// `offset=current_index`; an explicit `offset` still wins when both are supplied. Any other
 /// `from` value is rejected with 400 `invalid_input`.
@@ -728,6 +848,10 @@ pub trait ControlApiContext: Send + Sync + 'static {
     /// `"none"`, `"host"`, or `"guest"`, matching the UI's Listen Together status.
     async fn listen_together_role(&self) -> String;
 
+    /// Internal mirror of UI events. WS clients subscribe per connection; continuous position
+    /// ticks are deliberately absent and are polled from the snapshot instead.
+    fn ui_events(&self) -> broadcast::Sender<HubEvent>;
+
     /// True when a Listen Together guest session owns playback policy.
     async fn is_guest(&self) -> bool;
 
@@ -798,6 +922,10 @@ impl ControlApiContext for crate::state::AppState {
         self.lt_role().await
     }
 
+    fn ui_events(&self) -> broadcast::Sender<HubEvent> {
+        self.ui_events.clone()
+    }
+
     async fn is_guest(&self) -> bool {
         self.lt.is_guest().await
     }
@@ -864,6 +992,10 @@ pub struct ApiShared {
     pub context: Arc<dyn ControlApiContext>,
     /// Serializes current-track/queue mutations so chat-driven callers see each other's results.
     pub mutation: Arc<Mutex<()>>,
+    /// Mirror of UI events, subscribed to once per WebSocket connection.
+    pub hub: broadcast::Sender<HubEvent>,
+    /// Shared socket cap and the close signal used by token regeneration, disable, rebind and exit.
+    pub ws: Arc<WsConnections>,
 }
 
 #[cfg(test)]
