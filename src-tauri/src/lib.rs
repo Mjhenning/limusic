@@ -1804,6 +1804,14 @@ fn spawn_event_pump(
                                 true,
                             );
                         }
+                    } else if !remote {
+                        // The 1 Hz WS timer starts again here; send its first value immediately so
+                        // clients do not sit on a paused position for up to a second.
+                        state.emit_ui_event(
+                            "position",
+                            serde_json::json!({ "position": state.current_position() }),
+                            true,
+                        );
                     }
                     state.media_set_playing(playing);
                     // Playing here ends showing another linked device; pausing may start it.

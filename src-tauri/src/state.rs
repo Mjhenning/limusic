@@ -18,6 +18,7 @@ use player::Player;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 
+use crate::control_api::types::CONTROL_API_SKIP_HARD_TIMEOUT;
 use crate::db::{now_secs, Db, StoredAccount};
 use crate::devicelink::{LinkCommand, LinkSession, Publish, RemoteView};
 use crate::discord::DiscordHandle;
@@ -70,6 +71,41 @@ const CONTROL_API_NEXT_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_API_SEARCH_RECORD_HISTORY: bool = false;
 /// How many ordered result ids to include in the debug trace of a control-API search.
 const CONTROL_API_SEARCH_TRACE_IDS: usize = 5;
+
+/// Two of our emit paths can announce the same transport/queue fact in one tick: `emit_now_playing`
+/// plus mpv's `Playing`, and the several `emit_queue` calls around a skip. Coalesce them before
+/// they reach the hub so WebSocket clients never see the identical event twice.
+const HUB_EVENT_COALESCE_WINDOW: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct HubDedupe {
+    playback_state: Option<(String, Instant)>,
+    queue_event: Option<Instant>,
+}
+
+impl HubDedupe {
+    /// Returns true when this state was already sent inside the window.
+    fn suppress_playback_state(&mut self, state: &str, now: Instant) -> bool {
+        if let Some((last, at)) = &self.playback_state {
+            if last == state && now.duration_since(*at) < HUB_EVENT_COALESCE_WINDOW {
+                return true;
+            }
+        }
+        self.playback_state = Some((state.to_owned(), now));
+        false
+    }
+
+    /// All queue event names collapse into `HubEvent::QueueChanged`, so only the timing matters.
+    fn suppress_queue_event(&mut self, now: Instant) -> bool {
+        if let Some(at) = self.queue_event {
+            if now.duration_since(at) < HUB_EVENT_COALESCE_WINDOW {
+                return true;
+            }
+        }
+        self.queue_event = Some(now);
+        false
+    }
+}
 
 pub struct AppState {
     pub it: InnerTube,
@@ -157,6 +193,9 @@ pub struct AppState {
     /// moved. It cannot be dropped entirely: souvlaki answers a `Position` read from the progress
     /// of the last push, so the value still has to be refreshed periodically.
     last_media_state: std::sync::Mutex<Option<(bool, f64)>>,
+    /// Source-level coalescing for hub events that two of our own emit paths can produce in the
+    /// same instant (a track start plus mpv's `Playing`, or several queue emits during a skip).
+    hub_dedupe: std::sync::Mutex<HubDedupe>,
     /// videoId → (the googlevideo URL the loopback proxy streams from, unix seconds it stops being
     /// treated as usable). Written by the `video_stream` command, read by `videoproxy::handle` and
     /// by `video_stream` itself: an entry that is still live answers a reopen with no network at
@@ -594,6 +633,7 @@ impl AppState {
             last_pos_persist: AtomicU64::new(0),
             last_media_push: AtomicU64::new(0),
             last_media_state: std::sync::Mutex::new(None),
+            hub_dedupe: std::sync::Mutex::default(),
             last_queue_fingerprint: AtomicU64::new(0),
             last_persisted_fingerprint: AtomicU64::new(0),
         }
@@ -1977,7 +2017,9 @@ impl AppState {
     /// wait for mpv to start audio, which can lag a network resolve by seconds. The deadline starts
     /// before the skip so a synchronous autoplay fetch is covered too; a repeat-one advance keeps
     /// the same row but bumps `generation`, which is the other acceptable signal. An autoplay fetch
-    /// that produces nothing leaves both unchanged and times out.
+    /// that produces nothing leaves both unchanged and times out. A second, longer guard keeps a
+    /// stalled resolver from holding the control API's mutation lock forever; when it fires the
+    /// queue is restored to the pre-skip row and late work is invalidated by a generation bump.
     pub async fn next_with_current(self: &std::sync::Arc<Self>) -> Option<serde_json::Value> {
         // The app serializes SongItem as `video_id`; older snapshots and remote payloads use
         // `videoId`. Readiness must recognize either spelling or it would miss an id-only advance.
@@ -1996,8 +2038,15 @@ impl AppState {
                 snap.get("currentIndex").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
             (index, id_at(&snap, index))
         };
+        let before_position = self.current_position();
         let deadline = Instant::now() + CONTROL_API_NEXT_TIMEOUT;
-        self.next_in_queue().await;
+        // The handler has a hard 45 s ceiling for the detached task. Roll back one second earlier
+        // so a cancellation here never races the HTTP-side guard.
+        let skip_deadline = CONTROL_API_SKIP_HARD_TIMEOUT.saturating_sub(Duration::from_secs(1));
+        if tokio::time::timeout(skip_deadline, self.next_in_queue()).await.is_err() {
+            self.restore_after_skip_timeout(before_index, before_id, before_position).await;
+            return None;
+        }
         loop {
             let snap = self.queue_snapshot().await;
             let index =
@@ -2020,6 +2069,45 @@ impl AppState {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Undo a skip whose resolution never returned. `next_in_queue` advances `queue.current` before
+    /// it resolves, so cancellation alone would leave the pointer on a track mpv never loaded.
+    /// Restore by id (the row can move during an autoplay fetch), clear the pending start offset and
+    /// saved position, and bump `generation` so any late work cannot update the restored track.
+    /// A track that did load is left alone: rolling that back would fight already-started audio.
+    async fn restore_after_skip_timeout(
+        self: &std::sync::Arc<Self>,
+        before_index: usize,
+        before_id: Option<String>,
+        before_position: f64,
+    ) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let (target, current, duration, len) = {
+            let q = self.queue.lock().await;
+            let target = before_id.as_deref().and_then(|id| {
+                q.items
+                    .iter()
+                    .position(|row| row.video_id == id || row.counterpart.as_deref() == Some(id))
+            });
+            (target, q.current, q.duration, q.items.len())
+        };
+        let target = target.or_else(|| (before_index < len).then_some(before_index));
+        let started = duration > 0.0;
+        if started || target.is_none() || target == Some(current) {
+            return;
+        }
+        {
+            let mut q = self.queue.lock().await;
+            q.seek_to(target.unwrap());
+            q.lookahead_loaded = None;
+        }
+        self.pending_seek.lock().unwrap().take();
+        self.latest_position.store(before_position.to_bits(), Ordering::SeqCst);
+        self.emit_queue().await;
+        self.persist_queue().await;
+        self.lt_broadcast_queue().await;
+        self.emit_notice("Skip timed out; the previous track was kept.");
     }
 
     /// Previous for the control API. `true` means the transport rewound the current track rather
@@ -5202,9 +5290,17 @@ impl AppState {
                 *self.pending_seek.lock().unwrap() = Some((item.video_id, position));
                 self.latest_position.store(position.to_bits(), Ordering::SeqCst);
             }
+            // No mpv tick will follow while the queue is idle; announce the planned start now.
+            self.emit_ui_event(
+                "position",
+                serde_json::json!({ "position": position.max(0.0) }),
+                true,
+            );
             return Ok(());
         }
         self.player.seek(position).map_err(|e| e.to_string())?;
+        // mpv ticks are UI-only, so a paused seek would otherwise never reach the hub.
+        self.emit_ui_event("position", serde_json::json!({ "position": position.max(0.0) }), true);
         let p = Playback::at(PlaybackKind::Seek, (position * 1000.0) as i64);
         self.link.publish(p.clone());
         if self.lt.is_host().await {
@@ -5933,8 +6029,21 @@ impl AppState {
             .flatten()
             .and_then(|value| HubEvent::from_ui_event(event, &value, true));
         let _ = self.app.emit(event, payload);
-        if let Some(event) = mirror {
-            let _ = self.ui_events.send(event);
+        if let Some(hub_event) = mirror {
+            // Suppress only the hub copy. The webview still gets both UI events: its queue panel
+            // may need the full row payload that the small `queue-index` follow-up replaces.
+            let suppressed = {
+                let mut dedupe = self.hub_dedupe.lock().unwrap();
+                let now = Instant::now();
+                match &hub_event {
+                    HubEvent::PlaybackState(state) => dedupe.suppress_playback_state(state, now),
+                    HubEvent::QueueChanged { .. } => dedupe.suppress_queue_event(now),
+                    _ => false,
+                }
+            };
+            if !suppressed {
+                let _ = self.ui_events.send(hub_event);
+            }
         }
     }
 
@@ -7124,6 +7233,8 @@ fn persist_fingerprint(q: &QueueState) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{
         adopt_playlist_twins, adopt_twin, append_page, backfill_metadata, cache_horizon,
         drop_duplicates, enqueue_at, format_duration, freshen, get_url, guest_insert_index,
@@ -7131,10 +7242,25 @@ mod tests {
         persist_fingerprint, playlist_context, prefer_version, prev_track_title, put_url,
         queue_fingerprint, queue_neighbors_from_snapshot, radio_seed_for, remote_list,
         retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into, swap_version,
-        trim_played, twin_position, unshuffled, upcoming_queued, AppState, QueueState, RepeatMode,
-        VideoUrls, CONTROL_API_SEARCH_RECORD_HISTORY, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX,
-        MAX_BOOST_DB,
+        trim_played, twin_position, unshuffled, upcoming_queued, AppState, HubDedupe, QueueState,
+        RepeatMode, VideoUrls, CONTROL_API_SEARCH_RECORD_HISTORY, KEEP_PLAYED,
+        LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
     };
+
+    #[test]
+    fn hub_dedupe_coalesces_only_recent_identical_facts() {
+        let at = Instant::now();
+        let mut dedupe = HubDedupe::default();
+        assert!(!dedupe.suppress_playback_state("playing", at));
+        assert!(dedupe.suppress_playback_state("playing", at + Duration::from_millis(50)));
+        assert!(!dedupe.suppress_playback_state("paused", at + Duration::from_millis(60)));
+        assert!(!dedupe.suppress_playback_state("playing", at + Duration::from_millis(150)));
+
+        let mut dedupe = HubDedupe::default();
+        assert!(!dedupe.suppress_queue_event(at));
+        assert!(dedupe.suppress_queue_event(at + Duration::from_millis(20)));
+        assert!(!dedupe.suppress_queue_event(at + Duration::from_millis(120)));
+    }
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
     /// entry has to hit and a stale one has to miss. Getting the second one wrong hands the proxy a

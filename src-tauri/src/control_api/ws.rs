@@ -185,11 +185,16 @@ async fn run_socket(
 }
 
 /// Translate one hub event into a wire message. Continuous position ticks are never mirrored;
-/// the per-connection timer reads them from the snapshot instead.
+/// discrete seeks and pause/resume positions are, and the per-connection timer reads ongoing
+/// positions from the snapshot instead.
 async fn ws_message(event: HubEvent, shared: &ApiShared) -> Option<WsMessage> {
     match event {
         HubEvent::NowPlaying(now) => Some(WsMessage::NowPlaying {
-            current: ApiTrack::from_value(&now),
+            current: shared
+                .context
+                .current_api_track()
+                .await
+                .unwrap_or_else(|| ApiTrack::from_value(&now)),
             position_sec: now.get("position").and_then(serde_json::Value::as_f64),
             duration_sec: now.get("duration").and_then(serde_json::Value::as_f64),
         }),
@@ -206,10 +211,9 @@ async fn ws_message(event: HubEvent, shared: &ApiShared) -> Option<WsMessage> {
         HubEvent::PlaybackError { message, video_id } => {
             Some(WsMessage::PlaybackError { message, video_id })
         }
-        HubEvent::PositionSet(_)
-        | HubEvent::Duration(_)
-        | HubEvent::TrackLoading(_)
-        | HubEvent::TrackFailed(_) => None,
+        // Discrete seeks and pause/resume snapshots arrive here even while no 1 Hz timer runs.
+        HubEvent::PositionSet(position_sec) => Some(WsMessage::Position { position_sec }),
+        HubEvent::Duration(_) | HubEvent::TrackLoading(_) | HubEvent::TrackFailed(_) => None,
     }
 }
 

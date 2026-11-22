@@ -1,6 +1,7 @@
 //! Shared request state and response shapes for the local control API.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{FromRequest, Request as AxumRequest},
@@ -20,6 +21,11 @@ use super::ws::WsConnections;
 use crate::integrations::hub::HubEvent;
 use crate::integrations::parse::ParsedInput;
 use crate::state::QueueNeighbors;
+
+/// Hard ceiling for a detached `POST /playback/next` skip. The HTTP response still arrives at 15 s,
+/// but the task may not hold the mutation lock beyond this point even if resolution or lookahead
+/// never returns. The app's own skip leaves one second for its compensating restore.
+pub(crate) const CONTROL_API_SKIP_HARD_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The existing queue row that made a request a duplicate. `matched_by` is `video_id` only for a
 /// direct `video_id`-to-`video_id` hit; any hit involving a counterpart id on either side is
@@ -146,9 +152,9 @@ impl ErrorBody {
         Self::new(StatusCode::CONFLICT, "remote_linked", "another linked device is the player")
     }
 
-    /// The 15 s wait ended before the queue fact changed. This does **not** guarantee the skip
-    /// failed: the underlying task keeps running under the mutation lock. Clients should allow at
-    /// least 20 s before assuming the request was lost.
+    /// The 15 s wait ended before the queue fact changed. The skip may still finish (or be rolled
+    /// back at the 45 s hard ceiling), so this does not by itself prove failure. Clients should
+    /// allow at least 20 s before assuming the request was lost.
     pub fn next_timeout(current: Option<Value>) -> Self {
         let mut error = Self::new(
             StatusCode::GATEWAY_TIMEOUT,
@@ -432,6 +438,41 @@ impl ApiTrack {
             queued_end: get("queued_end", "queuedEnd").and_then(Value::as_bool).unwrap_or(false),
         }
     }
+    /// Build the track from the authoritative queue row rather than the slim `now-playing` event.
+    /// That event omits fields such as `album_id`, `explicit` and the queue flags, so deriving a
+    /// track from it makes WebSocket events disagree with `/queue`. `now` only supplies transport
+    /// facts (live, duration, artwork) when the row does not carry them.
+    pub fn from_queue_snapshot(queue: &Value, now: Option<&Value>) -> Option<Self> {
+        let index = queue.get("currentIndex").and_then(Value::as_u64)? as usize;
+        let row = queue.get("items").and_then(Value::as_array)?.get(index)?;
+        let mut track = Self::from_value(row);
+        if let Some(now) = now {
+            if track.album.is_none() {
+                track.album =
+                    field(now, "album", "album").and_then(Value::as_str).map(str::to_owned);
+            }
+            if track.album_id.is_none() {
+                track.album_id =
+                    field(now, "album_id", "albumId").and_then(Value::as_str).map(str::to_owned);
+            }
+            if track.thumbnail.is_none() {
+                track.thumbnail =
+                    field(now, "thumbnail", "thumbnail").and_then(Value::as_str).map(str::to_owned);
+            }
+            if track.duration.is_none() {
+                track.duration =
+                    field(now, "duration", "duration").and_then(Value::as_str).map(str::to_owned);
+            }
+            if track.duration_sec.is_none() {
+                track.duration_sec =
+                    field(now, "duration_sec", "durationSec").and_then(Value::as_u64);
+            }
+            if let Some(live) = now.get("live").and_then(Value::as_bool) {
+                track.live = live;
+            }
+        }
+        Some(track)
+    }
 }
 
 fn field<'a>(value: &'a Value, snake: &str, camel: &str) -> Option<&'a Value> {
@@ -479,12 +520,13 @@ impl StatusResponse {
 
 /// `GET /api/v1/now-playing`. The current track and the few facts a player bar needs.
 ///
-/// `now` is the same object as in [`StatusResponse`], including `queued_by` when present.
-/// `position` and `duration` are **seconds**; `live` is always present here (default `false`).
+/// `now` is the shared [`ApiTrack`] projection of the live queue row, so it carries `album_id` and
+/// the queue flags even though the slim `now-playing` event does not. `position` and `duration` are
+/// **seconds**; `live` is always present here (default `false`).
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct NowPlayingResponse {
-    pub now: Value,
+    pub now: ApiTrack,
     pub paused: bool,
     /// Playback position in seconds.
     pub position: f64,
@@ -494,9 +536,9 @@ pub struct NowPlayingResponse {
 }
 
 impl NowPlayingResponse {
-    pub fn from_snapshot(snap: &Value) -> Self {
+    pub fn from_snapshot(snap: &Value, track: ApiTrack) -> Self {
         let value = serde_json::json!({
-            "now": snap.get("now").cloned().unwrap_or(Value::Null),
+            "now": track,
             "paused": snap.get("paused").cloned().unwrap_or(serde_json::json!(true)),
             "position": snap.get("position").cloned().unwrap_or(serde_json::json!(0.0)),
             "duration": snap.get("duration").cloned().unwrap_or(serde_json::json!(0.0)),
@@ -672,7 +714,7 @@ pub async fn ws_snapshot(shared: &ApiShared) -> WsSnapshot {
         shared.context.queue_neighbors().await,
     );
     WsSnapshot {
-        current: ApiTrack::from_value(snap.get("now").unwrap_or(&Value::Null)),
+        current: shared.context.current_api_track().await.unwrap_or_default(),
         position_sec: snap.get("position").and_then(Value::as_f64).unwrap_or(0.0),
         duration_sec: snap.get("duration").and_then(Value::as_f64).unwrap_or(0.0),
         playing: !snap.get("paused").and_then(Value::as_bool).unwrap_or(false),
@@ -838,6 +880,13 @@ pub trait ControlApiContext: Send + Sync + 'static {
 
     /// Same shape the UI's `queue-changed` event uses, including `items[].queued_by`.
     async fn queue_snapshot(&self) -> serde_json::Value;
+
+    /// Current track projected from the live queue row, so every consumer sees the same album and
+    /// queue metadata. The slim `now-playing` event is used only for transport facts and fallback.
+    async fn current_api_track(&self) -> Option<ApiTrack> {
+        let now = self.playback_snapshot().await;
+        ApiTrack::from_queue_snapshot(&self.queue_snapshot().await, now.get("now"))
+    }
 
     /// Read-only next/previous indices, computed from the same snapshot shape.
     async fn queue_neighbors(&self) -> QueueNeighbors;
@@ -1021,5 +1070,42 @@ mod tests {
         };
         assert_eq!(artist_list(&item), vec!["A", "B"]);
         assert_eq!(artist_list(&SongItem::default()), vec![""]);
+    }
+
+    #[test]
+    fn current_track_comes_from_the_queue_row_not_the_slim_event() {
+        let queue = serde_json::json!({
+            "currentIndex": 0,
+            "items": [{
+                "video_id": "abc",
+                "title": "Mr. Brightside",
+                "artists": "The Killers",
+                "artist_list": ["The Killers"],
+                "album": "Hot Fuss",
+                "album_id": "MPREb_LU3E5vWgwfG",
+                "duration": "3:43",
+                "explicit": false,
+                "queued_by": "friend",
+                "queued": true,
+                "queued_end": false
+            }]
+        });
+        // The UI event is deliberately slim: it used to be the only source, losing album_id.
+        let now = serde_json::json!({
+            "videoId": "abc",
+            "album": null,
+            "albumId": null,
+            "duration_sec": 223,
+            "live": false
+        });
+        let track = ApiTrack::from_queue_snapshot(&queue, now.get("now")).unwrap();
+        assert_eq!(track.video_id, "abc");
+        assert_eq!(track.album.as_deref(), Some("Hot Fuss"));
+        assert_eq!(track.album_id.as_deref(), Some("MPREb_LU3E5vWgwfG"));
+        assert_eq!(track.artist_list, vec!["The Killers"]);
+        assert_eq!(track.duration_sec, Some(223));
+        assert_eq!(track.queued_by.as_deref(), Some("friend"));
+        assert!(track.queued);
+        assert!(!track.queued_end);
     }
 }

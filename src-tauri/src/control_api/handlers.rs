@@ -19,6 +19,7 @@ use super::types::{
     NowPlayingResponse, OkResponse, PlaybackStateResponse, PreviousResponse, QueueQuery,
     QueueRequest, QueueRequestResponse, QueueResponse, RemoveRequest, ResolveError, SeekRequest,
     SeekResponse, SimpleQueueRequest, StatusResponse, VolumeRequest, VolumeResponse,
+    CONTROL_API_SKIP_HARD_TIMEOUT,
 };
 
 /// A mutation waits at most this long for the shared lock; longer waits answer `503 busy` with
@@ -99,11 +100,13 @@ async fn status(State(shared): State<Arc<ApiShared>>) -> Response {
     Json(StatusResponse::from_snapshot(snap, linked, role)).into_response()
 }
 
-/// `GET /api/v1/now-playing`: the currently heard track and its transport facts. `now` carries
-/// `queued_by` when present; `position` and `duration` are seconds. See [`NowPlayingResponse`].
+/// `GET /api/v1/now-playing`: the currently heard track and its transport facts. `now` is the
+/// shared queue-row projection, so it carries `album_id`, `queued_by` and the queue flags;
+/// `position` and `duration` are seconds. See [`NowPlayingResponse`].
 async fn now_playing(State(shared): State<Arc<ApiShared>>) -> Response {
     let snap = shared.context.playback_snapshot().await;
-    Json(NowPlayingResponse::from_snapshot(&snap)).into_response()
+    let track = shared.context.current_api_track().await.unwrap_or_default();
+    Json(NowPlayingResponse::from_snapshot(&snap, track)).into_response()
 }
 
 /// `GET /api/v1/queue`: a defined projection of the displayed queue. UI-only fields such as
@@ -188,9 +191,11 @@ async fn toggle(State(shared): State<Arc<ApiShared>>) -> Response {
 /// autoplay fetch, and returns `{ok, current}` with that queue item. The wait ends when the queue's
 /// current index or video id changes, not when audio starts. The skip itself is never cancelled: it
 /// runs in a spawned task that carries the mutation lock to completion, so a following mutation
-/// cannot observe a half-applied skip (new track armed but autoplay fetch unfinished). On expiry the
+/// cannot observe a half-applied skip (new track armed but autoplay fetch unfinished). The task has
+/// a hard 45 s ceiling: a stalled resolver is cancelled, the app restores the pre-skip row, and the
+/// mutation lock is released even though the HTTP response already timed out at 15 s. On expiry the
 /// response is `next_timeout` with the track that was current when the request began. That response
-/// does **not** guarantee the skip failed; clients should use an HTTP timeout of at least 20 s and
+/// does **not** by itself prove failure; clients should use an HTTP timeout of at least 20 s and
 /// re-read `/status` before retrying.
 async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
     if let Err(error) = guard(&shared).await {
@@ -206,7 +211,18 @@ async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
     let task_shared = Arc::clone(&shared);
     let task = tokio::spawn(async move {
         let _lock = lock;
-        task_shared.context.clone().next().await
+        // The app's own skip restores its queue one second earlier. This outer guard also bounds
+        // other implementations (including test doubles): after 45 s the future is dropped and the
+        // owned guard is released no matter what it was awaiting.
+        match tokio::time::timeout(
+            CONTROL_API_SKIP_HARD_TIMEOUT,
+            task_shared.context.clone().next(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => None,
+        }
     });
     match tokio::time::timeout(CONTROL_API_NEXT_TIMEOUT, task).await {
         Ok(Ok(Some(item))) => {
@@ -505,13 +521,15 @@ mod tests {
 
     use crate::state::QueueNeighbors;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Default)]
     struct MockRow {
         id: String,
         counterpart: Option<String>,
         autoplay: bool,
         queued: bool,
         queued_by: Option<String>,
+        album: Option<String>,
+        album_id: Option<String>,
     }
 
     #[derive(Debug)]
@@ -579,11 +597,13 @@ mod tests {
                 resolve_error: None,
                 rows: StdMutex::new(vec![
                     MockRow {
-                        id: "a".into(),
+                        id: "abc".into(),
                         counterpart: None,
                         autoplay: false,
                         queued: false,
-                        queued_by: None,
+                        queued_by: Some("friend".into()),
+                        album: Some("Mr. Brightside Album".into()),
+                        album_id: Some("MPREb_LU3E5vWgwfG".into()),
                     },
                     MockRow {
                         id: "b".into(),
@@ -591,6 +611,7 @@ mod tests {
                         autoplay: false,
                         queued: false,
                         queued_by: Some("friend".into()),
+                        ..Default::default()
                     },
                     MockRow {
                         id: "c".into(),
@@ -598,6 +619,7 @@ mod tests {
                         autoplay: true,
                         queued: false,
                         queued_by: None,
+                        ..Default::default()
                     },
                 ]),
                 current: AtomicUsize::new(0),
@@ -646,6 +668,8 @@ mod tests {
                         "counterpart": row.counterpart,
                         "autoplay": row.autoplay,
                         "queued": row.queued,
+                        "album": row.album,
+                        "album_id": row.album_id,
                     });
                     if let Some(by) = &row.queued_by {
                         item.as_object_mut().unwrap().insert("queued_by".into(), json!(by));
@@ -808,6 +832,8 @@ mod tests {
                             autoplay: false,
                             queued: next,
                             queued_by: item.queued_by.clone(),
+                            album: item.album.clone(),
+                            album_id: item.album_id.clone(),
                         },
                     );
                     let mut inserted = item.clone();
@@ -960,6 +986,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = json_body(response).await;
         assert_eq!(json["now"]["queued_by"], "friend");
+        assert_eq!(json["now"]["album"], "Mr. Brightside Album");
+        assert_eq!(json["now"]["album_id"], "MPREb_LU3E5vWgwfG");
         assert_eq!(json["position"], 1.0);
         assert_eq!(json["duration"], 10.0);
         assert_eq!(json["live"], false);
@@ -1170,6 +1198,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn stalled_skip_has_a_hard_ceiling_and_releases_the_lock() {
+        let (app, ctx) = test_router_with(MockContext {
+            delay: Duration::from_secs(120),
+            next_item: StdMutex::new(Some(json!({ "videoId": "never" }))),
+            ..Default::default()
+        });
+        let response =
+            request(app.clone(), "/api/v1/playback/next", json!({}), Some("Bearer abc123")).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(json_body(response).await["error"], "next_timeout");
+
+        // The 15 s response already came back; the detached task still owns the guard. At 45 s the
+        // hard ceiling cancels it, and the next mutation must not see `busy`.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        let response =
+            request(app, "/api/v1/queue/clear-queued", json!({}), Some("Bearer abc123")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["ok"], true);
+        assert_eq!(ctx.clears.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn second_mutation_waits_for_the_first_skip() {
         let (app, ctx) =
             test_router_with(MockContext { delay: Duration::from_secs(5), ..Default::default() });
@@ -1366,7 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_request_rejects_duplicates_and_honours_override() {
-        for (id, expected) in [("a", 0), ("b", 1)] {
+        for (id, expected) in [("abc", 0), ("b", 1)] {
             let (app, _) = test_router_with(MockContext {
                 resolve_item: resolved(id, Some("3:00")),
                 ..Default::default()
@@ -1611,6 +1662,7 @@ mod tests {
             autoplay: false,
             queued: false,
             queued_by: None,
+            ..Default::default()
         };
         let cases = vec![
             // requested video_id == queue counterpart
@@ -1691,6 +1743,7 @@ mod tests {
                 autoplay: false,
                 queued: false,
                 queued_by: None,
+                ..Default::default()
             }]),
             ..Default::default()
         });
@@ -1787,6 +1840,8 @@ mod tests {
         let hello = next_json(&mut socket).await;
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["current"]["video_id"], "abc");
+        assert_eq!(hello["current"]["album"], "Mr. Brightside Album");
+        assert_eq!(hello["current"]["album_id"], "MPREb_LU3E5vWgwfG");
         assert_eq!(hello["position_sec"], 1.0);
         assert_eq!(hello["duration_sec"], 10.0);
         assert_eq!(hello["playing"], true);
@@ -1808,6 +1863,38 @@ mod tests {
         let event = next_json(&mut socket).await;
         assert_eq!(event["type"], "volume");
         assert_eq!(event["volume"], 42);
+        socket.close(None).await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_now_playing_uses_the_queue_row_for_album_fields() {
+        let (url, _, context, task) = spawn_ws_server().await;
+        let mut socket = connect_ws(&url, true).await.unwrap();
+        next_json(&mut socket).await;
+        // The slim UI event has no album at all; the queue row does.
+        context
+            .hub
+            .send(HubEvent::NowPlaying(serde_json::json!({ "videoId": "abc", "album": null })))
+            .unwrap();
+        let event = next_json(&mut socket).await;
+        assert_eq!(event["type"], "now_playing");
+        assert_eq!(event["current"]["video_id"], "abc");
+        assert_eq!(event["current"]["album"], "Mr. Brightside Album");
+        assert_eq!(event["current"]["album_id"], "MPREb_LU3E5vWgwfG");
+        socket.close(None).await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_sends_an_explicit_position_event() {
+        let (url, _, context, task) = spawn_ws_server().await;
+        let mut socket = connect_ws(&url, true).await.unwrap();
+        next_json(&mut socket).await;
+        context.hub.send(HubEvent::PositionSet(42.0)).unwrap();
+        let event = next_json(&mut socket).await;
+        assert_eq!(event["type"], "position");
+        assert_eq!(event["position_sec"], 42.0);
         socket.close(None).await.unwrap();
         task.abort();
     }
