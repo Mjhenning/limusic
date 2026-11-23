@@ -6684,9 +6684,9 @@ pub fn queue_neighbors_from_snapshot(snapshot: &serde_json::Value) -> QueueNeigh
 /// those: shuffle through a whole album and the tracks that happen to sit after the last shuffled
 /// one in album order come back as "up next" the moment shuffle goes off, even though they just
 /// played. Heard tracks *behind* the playing one stay — they're the hidden history, and removing
-/// them would only move the playing track's index for no visible gain.
-/// ponytail: dupes match by videoId — the same song twice in one queue keeps only its first copy
-/// past the playing track; harmless (identical items).
+/// them would only move the playing track's index for no visible gain. Manual adds are exempt: an
+/// API request is queue state, not replayable playlist history, so a heard video_id must not drop
+/// it. Plain dupes still match by videoId; only the queued/queued_end copies survive.
 fn unshuffled(
     orig: Vec<SongItem>,
     heard: &HashSet<String>,
@@ -6700,7 +6700,7 @@ fn unshuffled(
     let mut items = orig;
     let mut i = 0;
     items.retain(|it| {
-        let keep = i <= idx || !heard.contains(&it.video_id);
+        let keep = i <= idx || it.queued || it.queued_end || !heard.contains(&it.video_id);
         i += 1;
         keep
     });
@@ -8161,6 +8161,19 @@ mod tests {
         ];
         let (items, _) = unshuffled(with_adds, &heard(&["a"]), "a", 9);
         assert_eq!(ids(&items), ["a", "mine", "b", "c", "tail"]);
+
+        // An API request whose video_id shuffle already played must not be dropped. The plain
+        // duplicate is still removed; only the queued/queued_end copies survive.
+        let with_heard_adds = vec![
+            song("a", None),
+            song("b", None),
+            innertube::SongItem { queued: true, ..song("b", None) },
+            innertube::SongItem { queued_end: true, ..song("b", None) },
+        ];
+        let (items, _) = unshuffled(with_heard_adds, &heard(&["a", "b"]), "a", 9);
+        assert_eq!(ids(&items), ["a", "b", "b"]);
+        let flags: Vec<_> = items.iter().map(|i| (i.queued, i.queued_end)).collect();
+        assert_eq!(flags, [(false, false), (true, false), (false, true)]);
     }
 
     #[test]
