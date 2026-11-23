@@ -85,6 +85,7 @@ struct StatusFields {
     backoff_secs: Option<u64>,
     retry_at: Option<Instant>,
     last_signature: Option<(String, Instant)>,
+    degraded: bool,
 }
 
 struct RunningTuna {
@@ -125,12 +126,19 @@ impl TunaOutput {
     }
 
     pub async fn apply(&self, settings: TunaSettings) {
+        let was_enabled = self.inner.settings.read().await.enabled;
         self.stop().await;
         *self.inner.settings.write().await = settings.clone();
         *self.inner.status.lock().await = StatusFields::default();
         if !settings.enabled {
             *self.inner.force.write().await = None;
             return;
+        }
+        let endpoint = safe_target(&settings.url);
+        if was_enabled {
+            tracing::info!(endpoint, "tuna output restarted");
+        } else {
+            tracing::info!(endpoint, "tuna output started");
         }
         let (shutdown, mut shutdown_rx) = oneshot::channel();
         let (force, force_rx) = mpsc::unbounded_channel();
@@ -149,6 +157,8 @@ impl TunaOutput {
         *self.inner.force.write().await = None;
         let running = self.inner.running.lock().await.take();
         if let Some(running) = running {
+            let endpoint = safe_target(&self.inner.settings.read().await.url);
+            tracing::info!(endpoint, "tuna output stopped");
             let _ = running.shutdown.send(());
             running.task.abort();
             let _ = running.task.await;
@@ -257,18 +267,28 @@ impl TunaOutput {
         let mut status = inner.status.lock().await;
         match result {
             Ok(_) => {
+                let recovered = status.degraded;
                 status.last_ok_at_ms = Some(now_ms());
                 status.last_error = None;
                 status.backoff_secs = None;
                 status.retry_at = None;
+                status.degraded = false;
+                if recovered {
+                    tracing::info!(endpoint = safe_target(url), "tuna output recovered");
+                }
             }
             Err(error) => {
+                let first_failure = !status.degraded;
                 let secs = status
                     .backoff_secs
                     .map_or(1, |previous| previous.saturating_mul(2).min(MAX_BACKOFF_SECS));
                 status.backoff_secs = Some(secs);
                 status.retry_at = Some(now + Duration::from_secs(secs));
                 status.last_error = Some(error.to_string());
+                status.degraded = true;
+                if first_failure {
+                    tracing::warn!(endpoint = safe_target(url), "tuna output push failed");
+                }
             }
         }
     }
@@ -332,6 +352,21 @@ fn hostname() -> String {
         "limusic".to_string()
     } else {
         name
+    }
+}
+
+/// Log only the destination host and port. A configured Tuna URL can carry a path, query or
+/// token; none of that belongs in a log line.
+fn safe_target(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("unknown-host");
+            match parsed.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            }
+        }
+        Err(_) => "invalid-url".to_string(),
     }
 }
 
@@ -670,5 +705,12 @@ mod tests {
         assert_eq!(first.posts().len(), 1);
         assert_eq!(second.posts().len(), 1);
         output.stop().await;
+    }
+
+    #[test]
+    fn log_target_keeps_only_host_and_port() {
+        assert_eq!(safe_target("http://127.0.0.1:1608/obs?token=secret"), "127.0.0.1:1608");
+        assert_eq!(safe_target("https://tuna.example/path"), "tuna.example");
+        assert_eq!(safe_target("not a url"), "invalid-url");
     }
 }

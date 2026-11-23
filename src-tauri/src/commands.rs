@@ -3778,6 +3778,10 @@ pub async fn set_integration_settings(
         url: parsed.tuna.url.trim().to_string(),
     };
     let db = &state.db;
+    let previous: crate::integrations::settings::ControlApiSettings = db
+        .get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
     db.set_setting(
         crate::integrations::settings::CONTROL_API_SETTINGS_KEY,
         &serde_json::to_string(&control_api).map_err(|e| e.to_string())?,
@@ -3786,7 +3790,8 @@ pub async fn set_integration_settings(
         crate::integrations::settings::TUNA_SETTINGS_KEY,
         &serde_json::to_string(&tuna).map_err(|e| e.to_string())?,
     );
-    manager.apply_settings(control_api).await;
+    let reason = if previous.port != control_api.port { "port change" } else { "settings changed" };
+    manager.apply_settings(control_api, reason).await;
     manager.apply_tuna_settings(tuna).await;
     Ok(())
 }

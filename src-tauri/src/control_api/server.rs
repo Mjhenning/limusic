@@ -75,13 +75,13 @@ impl IntegrationsManager {
     /// Called from Tauri setup. A bad saved setting is reported through `last_error`, never by
     /// crashing startup.
     pub async fn start_from_settings(&self) {
-        self.apply(load_settings(&self.db)).await;
+        self.apply(load_settings(&self.db), "startup").await;
         self.tuna.apply(load_tuna_settings(&self.db)).await;
     }
 
     /// Apply already-validated settings from the settings command.
-    pub async fn apply_settings(&self, settings: ControlApiSettings) {
-        self.apply(settings).await;
+    pub async fn apply_settings(&self, settings: ControlApiSettings, reason: &'static str) {
+        self.apply(settings, reason).await;
     }
 
     /// Apply Tuna settings live: start, stop, or restart with a new URL.
@@ -103,7 +103,7 @@ impl IntegrationsManager {
         let token = generate_token();
         self.db.set_setting(CONTROL_API_TOKEN_KEY, &token);
         *self.token.write().await = token.clone();
-        self.apply(load_settings(&self.db)).await;
+        self.apply(load_settings(&self.db), "token regenerated").await;
         Ok(token)
     }
 
@@ -127,11 +127,13 @@ impl IntegrationsManager {
     }
 
     /// Stop the listener and wait for its task to finish. Called on every control-API apply.
-    async fn stop_control_api(&self) {
+    /// Returns whether a listener was actually running, so a restart can be logged as one.
+    async fn stop_control_api(&self) -> bool {
         // Token regeneration, disable and rebind all come through here. Close sockets before
         // aborting the server task so clients get a frame instead of a bare TCP reset.
         self.ws.close_all();
         let mut inner = self.inner.lock().await;
+        let was_running = inner.server.is_some();
         if let Some(server) = inner.server.take() {
             tracing::info!(addr = %server.addr, "stopping control API");
             let _ = server.shutdown.send(());
@@ -141,10 +143,11 @@ impl IntegrationsManager {
         inner.status.running = false;
         inner.status.bind_addr = None;
         inner.status.port = None;
+        was_running
     }
 
-    async fn apply(&self, settings: ControlApiSettings) {
-        self.stop_control_api().await;
+    async fn apply(&self, settings: ControlApiSettings, reason: &'static str) {
+        let was_running = self.stop_control_api().await;
         let mut status = ControlApiStatus {
             enabled: settings.enabled,
             running: false,
@@ -167,6 +170,10 @@ impl IntegrationsManager {
             }
         };
         let addr = SocketAddr::new(ip, settings.port);
+        if was_running {
+            tracing::info!(reason, "restarting control API");
+        }
+        tracing::info!(%addr, "starting control API");
         match TcpListener::bind(addr).await {
             Ok(listener) => {
                 let shared = self.shared();
