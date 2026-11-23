@@ -257,12 +257,13 @@ impl TunaOutput {
     }
 }
 
-/// The effective status is "stopped" with no current track. A paused track is "paused", never
-/// "stopped", so paused tabs do not fight a playing source in Tuna's browser script.
+/// Tuna's own browser script only emits `playing` and `stopped`. A paused track is reported as
+/// `stopped` so Tuna stops treating it as live audio and shows its placeholder text; we still send
+/// that one state change immediately, then no periodic pushes until playback resumes.
 fn build_payload<'a>(snapshot: &TunaSnapshot, hostname: &'a str) -> TunaRequest<'a> {
     let (status, track) = match &snapshot.track {
         None => ("stopped", None),
-        Some(track) if snapshot.paused => ("paused", Some(track)),
+        Some(track) if snapshot.paused => ("stopped", Some(track)),
         Some(track) => ("playing", Some(track)),
     };
     let (title, artists, cover_url, album, album_url) = match track {
@@ -528,7 +529,8 @@ mod tests {
         src.snapshot.lock().unwrap().paused = true;
         output.test_push().await;
         let posts = capture.wait(2).await;
-        assert_eq!(posts[1]["data"]["status"], "paused");
+        assert_eq!(posts[1]["data"]["status"], "stopped");
+        assert_eq!(posts[1]["data"]["cover_url"], "https://img.example/cover.jpg");
 
         *src.snapshot.lock().unwrap() = TunaSnapshot::default();
         output.test_push().await;
@@ -549,8 +551,12 @@ mod tests {
 
         hub.send(HubEvent::NowPlaying(json!({}))).unwrap();
         assert_eq!(capture.wait(1).await.len(), 1);
+        // The paused/stopped state change is pushed immediately, using Tuna's only two live states.
+        src.snapshot.lock().unwrap().paused = true;
         hub.send(HubEvent::PlaybackState("paused".into())).unwrap();
-        assert_eq!(capture.wait(2).await.len(), 2);
+        let posts = capture.wait(2).await;
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[1]["data"]["status"], "stopped");
 
         // A paused source gets no periodic posts, even though the worker keeps ticking.
         capture.clear();
