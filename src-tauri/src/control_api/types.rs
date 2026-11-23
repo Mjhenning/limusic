@@ -27,6 +27,10 @@ use crate::state::QueueNeighbors;
 /// never returns. The app's own skip leaves one second for its compensating restore.
 pub(crate) const CONTROL_API_SKIP_HARD_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Per-request ceiling for the control API's own song resolution. The shared InnerTube client keeps
+/// its 30 s connect / 60 s total defaults for the UI; only request/add/play-next are wrapped.
+pub(crate) const CONTROL_API_RESOLVE_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// The existing queue row that made a request a duplicate. `matched_by` is `video_id` only for a
 /// direct `video_id`-to-`video_id` hit; any hit involving a counterpart id on either side is
 /// `counterpart`. The row is identified by both its id and its twin so a client can see that an
@@ -190,6 +194,14 @@ impl ErrorBody {
 
     pub fn resolve_failed(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "resolve_failed", message)
+    }
+
+    pub fn resolve_timeout() -> Self {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "resolve_timeout",
+            "song resolution did not finish within 12 s",
+        )
     }
 
     pub fn duration_unknown() -> Self {

@@ -19,7 +19,7 @@ use super::types::{
     NowPlayingResponse, OkResponse, PlaybackStateResponse, PreviousResponse, QueueQuery,
     QueueRequest, QueueRequestResponse, QueueResponse, RemoveRequest, ResolveError, SeekRequest,
     SeekResponse, SimpleQueueRequest, StatusResponse, VolumeRequest, VolumeResponse,
-    CONTROL_API_SKIP_HARD_TIMEOUT,
+    CONTROL_API_RESOLVE_TIMEOUT, CONTROL_API_SKIP_HARD_TIMEOUT,
 };
 
 /// A mutation waits at most this long for the shared lock; longer waits answer `503 busy` with
@@ -398,10 +398,6 @@ fn resolve_error(error: ResolveError) -> ErrorBody {
 /// previous skip never leaves this endpoint guessing: it holds the same mutation lock as other
 /// current-track/queue changes.
 async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Response {
-    let _lock = match mutation_lock(&shared).await {
-        Ok(lock) => lock,
-        Err(error) => return error.into_response(),
-    };
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -409,9 +405,15 @@ async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Res
         Ok(parsed) => parsed,
         Err(error) => return parse_error(error).into_response(),
     };
-    let mut item = match shared.context.resolve_input(&parsed).await {
-        Ok(item) => item,
-        Err(error) => return resolve_error(error).into_response(),
+    let mut item = match tokio::time::timeout(
+        CONTROL_API_RESOLVE_TIMEOUT,
+        shared.context.resolve_input(&parsed),
+    )
+    .await
+    {
+        Ok(Ok(item)) => item,
+        Ok(Err(error)) => return resolve_error(error).into_response(),
+        Err(_) => return ErrorBody::resolve_timeout().into_response(),
     };
     if body.reject_explicit && item.explicit {
         return ErrorBody::explicit_content().into_response();
@@ -433,6 +435,10 @@ async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Res
             item.queued_by = Some(by.to_string());
         }
     }
+    let _lock = match mutation_lock(&shared).await {
+        Ok(lock) => lock,
+        Err(error) => return error.into_response(),
+    };
     match shared
         .context
         .clone()
@@ -558,6 +564,7 @@ mod tests {
         max_active: AtomicUsize,
         resolve_item: SongItem,
         resolve_error: Option<ResolveError>,
+        resolve_delay: Duration,
         rows: StdMutex<Vec<MockRow>>,
         current: AtomicUsize,
         inserted: StdMutex<Vec<(SongItem, bool, bool)>>,
@@ -595,6 +602,7 @@ mod tests {
                     ..Default::default()
                 },
                 resolve_error: None,
+                resolve_delay: Duration::ZERO,
                 rows: StdMutex::new(vec![
                     MockRow {
                         id: "abc".into(),
@@ -781,6 +789,11 @@ mod tests {
         }
 
         async fn resolve_input(&self, parsed: &ParsedInput) -> Result<SongItem, ResolveError> {
+            if !self.resolve_delay.is_zero()
+                && !matches!(parsed, ParsedInput::Query(query) if query.contains("next"))
+            {
+                sleep(self.resolve_delay).await;
+            }
             if let Some(error) = &self.resolve_error {
                 return Err(error.clone());
             }
@@ -1375,6 +1388,73 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(json_body(response).await["error"], "duration_unknown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_request_resolve_timeout_returns_504_and_queues_nothing() {
+        let (app, ctx) = test_router_with(MockContext {
+            resolve_delay: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "stalled" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "resolve_timeout");
+        assert!(ctx.inserted.lock().unwrap().is_empty());
+        assert_eq!(ctx.rows.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_resolve_does_not_block_pause_and_volume() {
+        let (app, ctx) = test_router_with(MockContext {
+            resolve_delay: Duration::from_secs(60),
+            ..Default::default()
+        });
+
+        let stalled = tokio::spawn(request(
+            app.clone(),
+            "/api/v1/queue/request",
+            json!({ "input": "stalled" }),
+            Some("Bearer abc123"),
+        ));
+        tokio::task::yield_now().await;
+
+        // Pause and volume take no network; they must not queue behind the stalled resolve.
+        let pause = tokio::spawn(request(
+            app.clone(),
+            "/api/v1/playback/pause",
+            json!({}),
+            Some("Bearer abc123"),
+        ));
+        let volume = tokio::spawn(request(
+            app.clone(),
+            "/api/v1/playback/volume",
+            json!({ "volume": 50 }),
+            Some("Bearer abc123"),
+        ));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(pause.is_finished());
+        assert!(volume.is_finished());
+        assert!(!stalled.is_finished());
+        tokio::time::advance(Duration::from_secs(13)).await;
+        let paused = pause.await.unwrap();
+        let volume_response = volume.await.unwrap();
+        let stalled_response = stalled.await.unwrap();
+
+        assert_eq!(paused.status(), StatusCode::OK);
+        assert_eq!(json_body(paused).await["ok"], true);
+        assert_eq!(volume_response.status(), StatusCode::OK);
+        assert_eq!(json_body(volume_response).await["ok"], true);
+        assert_eq!(ctx.pause_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.volume_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stalled_response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(json_body(stalled_response).await["error"], "resolve_timeout");
     }
 
     #[tokio::test]
