@@ -17,6 +17,7 @@ use crate::control_api::types::{ApiTrack, ControlApiContext};
 
 const PUSH_TIMEOUT: Duration = Duration::from_secs(3);
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
+const DUPLICATE_WINDOW: Duration = Duration::from_millis(250);
 const MAX_BACKOFF_SECS: u64 = 30;
 
 /// The facts needed for one payload. Every field comes from the effective app snapshot.
@@ -83,6 +84,7 @@ struct StatusFields {
     last_error: Option<String>,
     backoff_secs: Option<u64>,
     retry_at: Option<Instant>,
+    last_signature: Option<(String, Instant)>,
 }
 
 struct RunningTuna {
@@ -230,6 +232,21 @@ impl TunaOutput {
             }
         }
         let payload = build_payload(&snapshot, hostname);
+        // `date` changes on every build, so compare the rest of the envelope. The hub emits both
+        // now-playing and playback-state for one press; their snapshots are identical and only the
+        // first push should cross the wire. Real changes in status, track or progress get a new
+        // signature and go out immediately.
+        let signature =
+            format!("{hostname}|{}", serde_json::to_string(&payload.data).unwrap_or_default());
+        {
+            let mut status = inner.status.lock().await;
+            if let Some((last, at)) = &status.last_signature {
+                if *last == signature && now.saturating_duration_since(*at) < DUPLICATE_WINDOW {
+                    return;
+                }
+            }
+            status.last_signature = Some((signature, now));
+        }
         let result = crate::http::client()
             .post(url)
             .timeout(PUSH_TIMEOUT)
@@ -549,6 +566,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(capture.posts().is_empty());
 
+        // Start live so the next event is a real playing -> stopped transition, not a duplicate.
+        src.snapshot.lock().unwrap().paused = false;
         hub.send(HubEvent::NowPlaying(json!({}))).unwrap();
         assert_eq!(capture.wait(1).await.len(), 1);
         // The paused/stopped state change is pushed immediately, using Tuna's only two live states.
@@ -567,6 +586,33 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(2_200)).await;
         let posts = capture.posts();
         assert!((1..=4).contains(&posts.len()), "expected ~1 Hz ticks, got {}", posts.len());
+        output.stop().await;
+    }
+
+    #[tokio::test]
+    async fn coalesces_identical_immediate_pushes_but_not_changed_content() {
+        let capture = Capture::new();
+        let (src, hub) = source(playing()); // paused: no ticker in this test
+        let output = TunaOutput::new(src.clone());
+        output.apply(TunaSettings { enabled: true, url: capture.url() }).await;
+        tokio::time::sleep(Duration::from_millis(20)).await; // let the worker subscribe
+
+        // One play press emits both events with the same snapshot a few milliseconds apart.
+        hub.send(HubEvent::NowPlaying(json!({}))).unwrap();
+        hub.send(HubEvent::PlaybackState("playing".into())).unwrap();
+        assert_eq!(capture.wait(1).await.len(), 1);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(capture.posts().len(), 1, "identical immediate push was not coalesced");
+
+        // Progress is real content: it must not be swallowed by the 250 ms window.
+        src.snapshot.lock().unwrap().position_sec += 5.0;
+        hub.send(HubEvent::NowPlaying(json!({}))).unwrap();
+        assert_eq!(capture.wait(2).await.len(), 2);
+
+        // After the window the same payload is a fresh push again.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        hub.send(HubEvent::NowPlaying(json!({}))).unwrap();
+        assert_eq!(capture.wait(3).await.len(), 3);
         output.stop().await;
     }
 
