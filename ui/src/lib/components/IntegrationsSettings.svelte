@@ -4,6 +4,7 @@
 	// status poll while it is actually visible.
 	import { untrack, type Snippet } from 'svelte';
 	import { Button } from '$lib/components/ui/button';
+	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 	import { Input } from '$lib/components/ui/input';
 	import { Switch } from '$lib/components/ui/switch';
 	import * as Select from '$lib/components/ui/select';
@@ -22,6 +23,7 @@
 	let token = $state('');
 	let localIps = $state<string[]>([]);
 	let showToken = $state(false);
+	let tokenConfirmOpen = $state(false);
 	let applying = $state(false);
 	let error = $state('');
 	let portInput = $state('27199');
@@ -182,7 +184,6 @@
 	}
 
 	async function regenerateToken() {
-		if (!confirm(t('settings.integrations.token_regenerate_confirm'))) return;
 		applying = true;
 		error = '';
 		try {
@@ -315,6 +316,23 @@
 	</section>
 </div>
 
+<AlertDialog.Root bind:open={tokenConfirmOpen}>
+	<AlertDialog.Content>
+		<AlertDialog.Header>
+			<AlertDialog.Title>{t('settings.integrations.token_regenerate_title')}</AlertDialog.Title>
+			<AlertDialog.Description>
+				{t('settings.integrations.token_regenerate_confirm')}
+			</AlertDialog.Description>
+		</AlertDialog.Header>
+		<AlertDialog.Footer>
+			<AlertDialog.Cancel>{t('common.cancel')}</AlertDialog.Cancel>
+			<AlertDialog.Action onclick={regenerateToken}>
+				{t('settings.integrations.token_regenerate')}
+			</AlertDialog.Action>
+		</AlertDialog.Footer>
+	</AlertDialog.Content>
+</AlertDialog.Root>
+
 {#snippet controlSwitch()}
 	<Switch
 		checked={enabled}
@@ -391,7 +409,12 @@
 		<Button variant="ghost" size="sm" disabled={applying} onclick={copyToken}>
 			{t('settings.integrations.token_copy')}
 		</Button>
-		<Button variant="outline" size="sm" disabled={applying} onclick={regenerateToken}>
+		<Button
+			variant="outline"
+			size="sm"
+			disabled={applying}
+			onclick={() => (tokenConfirmOpen = true)}
+		>
 			{t('settings.integrations.token_regenerate')}
 		</Button>
 	</div>
