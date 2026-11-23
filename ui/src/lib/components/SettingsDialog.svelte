@@ -47,6 +47,7 @@
 	import ExperimentalBadge from '$lib/components/ExperimentalBadge.svelte';
 	import { KARAOKE_TIERS, tierMB } from '$lib/karaoke-tiers';
 	import ScrobbleSettings from '$lib/components/ScrobbleSettings.svelte';
+	import IntegrationsSettings from '$lib/components/IntegrationsSettings.svelte';
 	import DevicesSettings from '$lib/components/DevicesSettings.svelte';
 	import {
 		updateState,
@@ -81,6 +82,7 @@
 		{ id: 'hotkeys', label: t('settings.tabs.hotkeys'), hint: t('settings.tabs.hotkeys_hint'), icon: KeyboardIcon },
 		{ id: 'discord', label: t('settings.tabs.discord'), hint: t('settings.tabs.discord_hint'), icon: DiscordIcon },
 		{ id: 'scrobbling', label: t('settings.tabs.scrobbling'), hint: t('settings.tabs.scrobbling_hint'), icon: LastFmIcon },
+		{ id: 'integrations', label: t('settings.tabs.integrations'), hint: t('settings.tabs.integrations_hint'), icon: LinkSquare02Icon },
 		{ id: 'devices', label: t('settings.tabs.devices'), hint: t('settings.tabs.devices_hint'), icon: ComputerPhoneSyncIcon },
 		{ id: 'data', label: t('settings.tabs.data'), hint: t('settings.tabs.data_hint'), icon: Database02Icon },
 		{ id: 'about', label: t('settings.tabs.about'), hint: t('settings.tabs.about_hint'), icon: InformationCircleIcon }
@@ -926,6 +928,8 @@
 					<DiscordSettings {settings} />
 				{:else if loaded && tab === 'scrobbling'}
 					<ScrobbleSettings {settings} />
+				{:else if tab === 'integrations'}
+					<IntegrationsSettings />
 				{:else if tab === 'devices'}
 					<DevicesSettings />
 				{:else if tab === 'themes'}

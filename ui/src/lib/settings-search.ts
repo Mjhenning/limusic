@@ -17,6 +17,7 @@ export type SettingsTab =
 	| 'hotkeys'
 	| 'discord'
 	| 'scrobbling'
+	| 'integrations'
 	| 'devices'
 	| 'data'
 	| 'about';
@@ -43,6 +44,7 @@ const TABLE: [SettingsTab, K | null, Row[]][] = [
 	['hotkeys', null, [['settings.tabs.hotkeys', 'settings.tabs.hotkeys_hint']]],
 	['discord', null, [['settings.tabs.discord', 'settings.tabs.discord_hint']]],
 	['scrobbling', null, [['settings.tabs.scrobbling', 'settings.tabs.scrobbling_hint']]],
+	['integrations', null, [['settings.tabs.integrations', 'settings.tabs.integrations_hint']]],
 	['devices', null, [['settings.tabs.devices', 'settings.tabs.devices_hint']]],
 	['data', null, [['settings.tabs.data', 'settings.tabs.data_hint']]],
 	['about', null, [['settings.tabs.about', 'settings.tabs.about_hint']]],
@@ -103,6 +105,7 @@ const TABLE: [SettingsTab, K | null, Row[]][] = [
 		'settings.sections.player_view',
 		[
 			['settings.themes.classic_player', 'settings.themes.classic_player_hint'],
+			['settings.themes.cover_lyric', 'settings.themes.cover_lyric_hint'],
 			['settings.themes.cover_lyric_romanized', 'settings.themes.cover_lyric_romanized_hint'],
 			['settings.themes.open_player', 'settings.themes.open_player_hint'],
 			['settings.themes.empty_click_player', 'settings.themes.empty_click_player_hint'],
@@ -262,6 +265,32 @@ const TABLE: [SettingsTab, K | null, Row[]][] = [
 		[
 			['settings.scrobbling.section_rules', 'settings.scrobbling.rules_hint'],
 			['settings.scrobbling.section_edits', 'settings.scrobbling.edits_hint']
+		]
+	],
+
+	[
+		'integrations',
+		'settings.integrations.control_api',
+		[
+			['settings.integrations.enable', 'settings.integrations.enable_hint'],
+			['settings.integrations.status'],
+			['settings.integrations.bind_mode', 'settings.integrations.bind_mode_hint'],
+			['settings.integrations.port', 'settings.integrations.port_hint'],
+			['settings.integrations.token', 'settings.integrations.token_hint'],
+			['settings.integrations.connection', 'settings.integrations.connection_hint'],
+			['settings.integrations.clients']
+		]
+	],
+	[
+		'integrations',
+		'settings.integrations.tuna',
+		[
+			['settings.integrations.tuna_enable', 'settings.integrations.tuna_enable_hint'],
+			['settings.integrations.tuna_url', 'settings.integrations.tuna_url_hint'],
+			['settings.integrations.tuna_test'],
+			['settings.integrations.tuna_last_ok'],
+			['settings.integrations.tuna_last_error'],
+			['settings.integrations.tuna_backoff']
 		]
 	],
 

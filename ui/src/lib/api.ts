@@ -1749,3 +1749,52 @@ export const onMatugenThemeChanged = (cb: (css: string | null) => void): Promise
 	listen<string | null>('matugen-theme-changed', (event) => cb(event.payload));
 export const startMatugenWatcher = () => invoke<void>('start_matugen_watcher');
 export const stopMatugenWatcher = () => invoke<void>('stop_matugen_watcher');
+
+// --- Optional integrations -------------------------------------------------------------------
+export interface ControlApiSettings {
+	enabled: boolean;
+	bind: string;
+	port: number;
+}
+
+export interface TunaSettings {
+	enabled: boolean;
+	url: string;
+}
+
+export interface IntegrationSettings {
+	control_api: ControlApiSettings;
+	tuna: TunaSettings;
+}
+
+export interface ControlApiStatus {
+	enabled: boolean;
+	running: boolean;
+	bind_addr: string | null;
+	port: number | null;
+	last_error: string | null;
+	ws_clients: number;
+}
+
+export interface TunaStatus {
+	enabled: boolean;
+	url: string;
+	last_ok_at_ms: number | null;
+	last_error: string | null;
+	backoff_secs: number | null;
+}
+
+export interface IntegrationStatus {
+	control_api: ControlApiStatus;
+	tuna: TunaStatus;
+}
+
+export const getIntegrationSettings = () => invoke<IntegrationSettings>('get_integration_settings');
+export const setIntegrationSettings = (settings: IntegrationSettings) =>
+	invoke<void>('set_integration_settings', { settings });
+export const getIntegrationStatus = () => invoke<IntegrationStatus>('get_integration_status');
+/** UI-only: never reachable through the HTTP API and never logged. */
+export const getControlApiToken = () => invoke<string>('get_control_api_token');
+export const regenerateControlApiToken = () => invoke<string>('regenerate_control_api_token');
+export const tunaTestPush = () => invoke<TunaStatus>('tuna_test_push');
+export const getLocalIpv4Addresses = () => invoke<string[]>('get_local_ipv4_addresses');

@@ -1,6 +1,7 @@
 //! Tauri commands — the ONLY API the UI calls. context/11 UI contract. No YouTube shapes leak
 //! past here; the UI never sees a stream URL.
 
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
 use innertube::{
@@ -3814,4 +3815,31 @@ pub async fn regenerate_control_api_token(
     manager: State<'_, Arc<IntegrationsManager>>,
 ) -> Result<String, String> {
     manager.regenerate_token().await
+}
+
+/// Token for the Settings UI only. It is never exposed by the HTTP API and never logged.
+#[tauri::command]
+pub async fn get_control_api_token(state: St<'_>) -> Result<String, String> {
+    Ok(state
+        .db
+        .get_setting(crate::integrations::settings::CONTROL_API_TOKEN_KEY)
+        .unwrap_or_default())
+}
+
+/// Private IPv4 addresses for the "Local network" hint. Uses std plus the existing gethostname
+/// dependency; no new crate. The list is best-effort — a host with no private DNS entry still works.
+#[tauri::command]
+pub async fn get_local_ipv4_addresses() -> Result<Vec<String>, String> {
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(addrs) = (host.as_str(), 0u16).to_socket_addrs() {
+        for addr in addrs {
+            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                if (v4.is_private() || v4.is_link_local()) && !out.contains(&v4.to_string()) {
+                    out.push(v4.to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
 }
