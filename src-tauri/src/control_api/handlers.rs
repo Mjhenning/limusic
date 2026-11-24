@@ -507,8 +507,11 @@ async fn queue_play_next(
 mod tests {
     use super::super::types::ControlApiContext;
     use super::*;
+    use crate::control_api::server::IntegrationsManager;
+    use crate::db::Db;
     use crate::integrations::hub::HubEvent;
     use crate::integrations::parse::ParsedInput;
+    use crate::integrations::settings::{ControlApiSettings, CONTROL_API_SETTINGS_KEY};
     use axum::body::Body;
     use axum::http::{header::AUTHORIZATION, HeaderValue, Request, StatusCode};
     use futures_util::StreamExt;
@@ -519,7 +522,7 @@ mod tests {
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::sync::RwLock;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
     use tokio_tungstenite_026::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite_026::tungstenite::Message as ClientMessage;
     use tokio_tungstenite_026::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -2025,11 +2028,163 @@ mod tests {
         let (url, shared, _, task) = spawn_ws_server().await;
         let mut socket = connect_ws(&url, true).await.unwrap();
         next_json(&mut socket).await;
-        shared.ws.close_all();
+        shared.ws.close_all("control API token regenerated");
         match socket.next().await.unwrap().unwrap() {
-            ClientMessage::Close(_) => {}
-            other => panic!("expected a close frame, got {other:?}"),
+            ClientMessage::Close(Some(frame)) => {
+                assert!(frame.reason.to_string().contains("token regenerated"));
+            }
+            other => panic!("expected a close frame with a reason, got {other:?}"),
         }
         task.abort();
+    }
+
+    fn temp_db(label: &str) -> (Arc<Db>, std::path::PathBuf) {
+        let path = std::env::temp_dir()
+            .join(format!("limusic-control-api-{label}-{}.db", std::process::id()));
+        cleanup_db(&path);
+        let db = Arc::new(Db::open(&path).unwrap());
+        (db, path)
+    }
+
+    fn cleanup_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    async fn free_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn control_settings(port: u16, enabled: bool) -> ControlApiSettings {
+        ControlApiSettings { enabled, bind: "127.0.0.1".into(), port }
+    }
+
+    async fn start_manager(db: Arc<Db>, port: u16, token: &str) -> IntegrationsManager {
+        let manager = IntegrationsManager::new_for_test(
+            db.clone(),
+            Arc::new(MockContext::default()),
+            token.to_string(),
+        );
+        let config = control_settings(port, true);
+        db.set_setting(CONTROL_API_SETTINGS_KEY, &serde_json::to_string(&config).unwrap());
+        manager.apply_settings(config, "settings changed").await;
+        assert!(manager.control_api_status().await.running);
+        manager
+    }
+
+    async fn connect_ws_as(url: &str, token: &str) -> ClientSocket {
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+        connect_async(request).await.unwrap().0
+    }
+
+    async fn assert_close(socket: &mut ClientSocket, expected: &str) {
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("socket did not close in time")
+            .expect("socket ended without a close frame")
+            .expect("socket error while waiting for close");
+        match message {
+            ClientMessage::Close(Some(frame)) => {
+                let reason = frame.reason.to_string();
+                assert!(reason.contains(expected), "close reason {reason:?} lacks {expected:?}");
+            }
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    }
+
+    async fn http_status(port: u16, token: &str) -> Option<StatusCode> {
+        reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/v1/status"))
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .send()
+            .await
+            .ok()
+            .map(|response| response.status())
+    }
+
+    #[tokio::test]
+    async fn manager_token_regeneration_closes_sockets_and_rotates_token() {
+        let (db, path) = temp_db("regen");
+        let port = free_port().await;
+        let old_token = "a".repeat(64);
+        let manager = start_manager(db, port, &old_token).await;
+        let mut socket =
+            connect_ws_as(&format!("ws://127.0.0.1:{port}/api/v1/ws"), &old_token).await;
+        next_json(&mut socket).await;
+        assert_eq!(http_status(port, &old_token).await, Some(StatusCode::OK));
+
+        let new_token = manager.regenerate_token().await.unwrap();
+
+        assert_ne!(new_token, old_token);
+        assert_close(&mut socket, "token regenerated").await;
+        assert_eq!(http_status(port, &old_token).await, Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(http_status(port, &new_token).await, Some(StatusCode::OK));
+        cleanup_db(&path);
+    }
+
+    #[tokio::test]
+    async fn manager_disable_closes_sockets_and_stops_listener() {
+        let (db, path) = temp_db("disable");
+        let port = free_port().await;
+        let token = "b".repeat(64);
+        let manager = start_manager(db.clone(), port, &token).await;
+        let mut socket = connect_ws_as(&format!("ws://127.0.0.1:{port}/api/v1/ws"), &token).await;
+        next_json(&mut socket).await;
+
+        let config = control_settings(port, false);
+        db.set_setting(CONTROL_API_SETTINGS_KEY, &serde_json::to_string(&config).unwrap());
+        manager.apply_settings(config, "settings changed").await;
+
+        assert_close(&mut socket, "disabled").await;
+        assert_eq!(http_status(port, &token).await, None);
+        assert!(!manager.control_api_status().await.running);
+        cleanup_db(&path);
+    }
+
+    #[tokio::test]
+    async fn manager_port_change_closes_sockets_and_moves_listener() {
+        let (db, path) = temp_db("port-change");
+        let old_port = free_port().await;
+        let new_port = loop {
+            let port = free_port().await;
+            if port != old_port {
+                break port;
+            }
+        };
+        let token = "c".repeat(64);
+        let manager = start_manager(db.clone(), old_port, &token).await;
+        let mut socket =
+            connect_ws_as(&format!("ws://127.0.0.1:{old_port}/api/v1/ws"), &token).await;
+        next_json(&mut socket).await;
+
+        let config = control_settings(new_port, true);
+        db.set_setting(CONTROL_API_SETTINGS_KEY, &serde_json::to_string(&config).unwrap());
+        manager.apply_settings(config, "port change").await;
+
+        assert_close(&mut socket, "port changed").await;
+        assert_eq!(http_status(old_port, &token).await, None);
+        assert_eq!(http_status(new_port, &token).await, Some(StatusCode::OK));
+        cleanup_db(&path);
+    }
+
+    #[tokio::test]
+    async fn manager_stop_closes_sockets_on_app_exit() {
+        let (db, path) = temp_db("exit");
+        let port = free_port().await;
+        let token = "d".repeat(64);
+        let manager = start_manager(db, port, &token).await;
+        let mut socket = connect_ws_as(&format!("ws://127.0.0.1:{port}/api/v1/ws"), &token).await;
+        next_json(&mut socket).await;
+
+        manager.stop().await;
+
+        assert_close(&mut socket, "shutting down").await;
+        assert_eq!(http_status(port, &token).await, None);
+        cleanup_db(&path);
     }
 }

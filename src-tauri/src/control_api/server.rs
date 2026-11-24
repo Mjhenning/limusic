@@ -122,16 +122,18 @@ impl IntegrationsManager {
 
     /// Stop every optional output. Called on app exit only; a control-API rebind must not stop Tuna.
     pub async fn stop(&self) {
-        self.stop_control_api().await;
+        self.stop_control_api("control API shutting down").await;
         self.tuna.stop().await;
     }
 
     /// Stop the listener and wait for its task to finish. Called on every control-API apply.
     /// Returns whether a listener was actually running, so a restart can be logged as one.
-    async fn stop_control_api(&self) -> bool {
-        // Token regeneration, disable and rebind all come through here. Close sockets before
-        // aborting the server task so clients get a frame instead of a bare TCP reset.
-        self.ws.close_all();
+    async fn stop_control_api(&self, close_reason: &'static str) -> bool {
+        // Every listener restart, disable and app exit comes through here. Tell every socket why
+        // it is closing, then abort the accept loop instead of awaiting axum's graceful shutdown:
+        // that future waits for open WebSocket tasks, and a dead client must not hold up a token
+        // rotation or a settings apply.
+        self.ws.close_all(close_reason);
         let mut inner = self.inner.lock().await;
         let was_running = inner.server.is_some();
         if let Some(server) = inner.server.take() {
@@ -147,7 +149,16 @@ impl IntegrationsManager {
     }
 
     async fn apply(&self, settings: ControlApiSettings, reason: &'static str) {
-        let was_running = self.stop_control_api().await;
+        let close_reason = if !settings.enabled {
+            "control API disabled"
+        } else {
+            match reason {
+                "token regenerated" => "control API token regenerated",
+                "port change" => "control API port changed",
+                _ => "control API settings changed",
+            }
+        };
+        let was_running = self.stop_control_api(close_reason).await;
         let mut status = ControlApiStatus {
             enabled: settings.enabled,
             running: false,
@@ -201,6 +212,26 @@ impl IntegrationsManager {
                 status.last_error = Some(e.to_string());
                 self.inner.lock().await.status = status;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+impl IntegrationsManager {
+    /// Same manager the Tauri commands use, without needing a full `AppState` or `AppHandle`.
+    pub(crate) fn new_for_test(
+        db: Arc<Db>,
+        context: Arc<dyn ControlApiContext>,
+        token: String,
+    ) -> Self {
+        Self {
+            db,
+            context: context.clone(),
+            inner: Arc::new(Mutex::new(Inner::default())),
+            token: Arc::new(RwLock::new(token)),
+            mutation: Arc::new(Mutex::new(())),
+            ws: Arc::new(WsConnections::default()),
+            tuna: TunaOutput::for_context(context),
         }
     }
 }

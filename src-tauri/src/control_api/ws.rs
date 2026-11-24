@@ -35,12 +35,12 @@ const WS_POSITION_INTERVAL: Duration = Duration::from_secs(1);
 /// client disconnect cannot leak a slot.
 pub struct WsConnections {
     count: AtomicUsize,
-    close: broadcast::Sender<()>,
+    close: broadcast::Sender<String>,
 }
 
 impl Default for WsConnections {
     fn default() -> Self {
-        let (close, _) = broadcast::channel(16);
+        let (close, _) = broadcast::channel(4);
         Self { count: AtomicUsize::new(0), close }
     }
 }
@@ -51,7 +51,7 @@ impl WsConnections {
     }
 
     /// Reserve one slot and subscribe to the next lifecycle shutdown signal.
-    pub fn acquire(self: &Arc<Self>) -> Result<(WsPermit, broadcast::Receiver<()>), ErrorBody> {
+    pub fn acquire(self: &Arc<Self>) -> Result<(WsPermit, broadcast::Receiver<String>), ErrorBody> {
         loop {
             let current = self.count.load(Ordering::SeqCst);
             if current >= MAX_WS_CLIENTS {
@@ -68,10 +68,10 @@ impl WsConnections {
         Ok((WsPermit(Arc::clone(self)), self.close.subscribe()))
     }
 
-    /// Used by token regeneration, disable, rebind and app exit. Every connection sees this and
-    /// sends a close frame before its task ends.
-    pub fn close_all(&self) {
-        let _ = self.close.send(());
+    /// Used by token regeneration, disable, rebind and app exit. Every connection sees the reason
+    /// and sends it in a close frame before its task ends.
+    pub fn close_all(&self, reason: impl Into<String>) {
+        let _ = self.close.send(reason.into());
     }
 }
 
@@ -106,7 +106,7 @@ async fn run_socket(
     socket: WebSocket,
     shared: Arc<ApiShared>,
     permit: WsPermit,
-    mut close_rx: broadcast::Receiver<()>,
+    mut close_rx: broadcast::Receiver<String>,
 ) {
     let _permit = permit;
     let (mut sink, mut stream) = socket.split();
@@ -126,12 +126,13 @@ async fn run_socket(
 
     loop {
         tokio::select! {
-            _ = close_rx.recv() => {
+            signal = close_rx.recv() => {
+                let reason = signal.unwrap_or_else(|_| "control API stopped".to_string());
                 let _ = send(
                     &mut sink,
                     Message::Close(Some(CloseFrame {
                         code: 1001,
-                        reason: "control API restarting".into(),
+                        reason: reason.into(),
                     })),
                 )
                 .await;
