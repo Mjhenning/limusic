@@ -24,6 +24,7 @@
 	let localIps = $state<string[]>([]);
 	let showToken = $state(false);
 	let tokenConfirmOpen = $state(false);
+	let tokenError = $state('');
 	let applying = $state(false);
 	let error = $state('');
 	let portInput = $state('27199');
@@ -185,13 +186,15 @@
 
 	async function regenerateToken() {
 		applying = true;
-		error = '';
+		tokenError = '';
 		try {
 			token = await api.regenerateControlApiToken();
 			showToken = false;
 			await refreshStatus();
+			tokenConfirmOpen = false;
 		} catch (e) {
-			error = t('settings.integrations.apply_error', { reason: String(e) });
+			// Keep the dialog open: the error belongs next to the action the user just took.
+			tokenError = t('settings.integrations.apply_error', { reason: String(e) });
 		} finally {
 			applying = false;
 		}
@@ -323,6 +326,9 @@
 			<AlertDialog.Description>
 				{t('settings.integrations.token_regenerate_confirm')}
 			</AlertDialog.Description>
+			{#if tokenError}
+				<p class="px-4 pb-1 text-sm text-destructive">{tokenError}</p>
+			{/if}
 		</AlertDialog.Header>
 		<AlertDialog.Footer>
 			<AlertDialog.Cancel>{t('common.cancel')}</AlertDialog.Cancel>
@@ -413,7 +419,10 @@
 			variant="outline"
 			size="sm"
 			disabled={applying}
-			onclick={() => (tokenConfirmOpen = true)}
+			onclick={() => {
+				tokenError = '';
+				tokenConfirmOpen = true;
+			}}
 		>
 			{t('settings.integrations.token_regenerate')}
 		</Button>

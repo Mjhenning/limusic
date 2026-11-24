@@ -52,5 +52,7 @@ ok(ui.includes('bind:open={tokenConfirmOpen}'), 'token confirmation is not bound
 ok(ui.includes('<AlertDialog.Cancel>'), 'token confirmation has no cancel action');
 ok(ui.includes('<AlertDialog.Action onclick={regenerateToken}>'), 'regenerate is not gated by the dialog action');
 ok(!/onclick=\{regenerateToken\}/.test(ui.replace('<AlertDialog.Action onclick={regenerateToken}>', '')), 'regenerate is reachable without confirmation');
+ok(ui.includes('tokenConfirmOpen = false;'), 'successful regeneration does not close the dialog');
+ok(ui.includes('{#if tokenError}'), 'regeneration errors are not shown inline');
 
 console.log('ok');
