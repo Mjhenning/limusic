@@ -1,0 +1,209 @@
+name: Windows fork NSIS build
+
+# Manual, unsigned build of this fork's Windows NSIS installer. It deliberately has no release,
+# signing or updater-artifact steps: the fork disables the updater, so no signature artifact is
+# produced or wanted. Run it from Actions ▸ Windows fork NSIS build ▸ Run workflow, then download the
+# limusic-windows-nsis artifact. Nothing is pushed and no release is created.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One build at a time, everywhere. cancel-in-progress is false so a second dispatch queues rather
+# than killing a build that is already uploading its artifact.
+concurrency:
+  group: windows-fork-build
+  cancel-in-progress: false
+
+env:
+  # Same pinned libmpv as windows-release.yml and checks.yml. shinchiro only keeps ~30 daily
+  # builds, so the fork repacked the exact DLL from its own deps prerelease. Baseline x86_64,
+  # not -v3- (AVX2); the import check below rejects a DLL that gained a non-Windows dependency.
+  MPV_DEV_URL: https://github.com/SimoHypers/limusic/releases/download/deps/libmpv-2-x86_64-20260610-git-304426c.7z
+  MPV_DEV_SHA256: af708edcdf6ed12ac7b2bb31b4cbeba0bf7d4eef345a715ef5de782c0ddd6671
+  MPV_DIR: ${{ github.workspace }}\.libmpv
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # Upstream's release job allows 40 minutes; this one has no upload-to-release step, but keeps
+    # headroom for a cold cache and the 117 MB DLL.
+    timeout-minutes: 75
+    steps:
+      # Pinned to the same SHAs as windows-release.yml. Workflow files are executable code too.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Frontend deps
+        shell: bash
+        run: cd ui && pnpm install --frozen-lockfile
+
+      - name: Rust (MSVC)
+        shell: bash
+        run: rustup default stable-msvc
+
+      # RUSTFLAGS is exported before rust-cache so the cache key and cargo's fingerprints agree.
+      # -L native=…\.libmpv is the synthesised mpv.lib; rust-lld is a soft fallback to link.exe.
+      - name: Resolve RUSTFLAGS (linker + libmpv link path)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLAGS="-L native=${{ github.workspace }}\.libmpv"
+          SYSROOT="$(rustc --print sysroot | tr '\\' '/')"
+          RUST_LLD="$SYSROOT/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+          if [ -f "$RUST_LLD" ]; then
+            FLAGS="$FLAGS -C linker-flavor=lld-link -C linker=$RUST_LLD"
+            echo "linking with rust-lld ($RUST_LLD)"
+          else
+            echo "::warning::rust-lld not found at $RUST_LLD, falling back to MSVC link.exe"
+          fi
+          echo "RUSTFLAGS=$FLAGS" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=$FLAGS"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: . -> target
+
+      - name: Tauri CLI
+        shell: bash
+        # Pinned for the same reason upstream pins it: the npm CLI ships a prebuilt binary and
+        # 2.12.0 broke the hybrid CRT link. Do not widen this to ^2.
+        run: npm install -g "@tauri-apps/cli@2.11.5"
+
+      - name: Build the libmpv import library
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "$env:MPV_DIR" | Out-Null
+          curl.exe -fsSL -o "$env:MPV_DIR\mpv-dev.7z" "$env:MPV_DEV_URL"
+          if ((Get-FileHash "$env:MPV_DIR\mpv-dev.7z" -Algorithm SHA256).Hash -ne $env:MPV_DEV_SHA256) { throw "mpv-dev.7z does not match MPV_DEV_SHA256" }
+          7z x "$env:MPV_DIR\mpv-dev.7z" -o"$env:MPV_DIR" -y | Out-Null
+          if (-not (Test-Path "$env:MPV_DIR\libmpv-2.dll")) { throw "libmpv-2.dll not found in the dev package — did MPV_DEV_URL change shape?" }
+
+          # dumpbin/lib live in the MSVC toolchain. cargo finds MSVC on its own; this is only so
+          # the two tools can be called from PowerShell.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+
+          Set-Location "$env:MPV_DIR"
+          $names = & dumpbin /exports libmpv-2.dll |
+            Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\w+)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          if ($names.Count -lt 50) { throw "parsed only $($names.Count) exports from libmpv-2.dll — dumpbin output format changed?" }
+          @("EXPORTS") + ($names | ForEach-Object { "    $_" }) | Set-Content -Path mpv.def -Encoding ascii
+          & lib /def:mpv.def /name:libmpv-2.dll /out:mpv.lib /machine:x64
+          if (-not (Test-Path "$env:MPV_DIR\mpv.lib")) { throw "lib.exe did not produce mpv.lib" }
+
+          # Every DLL libmpv imports must ship with Windows. This is the guard for the
+          # vulkan-1.dll regression: that DLL comes with GPU drivers, not with Windows.
+          $system = @('ADVAPI32.dll', 'AVICAP32.dll', 'AVRT.dll', 'bcrypt.dll', 'bcryptprimitives.dll',
+            'CFGMGR32.dll', 'CRYPT32.dll', 'd2d1.dll', 'dwmapi.dll', 'DWrite.dll', 'GDI32.dll', 'IMM32.dll',
+            'IPHLPAPI.DLL', 'KERNEL32.dll', 'Normaliz.dll', 'ntdll.dll', 'ole32.dll', 'OLEAUT32.dll',
+            'OPENGL32.dll', 'Secur32.dll', 'SETUPAPI.dll', 'SHCORE.dll', 'SHELL32.dll', 'SHLWAPI.dll',
+            'USER32.dll', 'UxTheme.dll', 'VERSION.dll', 'WINMM.dll', 'WLDAP32.dll', 'WS2_32.dll')
+          $imports = & dumpbin /dependents libmpv-2.dll |
+            Select-String -Pattern '^\s+(\S+\.dll)\s*$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          if ($imports.Count -lt 10) { throw "parsed only $($imports.Count) imports from libmpv-2.dll, dumpbin output format changed?" }
+          $foreign = $imports | Where-Object { $_ -notlike 'api-ms-win-*' -and $system -notcontains $_ }
+          if ($foreign) { throw "libmpv-2.dll imports DLLs that are not part of Windows: $($foreign -join ', ')" }
+          Write-Host "libmpv-2.dll imports $($imports.Count) DLLs, all part of Windows"
+          Write-Host "mpv.lib built from $($names.Count) exports"
+
+          # tauri.windows.conf.json lists this under bundle.resources, so the installer places it
+          # next to the exe. Without the copy the build succeeds but the app cannot start.
+          Copy-Item "$env:MPV_DIR\libmpv-2.dll" "$env:GITHUB_WORKSPACE\src-tauri\libmpv-2.dll" -Force
+
+      # onnxruntime.dll needs the VC++ runtime; the user should not have to install the
+      # redistributable. These go into the "vcruntime" resource folder and load only with karaoke.
+      - name: VC++ runtime (bundled)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          if (-not $vs) { throw "Visual Studio not found" }
+          $msvc = Join-Path $vs "VC\Redist\MSVC"
+          $defaultTxt = Join-Path $vs "VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt"
+          if (Test-Path $defaultTxt) {
+              $redistVersion = (Get-Content -Raw $defaultTxt).Trim()
+          } else {
+              $redistVersion = (Get-ChildItem -Path $msvc -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1).Name
+              if (-not $redistVersion) { throw "no MSVC redist version found in $msvc" }
+          }
+          $x64Folder = Join-Path $msvc "$redistVersion\x64"
+          $crt = Get-ChildItem -Directory -Path $x64Folder -Filter 'Microsoft.VC*.CRT' | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $crt) {
+              $found = (Get-ChildItem -Directory -Path $x64Folder -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ', '
+              throw "no CRT folder matching Microsoft.VC*.CRT found in $x64Folder (folders found: $found)"
+          }
+          $crtDir = $crt.FullName
+
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\src-tauri\vcruntime" | Out-Null
+          foreach ($dll in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msvcp140_1.dll')) {
+              $src = Join-Path $crtDir $dll
+              if (-not (Test-Path $src)) { throw "missing $dll in $crtDir" }
+              Copy-Item $src -Destination "$env:GITHUB_WORKSPACE\src-tauri\vcruntime\$dll" -Force
+          }
+          foreach ($dll in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msvcp140_1.dll')) {
+              $dest = Join-Path "$env:GITHUB_WORKSPACE\src-tauri\vcruntime" $dll
+              if (-not (Test-Path $dest)) { throw "missing $dll in destination" }
+              $item = Get-Item $dest
+              $vi = $item.VersionInfo
+              $major = $vi.FileMajorPart
+              $minor = $vi.FileMinorPart
+              if (-not ($major -gt 14 -or ($major -eq 14 -and $minor -ge 44))) {
+                  throw "$dll version $major.$minor is older than 14.44"
+              }
+              Write-Host "$dll version $major.$minor size $($item.Length)"
+          }
+
+      - name: Build the NSIS installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "building with RUSTFLAGS=${RUSTFLAGS:-<unset>}"
+          (cd ui && pnpm build)
+          # beforeBuildCommand is emptied because pnpm build was just run from ui/. Left on, tauri
+          # would run pnpm from the repo root and pick a project by filesystem accident.
+          # --bundles nsis matches this fork's manual Windows build; the updater is disabled, so no
+          # updater signature artifact is expected.
+          tauri build --bundles nsis --config '{"build":{"beforeBuildCommand":""}}'
+
+      - name: Import table check
+        shell: pwsh
+        run: ./scripts/check-windows-imports.ps1 -Exe target/release/limusic-app.exe -AllowList .github/windows-exe-imports.txt
+
+      - name: Report installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installers = @(Get-ChildItem -Path target/release/bundle/nsis -Filter '*-setup.exe' -File)
+          if ($installers.Count -eq 0) { throw 'no NSIS setup.exe found in target/release/bundle/nsis' }
+          foreach ($installer in $installers) {
+            $mib = [math]::Round($installer.Length / 1MB, 2)
+            Write-Host "installer=$($installer.Name) size=$($installer.Length) bytes ($mib MiB)"
+          }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: limusic-windows-nsis
+          path: target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
