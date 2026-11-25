@@ -3018,7 +3018,7 @@ pub async fn release_notes() -> Result<Vec<ReleaseNote>, String> {
         prerelease: bool,
     }
     let releases: Vec<GhRelease> = crate::http::client()
-        .get("https://api.github.com/repos/SimoHypers/limusic/releases?per_page=20")
+        .get("https://api.github.com/repos/Mjhenning/limusic/releases?per_page=20")
         .header("User-Agent", concat!("Limusic/", env!("CARGO_PKG_VERSION")))
         .header("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(15))
@@ -3049,10 +3049,10 @@ pub async fn release_notes() -> Result<Vec<ReleaseNote>, String> {
 ///
 /// Tauri's Linux updater knows one trick: rewrite an AppImage in place. It takes the path from
 /// `Env::appimage` and, when that is unset, falls back to `current_exe()` and writes the downloaded
-/// AppImage bytes over whatever it finds there. On the `.rpm` and on distro packages (the AUR's
-/// `limusic-bin`) that is a package-manager-owned `/usr/bin/limusic-app`: it fails on permissions
-/// rather than doing damage, but offering the button at all is a lie. Those users update through
-/// their package manager, so the UI shows them a download link instead.
+/// AppImage bytes over whatever it finds there. On a distro package that is a package-manager-owned
+/// `/usr/bin/limusic-app`: it fails on permissions rather than doing damage, but offering the button
+/// at all is a lie. Those users update through their package manager, so the UI shows them a
+/// download link instead.
 ///
 /// Reads the same `Env::appimage` the updater plugin decides on, so the two cannot disagree.
 #[tauri::command]
@@ -3071,18 +3071,17 @@ pub fn can_self_update(app: tauri::AppHandle) -> bool {
     }
 }
 
-/// Fork build flag: this build must never install an upstream release. Flip this to `false`,
-/// restore the stable endpoint and pubkey in `tauri.conf.json`, and restore `BETA_MANIFEST` below
-/// to re-enable updater checks. The UI reads the same flag through `updates_disabled`.
-pub(crate) const UPDATES_DISABLED: bool = true;
+/// Emergency kill switch for this fork's updater. Both endpoints and the embedded pubkey point at
+/// the fork, so a build never accepts an upstream manifest; flip this to `true` if a bad release ever
+/// needs every client frozen until the manifest is fixed. The UI reads the flag through
+/// `updates_disabled`.
+pub(crate) const UPDATES_DISABLED: bool = false;
 
-/// The beta channel's manifest, neutralized while [`UPDATES_DISABLED`] is set. Port 9 is the
-/// discard service, so even a stray check cannot reach GitHub.
-const BETA_MANIFEST: &str = if UPDATES_DISABLED {
-    "http://127.0.0.1:9/limusic-updates-disabled/latest.json"
-} else {
-    "https://github.com/SimoHypers/limusic/releases/download/beta/latest.json"
-};
+/// The beta channel's manifest. `beta` is a permanent prerelease on the fork holding nothing but
+/// this file, and the release workflows move it to the newest release candidate, or to the newest
+/// release once that is ahead, so the URL never changes.
+const BETA_MANIFEST: &str =
+    "https://github.com/Mjhenning/limusic/releases/download/beta/latest.json";
 
 /// Exposes the build flag to the UI so the banner, manual check and Install action all agree.
 #[tauri::command]

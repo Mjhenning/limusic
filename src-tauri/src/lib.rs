@@ -896,8 +896,8 @@ pub fn run() {
         );
     }
 
-    // Fork builds omit the updater plugin entirely: no JS check can fetch or install an upstream
-    // release, even if a future UI path forgets to consult `updates_disabled`.
+    // The updater checks the fork's signed manifest only. The kill switch still removes the plugin
+    // entirely, so no JS path can install anything while `UPDATES_DISABLED` is set.
     if !commands::UPDATES_DISABLED {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }

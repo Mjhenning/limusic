@@ -121,8 +121,8 @@
 	let clearing = $state(false);
 	let version = $state('');
 	getVersion().then((v) => (version = v));
-	// Release candidates ship only what the updater installs, so an .rpm, .deb or AUR install has
-	// nothing to take from the beta channel. Shown in dev, which is never the AppImage either.
+	// Release candidates ship only what the updater installs, so a distro package has nothing to
+	// take from the beta channel. Shown in dev, which is never the AppImage either.
 	let betaAvailable = $state(import.meta.env.DEV);
 	api.canSelfUpdate().then((v) => (betaAvailable ||= v)).catch(() => {});
 	// Result of the last "Check for updates" click — shown inline (a toast renders behind the modal).

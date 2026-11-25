@@ -1,7 +1,7 @@
-// Auto-update via Tauri's updater plugin. Checks a signed latest.json on GitHub Releases; the
-// startup check is silent unless an update exists, the Settings check always reports a result.
-// Only self-updates the AppImage build on Linux (Tauri limitation) — .deb, .rpm and distro packages
-// update through their package manager, so they get a download link instead. See `canInstall`.
+// Auto-update via Tauri's updater plugin. Checks this fork's signed latest.json on GitHub Releases;
+// the startup check is silent unless an update exists, the Settings check always reports a result.
+// Only self-updates the AppImage build on Linux (Tauri limitation) — distro packages update through
+// their package manager, so they get a download link instead. See `canInstall`.
 import { check, Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { toast } from './player.svelte';
@@ -18,7 +18,7 @@ import {
 import { isNewer, isPrerelease } from './version';
 import { getVersion } from '@tauri-apps/api/app';
 
-const RELEASES_URL = 'https://github.com/SimoHypers/limusic/releases/latest';
+const RELEASES_URL = 'https://github.com/Mjhenning/limusic/releases/latest';
 
 /** How often the quiet check repeats while the app stays open. */
 export const QUIET_INTERVAL_MS = 6 * 60 * 60 * 1000;

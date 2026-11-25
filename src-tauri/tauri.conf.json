@@ -39,7 +39,7 @@
     "active": true,
     "category": "Music",
     "targets": ["appimage"],
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/icon.png",
       "icons/32x32.png",
@@ -56,9 +56,9 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "http://127.0.0.1:9/limusic-updates-disabled/latest.json"
+        "https://github.com/Mjhenning/limusic/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAwMDAwMDAwMDAwMDAwMDAKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZCQThEQ0Y0MUFEMTQ4MkQKUldRdFNORWE5TnlvYXl3K2ZzakFoRm05RjBlUmFkRGdQYU5WNWpxSmxkc0tVaTlqY2xQVU9oY1kK",
       "windows": {
         "installMode": "passive"
       }
