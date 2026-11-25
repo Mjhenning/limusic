@@ -12,6 +12,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SETTINGS } from './settings-search.ts';
 
 function ok(cond: boolean, what: string): void {
 	if (!cond) throw new Error(`FAIL: ${what}`);
@@ -30,9 +31,11 @@ function rustFiles(dir: string): string[] {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const component = join(here, 'components', 'IntegrationsSettings.svelte');
+const store = join(here, 'integrations.svelte.ts');
 const root = join(here, '..', '..', '..');
 const files = [
 	component,
+	store,
 	join(here, 'api.ts'),
 	join(root, 'src-tauri', 'src', 'commands.rs'),
 	...rustFiles(join(root, 'src-tauri', 'src', 'control_api')),
@@ -54,5 +57,43 @@ ok(ui.includes('<AlertDialog.Action onclick={regenerateToken}>'), 'regenerate is
 ok(!/onclick=\{regenerateToken\}/.test(ui.replace('<AlertDialog.Action onclick={regenerateToken}>', '')), 'regenerate is reachable without confirmation');
 ok(ui.includes('tokenConfirmOpen = false;'), 'successful regeneration does not close the dialog');
 ok(ui.includes('{#if tokenError}'), 'regeneration errors are not shown inline');
+
+// --- details folded behind their switches ------------------------------------------------------
+const storeSource = readFileSync(store, 'utf8');
+ok(ui.includes("from '$lib/integrations.svelte'"), 'the settings tab uses the shared store');
+ok(ui.includes('syncIntegrations(loaded)'), 'the initial load syncs the shared store');
+ok(ui.includes('syncIntegrations(next)'), 'an apply syncs the shared store');
+ok(storeSource.includes('setIntegrationEnabled'), 'the shared store can toggle control/Tuna');
+ok(storeSource.includes('setDiscordEnabled'), 'the shared store can toggle Discord');
+
+const enableRow = "title: t('settings.integrations.enable')";
+const controlFold = ui.indexOf('{#if enabled}');
+ok(controlFold > ui.indexOf(enableRow), 'control details follow their enable row');
+ok(controlFold < ui.indexOf("title: t('settings.integrations.status')"), 'status is folded');
+const tunaEnableRow = "title: t('settings.integrations.tuna_enable')";
+const tunaFold = ui.indexOf('{#if tunaEnabled}');
+ok(tunaFold > ui.indexOf(tunaEnableRow), 'Tuna details follow their enable row');
+ok(tunaFold < ui.indexOf("title: t('settings.integrations.tuna_url')"), 'Tuna URL is folded');
+
+const folded: [string, string][] = [
+	['settings.integrations.status', 'settings.integrations.enable'],
+	['settings.integrations.bind_mode', 'settings.integrations.enable'],
+	['settings.integrations.port', 'settings.integrations.enable'],
+	['settings.integrations.token', 'settings.integrations.enable'],
+	['settings.integrations.connection', 'settings.integrations.enable'],
+	['settings.integrations.clients', 'settings.integrations.enable'],
+	['settings.integrations.status', 'settings.integrations.tuna_enable'],
+	['settings.integrations.tuna_url', 'settings.integrations.tuna_enable'],
+	['settings.integrations.tuna_test', 'settings.integrations.tuna_enable'],
+	['settings.integrations.tuna_last_ok', 'settings.integrations.tuna_enable'],
+	['settings.integrations.tuna_last_error', 'settings.integrations.tuna_enable'],
+	['settings.integrations.tuna_backoff', 'settings.integrations.tuna_enable']
+];
+for (const [title, parent] of folded) {
+	ok(
+		SETTINGS.some((e) => e.tab === 'integrations' && e.title === title && e.under === parent),
+		`${title} is indexed under ${parent}`
+	);
+}
 
 console.log('ok');

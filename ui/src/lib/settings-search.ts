@@ -273,12 +273,20 @@ const TABLE: [SettingsTab, K | null, Row[]][] = [
 		'settings.integrations.control_api',
 		[
 			['settings.integrations.enable', 'settings.integrations.enable_hint'],
-			['settings.integrations.status'],
-			['settings.integrations.bind_mode', 'settings.integrations.bind_mode_hint'],
-			['settings.integrations.port', 'settings.integrations.port_hint'],
-			['settings.integrations.token', 'settings.integrations.token_hint'],
-			['settings.integrations.connection', 'settings.integrations.connection_hint'],
-			['settings.integrations.clients']
+			['settings.integrations.status', undefined, 'settings.integrations.enable'],
+			[
+				'settings.integrations.bind_mode',
+				'settings.integrations.bind_mode_hint',
+				'settings.integrations.enable'
+			],
+			['settings.integrations.port', 'settings.integrations.port_hint', 'settings.integrations.enable'],
+			['settings.integrations.token', 'settings.integrations.token_hint', 'settings.integrations.enable'],
+			[
+				'settings.integrations.connection',
+				'settings.integrations.connection_hint',
+				'settings.integrations.enable'
+			],
+			['settings.integrations.clients', undefined, 'settings.integrations.enable']
 		]
 	],
 	[
@@ -286,11 +294,20 @@ const TABLE: [SettingsTab, K | null, Row[]][] = [
 		'settings.integrations.tuna',
 		[
 			['settings.integrations.tuna_enable', 'settings.integrations.tuna_enable_hint'],
-			['settings.integrations.tuna_url', 'settings.integrations.tuna_url_hint'],
-			['settings.integrations.tuna_test'],
-			['settings.integrations.tuna_last_ok'],
-			['settings.integrations.tuna_last_error'],
-			['settings.integrations.tuna_backoff']
+			[
+				'settings.integrations.status',
+				undefined,
+				'settings.integrations.tuna_enable'
+			],
+			[
+				'settings.integrations.tuna_url',
+				'settings.integrations.tuna_url_hint',
+				'settings.integrations.tuna_enable'
+			],
+			['settings.integrations.tuna_test', undefined, 'settings.integrations.tuna_enable'],
+			['settings.integrations.tuna_last_ok', undefined, 'settings.integrations.tuna_enable'],
+			['settings.integrations.tuna_last_error', undefined, 'settings.integrations.tuna_enable'],
+			['settings.integrations.tuna_backoff', undefined, 'settings.integrations.tuna_enable']
 		]
 	],
 

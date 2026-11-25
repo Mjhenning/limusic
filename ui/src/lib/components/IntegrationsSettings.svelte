@@ -10,6 +10,7 @@
 	import * as Select from '$lib/components/ui/select';
 	import * as api from '$lib/api';
 	import { copyText } from '$lib/clipboard';
+	import { integrations, syncIntegrations } from '$lib/integrations.svelte';
 	import { toast, ui } from '$lib/player.svelte';
 	import { t } from '$lib/i18n.svelte';
 
@@ -31,9 +32,9 @@
 	let urlInput = $state('http://127.0.0.1:1608/');
 	let testMessage = $state<{ ok: boolean; text: string } | null>(null);
 
-	const enabled = $derived(settings?.control_api.enabled ?? false);
+	const enabled = $derived(integrations.controlApi);
 	const bindValue = $derived(settings?.control_api.bind ?? '127.0.0.1');
-	const tunaEnabled = $derived(settings?.tuna.enabled ?? false);
+	const tunaEnabled = $derived(integrations.tuna);
 	const isLocal = $derived(bindValue !== '127.0.0.1');
 
 	const portValid = $derived.by(() => {
@@ -101,6 +102,7 @@
 				api.getControlApiToken()
 			]);
 			settings = loaded;
+			syncIntegrations(loaded);
 			status = currentStatus;
 			token = currentToken;
 			portInput = String(loaded.control_api.port);
@@ -139,6 +141,7 @@
 		try {
 			await api.setIntegrationSettings(next);
 			settings = next;
+			syncIntegrations(next);
 			portInput = String(next.control_api.port);
 			urlInput = next.tuna.url;
 			await refreshStatus();
@@ -248,35 +251,37 @@
 				desc: t('settings.integrations.enable_hint'),
 				control: controlSwitch
 			})}
-			{@render row({
-				title: t('settings.integrations.status'),
-				control: controlStatus
-			})}
-			{@render row({
-				title: t('settings.integrations.bind_mode'),
-				desc: t('settings.integrations.bind_mode_hint'),
-				control: bindPicker,
-				below: localWarning
-			})}
-			{@render row({
-				title: t('settings.integrations.port'),
-				desc: t('settings.integrations.port_hint'),
-				control: portField
-			})}
-			{@render row({
-				title: t('settings.integrations.token'),
-				desc: t('settings.integrations.token_hint'),
-				control: tokenField
-			})}
-			{@render row({
-				title: t('settings.integrations.connection'),
-				desc: t('settings.integrations.connection_hint'),
-				below: connectionList
-			})}
-			{@render row({
-				title: t('settings.integrations.clients'),
-				control: clientCount
-			})}
+			{#if enabled}
+				{@render row({
+					title: t('settings.integrations.status'),
+					control: controlStatus
+				})}
+				{@render row({
+					title: t('settings.integrations.bind_mode'),
+					desc: t('settings.integrations.bind_mode_hint'),
+					control: bindPicker,
+					below: localWarning
+				})}
+				{@render row({
+					title: t('settings.integrations.port'),
+					desc: t('settings.integrations.port_hint'),
+					control: portField
+				})}
+				{@render row({
+					title: t('settings.integrations.token'),
+					desc: t('settings.integrations.token_hint'),
+					control: tokenField
+				})}
+				{@render row({
+					title: t('settings.integrations.connection'),
+					desc: t('settings.integrations.connection_hint'),
+					below: connectionList
+				})}
+				{@render row({
+					title: t('settings.integrations.clients'),
+					control: clientCount
+				})}
+			{/if}
 		</div>
 	</section>
 
@@ -289,32 +294,34 @@
 				desc: t('settings.integrations.tuna_enable_hint'),
 				control: tunaSwitch
 			})}
-			{@render row({
-				title: t('settings.integrations.status'),
-				control: tunaStatusBadge
-			})}
-			{@render row({
-				title: t('settings.integrations.tuna_url'),
-				desc: t('settings.integrations.tuna_url_hint'),
-				control: urlField
-			})}
-			{@render row({
-				title: t('settings.integrations.tuna_test'),
-				control: testButton,
-				below: testResult
-			})}
-			{@render row({
-				title: t('settings.integrations.tuna_last_ok'),
-				control: lastOk
-			})}
-			{@render row({
-				title: t('settings.integrations.tuna_last_error'),
-				control: lastError
-			})}
-			{@render row({
-				title: t('settings.integrations.tuna_backoff'),
-				control: backoff
-			})}
+			{#if tunaEnabled}
+				{@render row({
+					title: t('settings.integrations.status'),
+					control: tunaStatusBadge
+				})}
+				{@render row({
+					title: t('settings.integrations.tuna_url'),
+					desc: t('settings.integrations.tuna_url_hint'),
+					control: urlField
+				})}
+				{@render row({
+					title: t('settings.integrations.tuna_test'),
+					control: testButton,
+					below: testResult
+				})}
+				{@render row({
+					title: t('settings.integrations.tuna_last_ok'),
+					control: lastOk
+				})}
+				{@render row({
+					title: t('settings.integrations.tuna_last_error'),
+					control: lastError
+				})}
+				{@render row({
+					title: t('settings.integrations.tuna_backoff'),
+					control: backoff
+				})}
+			{/if}
 		</div>
 	</section>
 </div>
