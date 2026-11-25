@@ -7,8 +7,8 @@
 **A native desktop YouTube Music client. Rust + Tauri, ad-free, no Electron.**
 
 <p align="center">
-  <a href="https://github.com/SimoHypers/limusic/releases/latest"><img alt="GitHub Downloads" src="https://img.shields.io/github/downloads/SimoHypers/limusic/total?style=for-the-badge&label=DOWNLOADS&color=a4c400"></a>
-  <a href="https://github.com/SimoHypers/limusic/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/SimoHypers/limusic?display_name=release&style=for-the-badge&color=a10935"></a>
+  <a href="https://github.com/Mjhenning/limusic/releases/latest"><img alt="GitHub Downloads" src="https://img.shields.io/github/downloads/Mjhenning/limusic/total?style=for-the-badge&label=DOWNLOADS&color=a4c400"></a>
+  <a href="https://github.com/Mjhenning/limusic/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/Mjhenning/limusic?display_name=release&style=for-the-badge&color=a10935"></a>
   <img alt="License" src="https://img.shields.io/github/license/SimoHypers/limusic?style=for-the-badge&color=1881cc">
   <a href="https://hosted.weblate.org/engage/limusic/"><img alt="Translation status" src="https://img.shields.io/weblate/progress/limusic?server=https%3A%2F%2Fhosted.weblate.org&style=for-the-badge&label=TRANSLATED&color=6a3fb5"></a>
   <a href="https://limusic.app"><img alt="Website" src="https://img.shields.io/badge/WEBSITE-limusic-e5486e?style=for-the-badge"></a>
@@ -26,6 +26,12 @@
 browser runtime, no backend server, no ads in the audio. It started as a desktop rebuild of the
 playback engine behind [Metrolist](https://github.com/mostafaalagamy/Metrolist), an Android
 YouTube Music client, and grew from there.
+
+> **This is a fork.** It is based on upstream v1.4.1 and adds a local Control
+> API, a single Integrations settings area, titlebar integration toggles,
+> fork-controlled self-updates, and an opt-in shared-control mode for Listen
+> Together sessions between fork clients. It is not published by the upstream
+> project; releases live in [Mjhenning/limusic](https://github.com/Mjhenning/limusic).
 
 </div>
 
@@ -85,7 +91,7 @@ Discord.
 
 **Together**
 
-- Listen Together rooms with friends
+- Listen Together rooms with friends, with opt-in shared control between fork clients
 - Link [Limusic for Android](https://github.com/SimoHypers/limusic-android) and move the music between them
 - Last.fm and ListenBrainz scrobbling
 - Discord Rich Presence
@@ -138,28 +144,43 @@ Discord.
 <h2 align="center">Download & Install</h2>
 
 <p align="center">
-  <a href="https://github.com/SimoHypers/limusic/releases/latest">
+  <a href="https://github.com/Mjhenning/limusic/releases/latest">
     <img src="https://img.shields.io/badge/GitHub_Releases-100000?style=for-the-badge&logo=github&logoColor=white" height="40">
   </a>
 </p>
 
 | Platform | File | Notes |
 |---|---|---|
-| Windows | `-setup.exe` | Self-updating |
-| Windows | `.msi` | Plain installer, no auto-update |
-| Linux | `.AppImage` | Self-updating, libmpv bundled. Needs glibc 2.36+ (Debian 12+, Ubuntu 24.04+, Fedora 37+) |
-| Linux (Ubuntu/Debian) | `.deb` | No self-update. Needs Debian 12+ / Ubuntu 24.04+; apt pulls libmpv and webkit2gtk in for you |
-| Linux (Fedora/RHEL) | `.rpm` | Needs `mpv-libs` installed (`sudo dnf install mpv-libs`). No updates, redownload each release |
+| Windows | NSIS `-setup.exe` | Self-updating |
+| Linux x86_64 | `.AppImage` | Self-updating, libmpv bundled. Needs glibc 2.36+ (Debian 12+, Ubuntu 24.04+, Fedora 37+) |
 | macOS 15+ (Apple Silicon) | `.dmg` | Self-updating. Unsigned, so the first launch needs `xattr -dr com.apple.quarantine /Applications/limusic.app` |
 | macOS (Intel) | none | Build from source, see [docs/BUILD-PLATFORMS.md](docs/BUILD-PLATFORMS.md) |
 
-Community-maintained repositories, packaged and updated by their maintainers rather than by this project:
+Only the three self-updating formats above are published here. There are no
+`.msi`, `.deb`, or `.rpm` builds, and the community AUR/COPR/OBS packages track
+upstream Limusic rather than this fork.
 
-| Platform | Source | Notes |
-|---|---|---|
-| Linux (Arch) | [AUR](https://aur.archlinux.org/packages/limusic-bin) | `yay -S limusic-bin`, or `yay -S limusic-bin-prerelease` for release candidates. Maintained by [@xiryuudev](https://github.com/xiryuudev), updates through pacman |
-| Linux (Fedora COPR) | [COPR](https://copr.fedorainfracloud.org/coprs/oguzkarayemis/limusic/) | `sudo dnf copr enable oguzkarayemis/limusic` then `sudo dnf install limusic`. Maintained by [@oguzkarayemis](https://github.com/oguzkarayemis), updates through dnf |
-| Linux (openSUSE Tumbleweed) | [OBS](https://build.opensuse.org/package/show/home:itachi_re/limusic) | `sudo zypper ar -p 100 https://download.opensuse.org/repositories/home:/itachi_re/openSUSE_Tumbleweed/home:itachi_re.repo` then `sudo zypper install limusic`. Maintained by [@itachi-re](https://github.com/itachi-re), updates through zypper. The repo carries the maintainer's other packages too, so `-p 100` keeps it below the distro repos |
+Developers can dispatch `.github/workflows/windows-fork-build.yml` for an
+unsigned Windows NSIS QA artifact. It needs no signing secret and is not a
+release build.
+
+---
+
+## Integrations and Control API
+
+**Settings ▸ Integrations** is the single home for Discord Rich Presence, the
+Control API, and OBS/Tuna output. The titlebar Integrations menu toggles the
+same flags without opening Settings.
+
+The Control API is a local, token-protected HTTP and WebSocket API for scripts,
+bots, and dashboards. It is off by default, accepts the token only in a bearer
+header, and exposes no CORS headers. Its full contract is in
+[docs/CONTROL-API.md](docs/CONTROL-API.md).
+
+The OBS/Tuna integration pushes the current track to a Tuna browser source. It
+is a client only: Limusic does not open or control OBS.
+
+---
 
 ---
 
@@ -167,7 +188,8 @@ Community-maintained repositories, packaged and updated by their maintainers rat
 
 Last.fm lives in the title bar, next to the window controls, and ListenBrainz connects from
 Settings ▸ Scrobbling. Both get the same cleaned-up track (the tab's preview shows what each
-play counts as).
+play counts as). Discord is toggled from the titlebar Integrations menu or from
+Settings ▸ Integrations, next to the Control API and OBS/Tuna switches.
 
 - **Last.fm**: click the Last.fm mark, approve Limusic in the browser tab that
   opens, and you're connected for good. Tracks scrobble at the halfway point (or
@@ -178,7 +200,7 @@ play counts as).
   Plays submit as `playing_now` on start and one `single` listen at the same
   halfway-or-four-minutes point. A new MetaBrainz account has to verify its email first, or
   ListenBrainz turns every listen away (the Scrobbling tab says so).
-- **Discord**: click the Discord mark to toggle Rich Presence. Green dot means
+- **Discord**: toggle it in the Integrations menu or settings. Green dot means
   it's live. The card shows the track, artist, album art, and a progress bar, and
   it disappears when you pause.
 
