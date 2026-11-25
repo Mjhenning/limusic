@@ -21,6 +21,8 @@ off by default, has no CORS support, and is not meant to be a public web service
    detected private IPv4 addresses are shown as separate `http://…` links.
 5. Copy the token from the masked token field. Regenerating it disconnects all
    existing HTTP clients and WebSocket sockets immediately.
+6. Set **Queue request window** (default `10`, range `0 to 50`). It applies to the
+   next request without restarting the API or dropping WebSocket clients.
 
 Defaults:
 
@@ -29,6 +31,7 @@ Defaults:
 | Enabled | `false` |
 | Bind | `127.0.0.1` |
 | Port | `27199` |
+| Queue request window | `10` |
 | Token | generated once, 64 lowercase hex characters |
 
 The token is only readable from the Settings UI. It is never accepted in a
@@ -88,7 +91,7 @@ parsing the message.
 | 409 | `listen_together_guest` | A Listen Together host controls playback |
 | 409 | `remote_linked` | Another linked device is the player |
 | 409 | `queue_changed` | A stale `video_id` was sent to `/queue/remove` |
-| 409 | `duplicate` | Song is already queued; counterparts count as duplicates |
+| 409 | `duplicate` | Song is inside the protected window; counterparts count as duplicates |
 | 415 | `unsupported_media_type` | Body route without `application/json` |
 | 422 | `duration_unknown` | A duration limit was set but the track's length is unknown |
 | 422 | `too_long` | Track exceeds `max_duration_sec` |
@@ -327,6 +330,26 @@ Successful response:
 `position` is the final zero-based index of the inserted row. `item` describes
 the exact version that will play.
 
+#### Queue request dedupe window
+
+`queue_dedupe_window` is a live Integrations setting, default `10` and range
+`0 to 50` (`0` protects only the playing row). A match anywhere from
+`current - window` through `current + window`, including the playing row and
+played rows behind it, returns `409 duplicate` with the existing row's `position`.
+A counterpart id counts as the same song in either direction.
+
+Beyond that window, a matching row ahead of the current track with no `queued_by`
+is **claimed**: Limusic moves that existing row to the requested block and tags
+it with `requested_by` instead of adding a second copy. Its video id,
+counterpart, per-instance ids and display metadata are preserved, and the
+response describes the claimed row. A row ahead with `queued_by` already set, or
+any match behind the window, does not block the request; a fresh row is added.
+`submitted_by` is room-forwarding metadata, not ownership, so it does not stop a
+claim.
+
+`allow_duplicates: true` skips this request policy. The app's global
+**Prevent duplicate songs in queue** setting still applies to a fresh insert.
+
 `POST /api/v1/queue/add` and `POST /api/v1/queue/play-next` are thin variants
 that accept only `input` and `requested_by`. `/add` forces `play_next: false`;
 `/play-next` forces `play_next: true`. Both use all other defaults.
@@ -468,6 +491,11 @@ body with the guest's current mirrored track/queue. A timeout answers `502
 shared_control_failed`; the action may still have been applied, so re-read
 `GET /api/v1/status` before retrying. With no opt-in the old `409
 listen_together_guest` is unchanged.
+
+The host applies its own **Queue request window** to forwarded
+`/queue/request`, `/queue/add`, and `/queue/play-next` calls; the guest's window
+setting is not used. If the host rejects a row inside that window, the guest
+answers `502 shared_control_failed` with the host's reason and inserts nothing.
 
 The wire change is additive: defaulted fields in the existing room state, and
 new kinds inside the existing opaque `remote` envelope. No `ServerMessage`

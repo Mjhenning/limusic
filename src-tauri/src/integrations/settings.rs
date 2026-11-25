@@ -4,6 +4,16 @@ pub const CONTROL_API_SETTINGS_KEY: &str = "integrations.control_api";
 pub const TUNA_SETTINGS_KEY: &str = "integrations.tuna";
 pub const CONTROL_API_TOKEN_KEY: &str = "integrations.control_api_token";
 
+/// Default number of queue rows on either side of the current track protected from a repeat
+/// request. Stored with the Control API settings but read per request, so UI edits take effect
+/// without restarting the listener.
+pub const DEFAULT_QUEUE_DEDUPE_WINDOW: usize = 10;
+pub const MAX_QUEUE_DEDUPE_WINDOW: usize = 50;
+
+fn default_queue_dedupe_window() -> usize {
+    DEFAULT_QUEUE_DEDUPE_WINDOW
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlApiSettings {
     pub enabled: bool,
@@ -13,11 +23,21 @@ pub struct ControlApiSettings {
     /// false. `#[serde(default)]` keeps that upgrade silent.
     #[serde(default)]
     pub shared_control: bool,
+    /// Rows within this distance of the current track are protected from repeat requests. Old
+    /// saved payloads predate it and read as the default.
+    #[serde(default = "default_queue_dedupe_window")]
+    pub queue_dedupe_window: usize,
 }
 
 impl Default for ControlApiSettings {
     fn default() -> Self {
-        Self { enabled: false, bind: "127.0.0.1".to_string(), port: 27199, shared_control: false }
+        Self {
+            enabled: false,
+            bind: "127.0.0.1".to_string(),
+            port: 27199,
+            shared_control: false,
+            queue_dedupe_window: DEFAULT_QUEUE_DEDUPE_WINDOW,
+        }
     }
 }
 
@@ -86,6 +106,9 @@ pub fn validate_and_normalize_control_api_settings(
     if s.port == 0 || s.port < 1024 {
         return Err("port must be between 1024 and 65535".to_string());
     }
+    if s.queue_dedupe_window > MAX_QUEUE_DEDUPE_WINDOW {
+        return Err(format!("queue dedupe window must be between 0 and {MAX_QUEUE_DEDUPE_WINDOW}"));
+    }
     s.bind = bind;
     Ok(s)
 }
@@ -115,6 +138,7 @@ mod tests {
         assert_eq!(s.control_api.bind, "127.0.0.1");
         assert_eq!(s.control_api.port, 27199);
         assert!(!s.control_api.shared_control);
+        assert_eq!(s.control_api.queue_dedupe_window, DEFAULT_QUEUE_DEDUPE_WINDOW);
         assert!(!s.tuna.enabled);
         assert_eq!(s.tuna.url, "http://127.0.0.1:1608/");
     }
@@ -129,6 +153,7 @@ mod tests {
         let old = r#"{"control_api":{"enabled":true,"bind":"0.0.0.0","port":27199},"tuna":{"enabled":false,"url":"http://127.0.0.1:1608/"}}"#;
         let old: IntegrationSettings = serde_json::from_str(old).unwrap();
         assert!(!old.control_api.shared_control);
+        assert_eq!(old.control_api.queue_dedupe_window, DEFAULT_QUEUE_DEDUPE_WINDOW);
     }
 
     #[test]
@@ -155,6 +180,20 @@ mod tests {
         assert!(validate_and_normalize_control_api_settings(s.clone()).is_err());
         s.port = 80;
         assert!(validate_and_normalize_control_api_settings(s.clone()).is_err());
+    }
+
+    #[test]
+    fn validate_queue_dedupe_window() {
+        let mut s = ControlApiSettings::default();
+        for window in [0, 5, MAX_QUEUE_DEDUPE_WINDOW] {
+            s.queue_dedupe_window = window;
+            assert_eq!(
+                validate_and_normalize_control_api_settings(s.clone()).unwrap().queue_dedupe_window,
+                window
+            );
+        }
+        s.queue_dedupe_window = MAX_QUEUE_DEDUPE_WINDOW + 1;
+        assert!(validate_and_normalize_control_api_settings(s).is_err());
     }
 
     #[test]

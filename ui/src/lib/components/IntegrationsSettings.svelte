@@ -32,6 +32,7 @@
 	let applying = $state(false);
 	let error = $state('');
 	let portInput = $state('27199');
+	let dedupeInput = $state('10');
 	let urlInput = $state('http://127.0.0.1:1608/');
 	let testMessage = $state<{ ok: boolean; text: string } | null>(null);
 
@@ -43,6 +44,10 @@
 	const portValid = $derived.by(() => {
 		const port = Number(portInput);
 		return Number.isInteger(port) && port >= 1024 && port <= 65535;
+	});
+	const dedupeValid = $derived.by(() => {
+		const distance = Number(dedupeInput);
+		return Number.isInteger(distance) && distance >= 0 && distance <= 50;
 	});
 	const urlValid = $derived(/^https?:\/\/\S+/i.test(urlInput.trim()));
 
@@ -109,6 +114,7 @@
 			status = currentStatus;
 			token = currentToken;
 			portInput = String(loaded.control_api.port);
+			dedupeInput = String(loaded.control_api.queue_dedupe_window ?? 10);
 			urlInput = loaded.tuna.url;
 			api.getLocalIpv4Addresses().then((ips) => (localIps = ips)).catch(() => {});
 		} catch (e) {
@@ -138,7 +144,7 @@
 
 	async function apply(next: api.IntegrationSettings) {
 		if (applying) return;
-		if (!portValid || !urlValid) return;
+		if (!portValid || !dedupeValid || !urlValid) return;
 		error = '';
 		applying = true;
 		try {
@@ -146,6 +152,7 @@
 			settings = next;
 			syncIntegrations(next);
 			portInput = String(next.control_api.port);
+			dedupeInput = String(next.control_api.queue_dedupe_window);
 			urlInput = next.tuna.url;
 			await refreshStatus();
 		} catch (e) {
@@ -175,6 +182,12 @@
 		const port = Number(portInput);
 		if (!Number.isInteger(port)) return;
 		setControl({ port });
+	}
+
+	function saveDedupe() {
+		const queue_dedupe_window = Number(dedupeInput);
+		if (!Number.isInteger(queue_dedupe_window)) return;
+		setControl({ queue_dedupe_window });
 	}
 
 	function saveUrl() {
@@ -263,6 +276,11 @@
 					title: t('settings.integrations.shared_control'),
 					desc: t('settings.integrations.shared_control_hint'),
 					control: sharedControlSwitch
+				})}
+				{@render row({
+					title: t('settings.integrations.queue_dedupe_window'),
+					desc: t('settings.integrations.queue_dedupe_window_hint'),
+					control: dedupeField
 				})}
 				{@render row({
 					title: t('settings.integrations.bind_mode'),
@@ -424,6 +442,27 @@
 		/>
 		{#if !portValid}
 			<p class="mt-1.5 text-xs text-destructive">{t('settings.integrations.port_invalid')}</p>
+		{/if}
+	</div>
+{/snippet}
+
+{#snippet dedupeField()}
+	<div>
+		<Input
+			type="number"
+			min="0"
+			max="50"
+			class="w-20"
+			value={dedupeInput}
+			disabled={applying || !settings}
+			oninput={(e) => (dedupeInput = e.currentTarget.value)}
+			onblur={saveDedupe}
+			aria-label={t('settings.integrations.queue_dedupe_window')}
+		/>
+		{#if !dedupeValid}
+			<p class="mt-1.5 text-xs text-destructive">
+				{t('settings.integrations.queue_dedupe_window_invalid')}
+			</p>
 		{/if}
 	</div>
 {/snippet}

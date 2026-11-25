@@ -98,4 +98,26 @@ ok(protocol.includes('SharedControlEnvelope'), 'the wire shape is in listen-prot
 ok(sync.includes('MAX_SHARED_CONTROL'), 'the relay bounds shared-control envelopes');
 ok(doc.includes('| 502 | `shared_control_failed` |'), 'the error table has shared_control_failed');
 
+// --- live queue request window -----------------------------------------------------------------
+const queueStart = doc.indexOf('### Queue requests');
+const queueEnd = doc.indexOf('### WebSocket', queueStart);
+ok(queueStart >= 0 && queueEnd > queueStart, 'CONTROL-API.md documents queue requests');
+const queueSection = doc.slice(queueStart, queueEnd);
+for (const text of [
+	'queue_dedupe_window',
+	'default `10`',
+	'0 to 50',
+	'claimed',
+	'counterpart',
+	'allow_duplicates'
+]) {
+	ok(queueSection.includes(text), `queue request docs mention ${text}`);
+}
+const state = read(join(root, 'src-tauri', 'src', 'state.rs'));
+const settings = read(join(root, 'src-tauri', 'src', 'integrations', 'settings.rs'));
+ok(settings.includes('queue_dedupe_window: usize'), 'the setting is persisted in Rust');
+ok(state.includes('pub fn queue_dedupe_window'), 'the window is read live per request');
+ok(state.includes('apply_shared_queue_action'), 'guests use the same host-side policy');
+ok(doc.includes('host applies its own'), 'shared-control docs name the host window');
+
 console.log('ok');

@@ -397,6 +397,13 @@ fn row_video_id(row: &serde_json::Value) -> Option<&serde_json::Value> {
     row.get("video_id").or_else(|| row.get("videoId"))
 }
 
+/// A claimed row can be the requested song's counterpart, so look both fields up when finding the
+/// row a forwarded request produced.
+fn row_matches_id(row: &serde_json::Value, id: &str) -> bool {
+    row_video_id(row).and_then(serde_json::Value::as_str) == Some(id)
+        || row.get("counterpart").and_then(serde_json::Value::as_str) == Some(id)
+}
+
 /// `POST /api/v1/queue/remove`: removes an upcoming row only; out-of-range and current indices are
 /// rejected instead of silently ignored. An optional `video_id` makes the removal conditional: a
 /// stale id gets `queue_changed` without touching the queue.
@@ -510,10 +517,7 @@ async fn forwarded_queue_response(shared: &ApiShared, video_id: &str) -> Respons
     let snap = shared.context.queue_snapshot().await;
     let items =
         snap.get("items").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
-    let position = items
-        .iter()
-        .position(|row| row_video_id(row).and_then(serde_json::Value::as_str) == Some(video_id))
-        .unwrap_or(0);
+    let position = items.iter().position(|row| row_matches_id(row, video_id)).unwrap_or(0);
     let row = items.get(position).cloned().unwrap_or(serde_json::Value::Null);
     Json(QueueRequestResponse { ok: true, position, item: ApiTrack::from_value(&row) })
         .into_response()
@@ -527,10 +531,11 @@ async fn forwarded_queue_response(shared: &ApiShared, video_id: &str) -> Respons
 /// duration, never its counterpart's. No extra `/player` lookup is made. It fails closed with 422
 /// `duration_unknown` unless `allow_unknown_duration` is true; a known but longer track gets 422
 /// `too_long` with `duration_sec` and `max_duration_sec`.
-/// Duplicate rejection (409 with the existing `position`) is skipped by `allow_duplicates`, but the
-/// app's global `prevent_duplicates` setting still applies inside the insertion. A timeout from a
-/// previous skip never leaves this endpoint guessing: it holds the same mutation lock as other
-/// current-track/queue changes.
+/// Rows inside the live `queue_dedupe_window` reject with 409 and the existing `position`; an
+/// unowned row ahead of that window is moved and tagged instead. `allow_duplicates` skips this
+/// policy, but the app's global `prevent_duplicates` setting still applies to a fresh insert. A
+/// timeout from a previous skip never leaves this endpoint guessing: it holds the same mutation
+/// lock as other current-track/queue changes.
 async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Response {
     let parsed = match parse_input(&body.input) {
         Ok(parsed) => parsed,
@@ -733,6 +738,7 @@ mod tests {
         resolve_delay: Duration,
         rows: StdMutex<Vec<MockRow>>,
         current: AtomicUsize,
+        queue_dedupe_window: usize,
         inserted: StdMutex<Vec<(SongItem, bool, bool)>>,
     }
 
@@ -802,6 +808,7 @@ mod tests {
                     },
                 ]),
                 current: AtomicUsize::new(0),
+                queue_dedupe_window: 10,
                 inserted: StdMutex::new(Vec::new()),
             }
         }
@@ -998,21 +1005,50 @@ mod tests {
             self.enter().await;
             let result = {
                 let mut rows = self.rows.lock().unwrap();
-                if !allow_duplicates {
-                    let queue: Vec<SongItem> = rows
-                        .iter()
-                        .map(|row| SongItem {
-                            video_id: row.id.clone(),
-                            counterpart: row.counterpart.clone(),
-                            ..Default::default()
-                        })
-                        .collect();
-                    super::super::types::find_request_duplicate(&item, queue.iter())
-                        .map_or(Ok(()), Err)
+                let queue: Vec<SongItem> = rows
+                    .iter()
+                    .map(|row| SongItem {
+                        video_id: row.id.clone(),
+                        counterpart: row.counterpart.clone(),
+                        queued_by: row.queued_by.clone(),
+                        queued: row.queued,
+                        ..Default::default()
+                    })
+                    .collect();
+                let decision = if allow_duplicates {
+                    super::super::types::RequestDecision::Insert
                 } else {
-                    Ok(())
+                    super::super::types::classify_request(
+                        &item,
+                        queue.iter(),
+                        self.current.load(Ordering::SeqCst),
+                        self.queue_dedupe_window,
+                    )
+                };
+                let row = match decision {
+                    super::super::types::RequestDecision::Reject(matched) => Err(matched),
+                    super::super::types::RequestDecision::Claim { index } => {
+                        let mut claimed = rows.remove(index);
+                        claimed.autoplay = false;
+                        claimed.queued = next;
+                        claimed.queued_by = item.queued_by.clone();
+                        if item.submitted_by.is_some() {
+                            claimed.submitted_by = item.submitted_by.clone();
+                        }
+                        Ok(claimed)
+                    }
+                    super::super::types::RequestDecision::Insert => Ok(MockRow {
+                        id: item.video_id.clone(),
+                        counterpart: item.counterpart.clone(),
+                        autoplay: false,
+                        queued: next,
+                        queued_by: item.queued_by.clone(),
+                        submitted_by: item.submitted_by.clone(),
+                        album: item.album.clone(),
+                        album_id: item.album_id.clone(),
+                    }),
                 }
-                .and_then(|()| {
+                .and_then(|mut row| {
                     let at = if next {
                         let mut at = self.current.load(Ordering::SeqCst) + 1;
                         while at < rows.len() && rows[at].queued {
@@ -1023,24 +1059,22 @@ mod tests {
                         rows.iter().position(|row| row.autoplay).unwrap_or(rows.len())
                     }
                     .min(rows.len());
-                    rows.insert(
-                        at,
-                        MockRow {
-                            id: item.video_id.clone(),
-                            counterpart: item.counterpart.clone(),
-                            autoplay: false,
-                            queued: next,
-                            queued_by: item.queued_by.clone(),
-                            submitted_by: item.submitted_by.clone(),
-                            album: item.album.clone(),
-                            album_id: item.album_id.clone(),
-                        },
-                    );
-                    let mut inserted = item.clone();
+                    let mut inserted = SongItem {
+                        video_id: row.id.clone(),
+                        counterpart: row.counterpart.clone(),
+                        album: row.album.clone(),
+                        album_id: row.album_id.clone(),
+                        queued_by: row.queued_by.clone(),
+                        submitted_by: row.submitted_by.clone(),
+                        ..item.clone()
+                    };
                     inserted.queued = next;
                     inserted.queued_end = at + 1 == rows.len();
+                    row.queued = next;
+                    rows.insert(at, row);
                     Ok((at, inserted))
-                })
+                });
+                row
             };
             if let Ok((_, ref inserted)) = result {
                 self.inserted.lock().unwrap().push((inserted.clone(), next, allow_duplicates));
@@ -1755,6 +1789,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_request_window_rejects_claims_and_adds_by_distance() {
+        // The mock resolver always returns `resolved123`; only its position and ownership vary.
+        let near = test_router_with(MockContext {
+            rows: StdMutex::new(vec![
+                MockRow { id: "current".into(), ..Default::default() },
+                MockRow { id: "resolved123".into(), ..Default::default() },
+                MockRow { id: "spacer".into(), ..Default::default() },
+            ]),
+            queue_dedupe_window: 1,
+            ..Default::default()
+        })
+        .0;
+        let response = request(
+            near,
+            "/api/v1/queue/request",
+            json!({ "input": "song", "requested_by": "bob" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(response).await["position"], 1);
+
+        let claim = test_router_with(MockContext {
+            rows: StdMutex::new(vec![
+                MockRow { id: "current".into(), ..Default::default() },
+                MockRow { id: "near".into(), ..Default::default() },
+                MockRow { id: "spacer".into(), ..Default::default() },
+                MockRow { id: "resolved123".into(), ..Default::default() },
+                MockRow {
+                    id: "far-owned".into(),
+                    queued_by: Some("alice".into()),
+                    ..Default::default()
+                },
+            ]),
+            queue_dedupe_window: 1,
+            ..Default::default()
+        })
+        .0;
+        let response = request(
+            claim,
+            "/api/v1/queue/request",
+            json!({ "input": "song", "requested_by": "bob", "play_next": false }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = json_body(response).await;
+        assert_eq!(response["position"], 4);
+        assert_eq!(response["item"]["video_id"], "resolved123");
+        assert_eq!(response["item"]["queued_by"], "bob");
+
+        let owned = test_router_with(MockContext {
+            rows: StdMutex::new(vec![
+                MockRow { id: "current".into(), ..Default::default() },
+                MockRow { id: "near".into(), ..Default::default() },
+                MockRow { id: "spacer".into(), ..Default::default() },
+                MockRow {
+                    id: "resolved123".into(),
+                    queued_by: Some("alice".into()),
+                    ..Default::default()
+                },
+            ]),
+            queue_dedupe_window: 1,
+            ..Default::default()
+        })
+        .0;
+        let response = request(
+            owned,
+            "/api/v1/queue/request",
+            json!({ "input": "song", "requested_by": "bob" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["item"]["video_id"], "resolved123");
+    }
+
+    #[tokio::test]
+    async fn claimed_row_is_protected_from_the_next_request() {
+        let (app, _) = test_router_with(MockContext {
+            resolve_item: resolved("far", Some("3:00")),
+            rows: StdMutex::new(vec![
+                MockRow { id: "current".into(), ..Default::default() },
+                MockRow { id: "near".into(), ..Default::default() },
+                MockRow { id: "spacer".into(), ..Default::default() },
+                MockRow { id: "far".into(), ..Default::default() },
+            ]),
+            queue_dedupe_window: 1,
+            ..Default::default()
+        });
+
+        let first = request(
+            app.clone(),
+            "/api/v1/queue/request",
+            json!({ "input": "far", "requested_by": "bob" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = json_body(first).await;
+        assert_eq!(first["position"], 1);
+        assert_eq!(first["item"]["video_id"], "far");
+        assert_eq!(first["item"]["queued_by"], "bob");
+
+        let second = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "far", "requested_by": "carol" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(second).await["position"], 1);
+    }
+
+    #[tokio::test]
+    async fn counterpart_claim_returns_the_queued_row() {
+        let (app, _) = test_router_with(MockContext {
+            resolve_item: resolved("audio", Some("3:00")),
+            rows: StdMutex::new(vec![
+                MockRow { id: "current".into(), ..Default::default() },
+                MockRow {
+                    id: "music-video".into(),
+                    counterpart: Some("audio".into()),
+                    ..Default::default()
+                },
+            ]),
+            queue_dedupe_window: 0,
+            ..Default::default()
+        });
+        let response = request(
+            app,
+            "/api/v1/queue/request",
+            json!({ "input": "audio", "requested_by": "bob" }),
+            Some("Bearer abc123"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(response).await;
+        assert_eq!(json["position"], 1);
+        assert_eq!(json["item"]["video_id"], "music-video");
+        assert_eq!(json["item"]["queued_by"], "bob");
+    }
+
+    #[test]
+    fn forwarded_queue_response_matches_counterparts() {
+        let row = json!({ "video_id": "music-video", "counterpart": "audio" });
+        assert!(row_matches_id(&row, "audio"));
+        assert!(row_matches_id(&row, "music-video"));
+        assert!(!row_matches_id(&row, "other"));
+    }
+
+    #[tokio::test]
     async fn play_next_and_append_use_different_positions() {
         let (app, ctx) = test_router();
         let response = request(
@@ -2277,7 +2464,13 @@ mod tests {
     }
 
     fn control_settings(port: u16, enabled: bool) -> ControlApiSettings {
-        ControlApiSettings { enabled, bind: "127.0.0.1".into(), port, shared_control: false }
+        ControlApiSettings {
+            enabled,
+            bind: "127.0.0.1".into(),
+            port,
+            shared_control: false,
+            queue_dedupe_window: 10,
+        }
     }
 
     async fn start_manager(db: Arc<Db>, port: u16, token: &str) -> IntegrationsManager {

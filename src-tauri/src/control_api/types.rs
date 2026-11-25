@@ -44,34 +44,74 @@ pub struct DuplicateMatch {
     pub matched_by: String,
 }
 
-/// Compare one requested item with the full queue, including the current row. Either side's
-/// `video_id` or `counterpart` counts, so an audio id and its paired music video are one song.
-pub fn find_request_duplicate<'a>(
+/// What a queue request should do with the current queue snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestDecision {
+    /// No match blocks the request; insert a fresh row.
+    Insert,
+    /// An unowned row ahead of the protection window can be moved and tagged instead of adding a
+    /// second copy. The index refers to the snapshot passed to [`classify_request`].
+    Claim { index: usize },
+    /// A row inside the protection window matched; reject with the same payload as before.
+    Reject(DuplicateMatch),
+}
+
+/// Decide how a queue request relates to the current queue. Only rows within `window` of `current`
+/// protect a song from being requested again, in both directions and including the playing row.
+/// Beyond that window an unowned upcoming row can be claimed; any other match is ignored.
+pub fn classify_request<'a>(
     item: &SongItem,
     queue: impl IntoIterator<Item = &'a SongItem>,
-) -> Option<DuplicateMatch> {
+    current: usize,
+    window: usize,
+) -> RequestDecision {
     let requested = [
         ("video_id", Some(item.video_id.as_str())),
         ("counterpart", item.counterpart.as_deref().filter(|id| !id.is_empty())),
     ];
     let queue: Vec<&SongItem> = queue.into_iter().collect();
+    if queue.is_empty() {
+        return RequestDecision::Insert;
+    }
+    let current = current.min(queue.len() - 1);
+    let mut candidates: Vec<(usize, DuplicateMatch)> = Vec::new();
     for (requested_field, wanted) in requested {
         let Some(wanted) = wanted else { continue };
         for (position, row) in queue.iter().copied().enumerate() {
             let row_counterpart = row.counterpart.as_deref().filter(|id| !id.is_empty());
-            if row.video_id == wanted || row_counterpart == Some(wanted) {
-                let via_counterpart =
-                    requested_field == "counterpart" || row_counterpart == Some(wanted);
-                return Some(DuplicateMatch {
+            if row.video_id != wanted && row_counterpart != Some(wanted) {
+                continue;
+            }
+            // One row can answer to both ids; count it once, in the old field-then-position order.
+            if candidates.iter().any(|(index, _)| *index == position) {
+                continue;
+            }
+            let via_counterpart =
+                requested_field == "counterpart" || row_counterpart == Some(wanted);
+            candidates.push((
+                position,
+                DuplicateMatch {
                     position,
                     video_id: row.video_id.clone(),
                     counterpart: row_counterpart.map(str::to_owned),
                     matched_by: if via_counterpart { "counterpart" } else { "video_id" }.to_owned(),
-                });
-            }
+                },
+            ));
         }
     }
-    None
+
+    if let Some((_, matched)) =
+        candidates.iter().find(|(index, _)| index.abs_diff(current) <= window)
+    {
+        return RequestDecision::Reject(matched.clone());
+    }
+    if let Some((index, _)) = candidates.iter().find(|(index, _)| {
+        *index > current.saturating_add(window)
+            && queue[*index].queued_by.as_deref().unwrap_or("").trim().is_empty()
+    }) {
+        return RequestDecision::Claim { index: *index };
+    }
+    RequestDecision::Insert
 }
 
 /// The standard error envelope. `error` is a stable machine code; `message` is human-readable.
@@ -977,9 +1017,10 @@ pub trait ControlApiContext: Send + Sync + 'static {
     /// Resolve a parsed input to one fully-described song, including duration.
     async fn resolve_input(&self, parsed: &ParsedInput) -> Result<SongItem, ResolveError>;
 
-    /// Check duplicates and insert under one queue lock. `Ok` is the final index and the row as it
-    /// exists after insertion (so callers see `queued`/`queued_end`); `Err` names the existing row,
-    /// including a counterpart match. `allow_duplicates` skips only the API-level check.
+    /// Apply the windowed request policy and insert under one queue lock. `Ok` is the final index
+    /// and the row as it exists afterwards (a claim returns the moved row); `Err` names an existing
+    /// row inside the protection window, including a counterpart match. `allow_duplicates` skips
+    /// only the API-level policy.
     async fn insert_request(
         self: Arc<Self>,
         item: SongItem,
@@ -1098,6 +1139,88 @@ pub struct ApiShared {
 mod tests {
     use super::*;
     use innertube::models::metadata::ArtistRun;
+
+    fn row(id: &str, queued_by: Option<&str>) -> SongItem {
+        SongItem {
+            video_id: id.to_owned(),
+            queued_by: queued_by.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn request_decision_uses_an_absolute_window() {
+        let queue: Vec<SongItem> = (0..12).map(|i| row(&i.to_string(), None)).collect();
+        let request = |id: &str| row(id, None);
+
+        for (id, position) in [("3", 3), ("5", 5), ("7", 7)] {
+            assert_eq!(
+                classify_request(&request(id), &queue, 5, 2),
+                RequestDecision::Reject(DuplicateMatch {
+                    position,
+                    video_id: id.to_owned(),
+                    counterpart: None,
+                    matched_by: "video_id".to_owned(),
+                })
+            );
+        }
+        assert_eq!(
+            classify_request(&request("8"), &queue, 5, 2),
+            RequestDecision::Claim { index: 8 }
+        );
+        assert_eq!(classify_request(&request("2"), &queue, 5, 2), RequestDecision::Insert);
+    }
+
+    #[test]
+    fn request_decision_ignores_ownership_outside_the_window() {
+        let queue = vec![
+            row("current", None),
+            row("near", Some("alice")),
+            row("spacer", None),
+            row("far-owned", Some("alice")),
+            row("far-free", None),
+        ];
+        let request = |id: &str| row(id, None);
+
+        assert_eq!(
+            classify_request(&request("near"), &queue, 0, 1),
+            RequestDecision::Reject(DuplicateMatch {
+                position: 1,
+                video_id: "near".to_owned(),
+                counterpart: None,
+                matched_by: "video_id".to_owned(),
+            })
+        );
+        assert_eq!(classify_request(&request("far-owned"), &queue, 0, 1), RequestDecision::Insert);
+        assert_eq!(
+            classify_request(&request("far-free"), &queue, 0, 1),
+            RequestDecision::Claim { index: 4 }
+        );
+    }
+
+    #[test]
+    fn request_decision_counts_counterparts_as_the_same_song() {
+        let queue = vec![
+            row("current", None),
+            SongItem {
+                video_id: "music-video".to_owned(),
+                counterpart: Some("audio".to_owned()),
+                ..Default::default()
+            },
+        ];
+        let request = row("audio", None);
+
+        assert_eq!(
+            classify_request(&request, &queue, 0, 1),
+            RequestDecision::Reject(DuplicateMatch {
+                position: 1,
+                video_id: "music-video".to_owned(),
+                counterpart: Some("audio".to_owned()),
+                matched_by: "counterpart".to_owned(),
+            })
+        );
+        assert_eq!(classify_request(&request, &queue, 0, 0), RequestDecision::Claim { index: 1 });
+    }
 
     #[test]
     fn duration_and_artist_helpers_cover_display_metadata() {

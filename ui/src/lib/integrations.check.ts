@@ -95,14 +95,20 @@ ok(tunaFold < ui.indexOf("title: t('settings.integrations.tuna_url')"), 'Tuna UR
 
 ok(ui.includes('setControl({ shared_control: on })'), 'shared control is saved with Control API settings');
 ok(ui.includes('settings?.control_api.shared_control'), 'the shared-control switch reads persisted state');
+ok(ui.includes('setControl({ queue_dedupe_window })'), 'the queue window is saved live with Control API settings');
 ok(
 	readFileSync(join(here, 'api.ts'), 'utf8').includes('shared_control: boolean'),
 	'the UI settings type carries shared_control'
+);
+ok(
+	readFileSync(join(here, 'api.ts'), 'utf8').includes('queue_dedupe_window: number'),
+	'the UI settings type carries queue_dedupe_window'
 );
 
 const folded: [string, string][] = [
 	['settings.integrations.status', 'settings.integrations.enable'],
 	['settings.integrations.shared_control', 'settings.integrations.enable'],
+	['settings.integrations.queue_dedupe_window', 'settings.integrations.enable'],
 	['settings.integrations.bind_mode', 'settings.integrations.enable'],
 	['settings.integrations.port', 'settings.integrations.enable'],
 	['settings.integrations.token', 'settings.integrations.enable'],
@@ -227,6 +233,13 @@ for (const key of [
 	'tuna_off'
 ]) {
 	ok(typeof en.integrations[key] === 'string', `en.json has integrations.${key}`);
+}
+for (const key of [
+	'queue_dedupe_window',
+	'queue_dedupe_window_hint',
+	'queue_dedupe_window_invalid'
+]) {
+	ok(typeof en.settings.integrations[key] === 'string', `en.json has settings.integrations.${key}`);
 }
 for (const key of ['shared_control', 'shared_control_hint', 'shared_control_requires_api']) {
 	ok(

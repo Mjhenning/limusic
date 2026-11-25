@@ -3791,8 +3791,17 @@ pub async fn set_integration_settings(
         crate::integrations::settings::TUNA_SETTINGS_KEY,
         &serde_json::to_string(&tuna).map_err(|e| e.to_string())?,
     );
-    let reason = if previous.port != control_api.port { "port change" } else { "settings changed" };
-    manager.apply_settings(control_api.clone(), reason).await;
+    // Only the listener's own fields need a rebind. The dedupe window is read from the DB per
+    // request, and the shared-control opt-in is pushed to the room state directly, so changing
+    // either while bots are connected must not drop their sockets.
+    let listener_changed = previous.enabled != control_api.enabled
+        || previous.bind != control_api.bind
+        || previous.port != control_api.port;
+    if listener_changed {
+        let reason =
+            if previous.port != control_api.port { "port change" } else { "settings changed" };
+        manager.apply_settings(control_api.clone(), reason).await;
+    }
     state.lt.set_shared_control_enabled(control_api.shared_control).await;
     manager.apply_tuna_settings(tuna).await;
     Ok(())

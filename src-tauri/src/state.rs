@@ -18,7 +18,9 @@ use player::Player;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 
-use crate::control_api::types::CONTROL_API_SKIP_HARD_TIMEOUT;
+use crate::control_api::types::{
+    classify_request, DuplicateMatch, RequestDecision, CONTROL_API_SKIP_HARD_TIMEOUT,
+};
 use crate::db::{now_secs, Db, StoredAccount};
 use crate::devicelink::{LinkCommand, LinkSession, Publish, RemoteView};
 use crate::discord::DiscordHandle;
@@ -4918,8 +4920,20 @@ impl AppState {
             let (id, from, action, submitted_by) =
                 (id.clone(), from.clone(), action.clone(), submitted_by.clone());
             let action = stamp_shared_action(action, submitted_by.as_deref());
-            self.apply_link(LinkCommand::Remote(action)).await;
-            self.lt.send_control_result(id, from, Ok(())).await;
+            let queue_request =
+                matches!(&action, RemoteAction::PlayNext { .. } | RemoteAction::AddToQueue { .. });
+            let result = if queue_request {
+                self.apply_shared_queue_action(action).await.map_err(|matched| {
+                    format!(
+                        "song is within the protected queue window (position {})",
+                        matched.position
+                    )
+                })
+            } else {
+                self.apply_link(LinkCommand::Remote(action)).await;
+                Ok(())
+            };
+            self.lt.send_control_result(id, from, result).await;
             return;
         }
         // Membership has already changed. Finish any earlier effect request, restore the shared
@@ -5530,38 +5544,124 @@ impl AppState {
         }
         let (index, was_empty, _) = {
             let mut q = self.queue.lock().await;
-            self.insert_queued_inner(&mut q, items, next, from).await
+            self.insert_queued_inner(&mut q, items, next, from, false).await
         };
         self.finish_insert(was_empty).await;
         index
     }
 
-    /// Control-API variant: reject a duplicate *and* insert under one queue lock, so two chat
-    /// callers cannot both pass the check against the same pre-insert snapshot. A counterpart is
-    /// the same song as its twin, in either direction; the current row counts too. `Ok` is the
-    /// final inserted index; `Err` names the existing row. `allow_duplicates` skips only this
-    /// check — the user's global `prevent_duplicates` setting still applies inside
-    /// [`Self::insert_queued_inner`].
+    /// Live value of the queue-request protection window. Loaded from the DB per call so an edit
+    /// in Integrations settings takes effect on the next request without restarting the listener.
+    pub fn queue_dedupe_window(&self) -> usize {
+        use crate::integrations::settings::{
+            ControlApiSettings, CONTROL_API_SETTINGS_KEY, DEFAULT_QUEUE_DEDUPE_WINDOW,
+        };
+        self.db
+            .get_setting(CONTROL_API_SETTINGS_KEY)
+            .and_then(|json| serde_json::from_str::<ControlApiSettings>(&json).ok())
+            .map(|settings| settings.queue_dedupe_window)
+            .unwrap_or(DEFAULT_QUEUE_DEDUPE_WINDOW)
+    }
+
+    /// Control-API variant: decide against one queue snapshot under one lock, so two chat callers
+    /// cannot both claim the same row or both pass the same check. A counterpart is the same song
+    /// as its twin, in either direction. `Ok` is the final row index; `Err` names a row that is
+    /// inside the protection window. `allow_duplicates` skips only this policy — the user's global
+    /// `prevent_duplicates` setting still applies to a fresh insert.
     pub async fn insert_queued_checked(
         self: &std::sync::Arc<Self>,
         item: SongItem,
         next: bool,
         from: Option<String>,
         allow_duplicates: bool,
-    ) -> Result<(usize, SongItem), crate::control_api::types::DuplicateMatch> {
+    ) -> Result<(usize, SongItem), DuplicateMatch> {
+        let window = self.queue_dedupe_window();
+        self.insert_queued_request(item, next, from, allow_duplicates, window).await
+    }
+
+    /// Apply the shared request policy to one item. A claim keeps the existing row's identity and
+    /// only moves/tags it; a rejected row leaves the queue untouched.
+    async fn insert_queued_request(
+        self: &std::sync::Arc<Self>,
+        item: SongItem,
+        next: bool,
+        from: Option<String>,
+        allow_duplicates: bool,
+        window: usize,
+    ) -> Result<(usize, SongItem), DuplicateMatch> {
         let mut q = self.queue.lock().await;
-        if !allow_duplicates {
-            if let Some(matched) =
-                crate::control_api::types::find_request_duplicate(&item, q.items.iter())
-            {
-                return Err(matched);
+        let decision = if allow_duplicates {
+            RequestDecision::Insert
+        } else {
+            classify_request(&item, q.items.iter(), q.current, window)
+        };
+        let result = match decision {
+            RequestDecision::Reject(matched) => return Err(matched),
+            RequestDecision::Claim { index } => {
+                let mut claimed = q.items.remove(index);
+                claimed.queued_by = item.queued_by.clone();
+                // `submitted_by` is room metadata, not ownership; an incoming forwarder wins, and
+                // otherwise the row keeps whatever forwarding client it already had.
+                if item.submitted_by.is_some() {
+                    claimed.submitted_by = item.submitted_by.clone();
+                }
+                if let Some(orig) = q.shuffle_orig.as_mut() {
+                    if let Some(old) = orig.iter().position(|i| i.video_id == claimed.video_id) {
+                        orig.remove(old);
+                    }
+                }
+                self.insert_queued_inner(&mut q, vec![claimed], next, None, true).await
             }
-        }
-        let (index, was_empty, inserted) =
-            self.insert_queued_inner(&mut q, vec![item], next, from).await;
+            RequestDecision::Insert => {
+                self.insert_queued_inner(&mut q, vec![item], next, from, false).await
+            }
+        };
+        let (index, was_empty, inserted) = result;
         drop(q);
         self.finish_insert(was_empty).await;
         Ok((index, inserted))
+    }
+
+    /// Host-side counterpart of [`Self::insert_queued_checked`] for forwarded room requests. The
+    /// action is already stamped with the requesting room client, so the host's own window decides
+    /// whether the rows are rejected, claimed, or added.
+    pub async fn apply_shared_queue_action(
+        self: &std::sync::Arc<Self>,
+        action: RemoteAction,
+    ) -> Result<(), DuplicateMatch> {
+        // Keep the old device-link and guest behavior before applying host-side policy: while the
+        // windows show another device, the action belongs there, and a guest owns no local queue.
+        if matches!(&action, RemoteAction::PlayNext { .. } | RemoteAction::AddToQueue { .. }) {
+            if self.link_route(|_| Some(action.clone())) {
+                return Ok(());
+            }
+            if self.lt.is_guest().await {
+                let tracks = match &action {
+                    RemoteAction::PlayNext { tracks, .. }
+                    | RemoteAction::AddToQueue { tracks, .. } => tracks.clone(),
+                    _ => unreachable!(),
+                };
+                for track in tracks {
+                    self.lt.suggest(track).await;
+                }
+                return Ok(());
+            }
+        }
+        let window = self.queue_dedupe_window();
+        match action {
+            RemoteAction::PlayNext { tracks, from } => {
+                for item in linkable_songs(&tracks, None).0 {
+                    self.insert_queued_request(item, true, from.clone(), false, window).await?;
+                }
+            }
+            RemoteAction::AddToQueue { tracks, from } => {
+                for item in linkable_songs(&tracks, None).0 {
+                    self.insert_queued_request(item, false, from.clone(), false, window).await?;
+                }
+            }
+            _ => self.apply_link(LinkCommand::Remote(action)).await,
+        }
+        Ok(())
     }
 
     /// The locked body of [`Self::insert_queued`]. Caller owns the queue guard, which is what lets
@@ -5572,6 +5672,7 @@ impl AppState {
         mut items: Vec<SongItem>,
         next: bool,
         from: Option<String>,
+        already_claimed: bool,
     ) -> (usize, bool, SongItem) {
         for item in &mut items {
             item.queued = next;
@@ -5580,7 +5681,10 @@ impl AppState {
             // Queued by hand, so it is the user's: switching Autoplay off leaves it be.
             item.autoplay = false;
         }
-        let dedupe = self.db.get_setting("prevent_duplicates").as_deref() == Some("true");
+        // A claimed row has already left its old slot; re-running the app's dedupe passes would
+        // drop unrelated context copies, so the claim path only splices the moved row back in.
+        let dedupe = !already_claimed
+            && self.db.get_setting("prevent_duplicates").as_deref() == Some("true");
         let first_item = items.first().cloned().unwrap_or_default();
         let (index, was_empty) = {
             let qm = &mut *q;
@@ -5599,7 +5703,8 @@ impl AppState {
             let n = qm.items.len();
             let mut i = 0;
             qm.items.retain(|it| {
-                let keep = i <= cur
+                let keep = already_claimed
+                    || i <= cur
                     || !((it.queued || it.queued_end) && ids.contains(it.video_id.as_str()));
                 i += 1;
                 keep

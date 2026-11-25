@@ -1767,6 +1767,8 @@ export interface ControlApiSettings {
 	port: number;
 	/** Host opt-in: let fork guests forward Control API mutations to this player. */
 	shared_control: boolean;
+	/** Queue rows on either side of the current track protected from repeat requests. */
+	queue_dedupe_window: number;
 }
 
 export interface TunaSettings {
