@@ -43,4 +43,36 @@ for (const format of ['deb', 'rpm', 'msi']) {
 const readme = read('README.md');
 ok(readme.includes('Only the three self-updating formats above are published here.'), 'README states the artifact policy');
 
+const linux = read('.github/workflows/linux-release.yml');
+const windows = read('.github/workflows/windows-release.yml');
+const macos = read('.github/workflows/macos-release.yml');
+const script = read('scripts/release.sh');
+
+ok(linux.includes('tauri build --bundles appimage'), 'Linux CI builds only the AppImage');
+ok(windows.includes('tauri build --bundles nsis'), 'Windows CI builds only NSIS');
+ok(macos.includes('tauri build --bundles app'), 'macOS CI builds the .app before dmg/tarball');
+ok(macos.includes('.app.tar.gz') && macos.includes('.dmg'), 'macOS CI ships the updater tarball and dmg');
+
+for (const [name, source] of [
+	['Linux CI', linux],
+	['Windows CI', windows],
+	['release script', script]
+]) {
+	ok(!/\b(?:deb|rpm|msi)\b/i.test(source), `${name} has no dropped format`);
+	ok(!source.includes('bundle/deb') && !source.includes('bundle/rpm') && !source.includes('bundle/msi'), `${name} attaches no dropped artifact`);
+}
+ok(!linux.includes('deb_check'), 'the Linux .deb verification step is gone');
+ok(!script.includes('--bundles rpm'), 'the release script no longer builds an rpm');
+
+for (const [name, source] of [
+	['Linux', linux],
+	['Windows', windows],
+	['macOS', macos]
+]) {
+	ok(
+		source.includes('REQUIRED_PLATFORMS=\'["darwin-aarch64","linux-x86_64","windows-x86_64"]\''),
+		`${name} still gates promotion on all three platforms`
+	);
+}
+
 console.log('ok');

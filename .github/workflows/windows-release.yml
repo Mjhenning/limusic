@@ -1,11 +1,11 @@
 name: Windows release binaries
 
-# Builds and signs the Windows installers for a release that ALREADY EXISTS, attaches them to it,
-# and adds the `windows-x86_64` entry to latest.json so Windows installs get auto-updates.
+# Builds and signs the Windows NSIS installer for a release that ALREADY EXISTS, attaches it, and
+# adds the `windows-x86_64` entry to latest.json so Windows installs get auto-updates.
 #
-# `scripts/release.sh` on Fedora creates the GitHub release and its .rpm. Publishing it fires this
-# workflow automatically — a few minutes later the Windows assets appear on the same release. Nobody
-# boots Windows. The Linux AppImage is built the same way, by linux-release.yml.
+# `scripts/release.sh` creates the GitHub release and dispatches this workflow. A few minutes later
+# the signed installer appears on the same release. Nobody boots Windows. The Linux AppImage and
+# macOS app are built the same way, by their own workflows.
 #
 # It can also be run by hand against an older tag to backfill:
 #   Actions ▸ Windows release binaries ▸ Run workflow ▸ tag = v0.1.4
@@ -77,7 +77,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       # Actions are pinned to commit SHAs, not tags: `@v4` and `@v2` are mutable refs. This job
-      # holds TAURI_SIGNING_PRIVATE_KEY and produces the installers users auto-update to, so
+      # holds TAURI_SIGNING_PRIVATE_KEY and produces the installer users auto-update to, so
       # nothing in it should be able to change under us. To bump one: read the SHA off the action's
       # release, update the pin and the trailing version comment together.
       # persist-credentials: false, because nothing after this step uses git and there is no reason to
@@ -327,7 +327,7 @@ jobs:
             echo "::warning::LASTFM_API_KEY / LASTFM_API_SECRET secrets not set — this Windows build ships without Last.fm scrobbling"
           fi
 
-      - name: Build + sign the installers
+      - name: Build + sign the NSIS installer
         shell: bash
         env:
           # Scoped to this step only — no other step (or third-party action) sees the signing key.
@@ -338,7 +338,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is not set — the build would produce unsignable installers"
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is not set — the build would produce an unsignable installer"
             exit 1
           fi
 
@@ -347,10 +347,7 @@ jobs:
           # beforeBuildCommand emptied: we just ran it. Left on, tauri runs `pnpm build` from the
           # repo root, which has no package.json, so pnpm's choice between ui/ and website/ is down
           # to the filesystem — it resolves to ui here and to website on Linux. Working by accident.
-          # A release candidate builds the NSIS installer only. The updater never uses the MSI, and
-          # WiX refuses a version whose prerelease suffix isn't numeric, which -rc.1 isn't.
-          BUNDLES=(); [ "$PRERELEASE" = false ] || BUNDLES=(--bundles nsis)
-          tauri build "${BUNDLES[@]}" --config '{"build":{"beforeBuildCommand":""}}'   # → target/release/bundle/{nsis,msi}/
+          tauri build --bundles nsis --config '{"build":{"beforeBuildCommand":""}}'   # → target/release/bundle/nsis/
 
       # Every load-time import is a DLL each user needs just to start the app, karaoke or not, and
       # auto-update delivers this exe to everyone. It must import exactly the allow-list (the
@@ -380,7 +377,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Attach installers + teach latest.json about Windows
+      - name: Attach the installer + teach latest.json about Windows
         if: ${{ !inputs.dry_run }}
         shell: bash
         env:
@@ -390,7 +387,7 @@ jobs:
           TAG="${{ steps.rel.outputs.tag }}"
 
           # Every GitHub API call below goes through this. Without it a single transient failure
-          # anywhere in this step aborts the job with the installers already uploaded and
+          # anywhere in this step aborts the job with the installer already uploaded and
           # latest.json un-merged, so Windows installs are never offered the update, and nothing
           # says so. All calls are idempotent (`--clobber` on upload, read-only download), so
           # retrying is safe.
@@ -466,7 +463,6 @@ jobs:
 
           EXE="target/release/bundle/nsis/limusic_${VERSION}_x64-setup.exe"
           SIG="$EXE.sig"
-          MSI="$(ls target/release/bundle/msi/limusic_${VERSION}_*.msi 2>/dev/null | head -1 || true)"
 
           if [ ! -f "$EXE" ]; then
             echo "::error::expected installer not found: $EXE"; find target/release/bundle -maxdepth 2; exit 1
@@ -475,7 +471,7 @@ jobs:
             echo "::error::no .sig next to the installer — signing key missing, or createUpdaterArtifacts got turned off"; exit 1
           fi
 
-          retry 5 upload "$EXE" "$SIG" ${MSI:+"$MSI"}
+          retry 5 upload "$EXE" "$SIG"
 
           # latest.json is the one thing both release workflows write, and they now run in parallel.
           # There is no compare-and-swap on release assets, so: merge, upload, read back, and retry

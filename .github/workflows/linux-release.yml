@@ -1,8 +1,8 @@
 name: Linux release binaries
 
-# Builds and signs the Linux AppImage and builds the .deb for a release that ALREADY EXISTS,
-# attaches both, adds the `linux-x86_64` entry to latest.json, and marks the release "Latest" if
-# Windows and macOS are already in it (see the end of the upload step).
+# Builds and signs the Linux AppImage for a release that ALREADY EXISTS, attaches it, adds the
+# `linux-x86_64` entry to latest.json, and marks the release "Latest" if Windows and macOS are
+# already in it (see the end of the upload step).
 #
 # WHY THIS EXISTS: an AppImage bundles the *build host's* system libraries but cannot bundle glibc,
 # so it inherits the build host's glibc floor. Built on Fedora (glibc 2.43) the 0.2.9 AppImage
@@ -19,18 +19,9 @@ name: Linux release binaries
 # fix. The "Check the glibc floor" step below fails the build if someone does it anyway.
 #
 # Two jobs, because a container job has no docker: `build` compiles, bundles, signs and runs the
-# static checks inside bookworm, then hands the bundle over as an artifact. `publish` runs on the
-# plain runner, starts the extracted AppImage on foreign distros in docker, installs the deb, and
-# attaches everything to the release. The signing key never leaves `build`.
-#
-# The .deb is here for exactly the same reason, and needs it more. Tauri writes a deb's Depends
-# verbatim from tauri.conf.json and never runs dpkg-shlibdeps, so nothing in the package records a
-# glibc floor at all: a Fedora-built deb installs cleanly on Debian and then dies at startup on a
-# missing GLIBC symbol. Built here it matches the AppImage's 2.36, which is what the hand-written
-# `libc6 (>= 2.36)` in tauri.conf.json claims.
-#
-# scripts/release.sh (run on Fedora) still builds and publishes the .rpm — an rpm links against the
-# host's system libs, so Fedora is the correct place to build it.
+# static checks inside bookworm, then hands the AppImage over as an artifact. `publish` runs on the
+# plain runner, starts the extracted AppImage on foreign distros in docker, and attaches it to the
+# release. The signing key never leaves `build`.
 #
 # It can also be run by hand against an older tag to backfill:
 #   Actions ▸ Linux release binaries ▸ Run workflow ▸ tag = v0.2.9
@@ -50,7 +41,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build the Linux AppImage + deb for (e.g. v0.2.9)
+        description: Existing release tag to build the Linux AppImage for (e.g. v0.2.9)
         required: true
         type: string
       dry_run:
@@ -243,7 +234,7 @@ jobs:
             echo "::warning::LASTFM_API_KEY / LASTFM_API_SECRET secrets not set — this Linux build ships without Last.fm scrobbling"
           fi
 
-      - name: Build + sign the AppImage, build the deb
+      - name: Build + sign the AppImage
         env:
           # Scoped to this step only — no other step (or third-party action) sees the signing key.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -265,10 +256,7 @@ jobs:
           # frontend packages (ui/, website/) pnpm picks is up to the filesystem: Windows resolved
           # it to ui, Linux to website, whose deps this job never installs. It only works locally
           # because you run it from ui/.
-          # A release candidate builds only what the updater installs. The beta channel is its whole
-          # audience, and a deb install can't take an update from it anyway.
-          BUNDLES=appimage,deb; [ "$PRERELEASE" = false ] || BUNDLES=appimage
-          tauri build --bundles "$BUNDLES" --config '{"build":{"beforeBuildCommand":""}}'
+          tauri build --bundles appimage --config '{"build":{"beforeBuildCommand":""}}'
           # Strip the bundled TLS trust stack + gio modules out of the AppDir and repack: they are
           # coupled to the build host's config and leave the webview with no TLS backend anywhere
           # else. Repacking invalidates the bundler's signature, so the script re-signs — which is
@@ -338,9 +326,9 @@ jobs:
             exit 1
           fi
 
-      # Handed to `publish` as built: the signed AppImage, its .sig and the deb. The AppDir is not
-      # sent, `publish` extracts it from the AppImage, so the foreign-distro check runs on exactly
-      # what users download. One day, like the dry-run artifact: it is a public repository.
+      # Handed to `publish` as built: the signed AppImage and its .sig. The AppDir is not sent;
+      # `publish` extracts it from the AppImage, so the foreign-distro check runs on exactly what
+      # users download. One day, like the dry-run artifact: it is a public repository.
       - name: Hand the bundle to the publish job
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -348,7 +336,6 @@ jobs:
           path: |
             target/release/bundle/appimage/*.AppImage
             target/release/bundle/appimage/*.AppImage.sig
-            target/release/bundle/deb/*.deb
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
@@ -447,36 +434,6 @@ jobs:
 
           [ "$fail" = 0 ] || { echo "::error::the AppDir failed a foreign-distro check"; exit 1; }
 
-      # The .deb gets no dependency detection whatsoever: Tauri copies Depends straight out of
-      # tauri.conf.json and never runs dpkg-shlibdeps, so a library the binary links but the config
-      # forgets installs perfectly and then fails at startup. dpkg is the only thing that can tell
-      # us that list is right, so let it: install the real package on the oldest release the floor
-      # claims to support and resolve every DT_NEEDED against whatever apt pulled in. This catches a
-      # too-new glibc too, since ldd reports a missing GLIBC_x.yz the same way.
-      # continue-on-error, and the attach step below skips the upload if this failed. The AppImage
-      # is how every Linux user gets updates; the deb is a convenience. A broken deb must not take
-      # the release down with it, so a failure here costs the deb and nothing else.
-      - name: Verify the .deb installs and resolves its libraries
-        id: deb_check
-        if: ${{ env.PRERELEASE == 'false' }}
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          DEB="$(ls target/release/bundle/deb/limusic_${VERSION}_*.deb | head -1)"
-          docker run --rm -v "$PWD/$DEB:/limusic.deb:ro" debian:bookworm bash -c '
-            set -eu
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
-            apt-get install -y --no-install-recommends /limusic.deb
-            BIN="$(dpkg -L limusic | grep "^/usr/bin/" | head -1)"
-            echo "installed $BIN, declared: $(dpkg-query -f "\${Depends}" -W limusic)"
-            if ldd "$BIN" | grep "not found"; then
-              echo "the deb declares nothing that provides the libraries above"
-              exit 1
-            fi
-            echo "every library the binary needs came from the declared Depends"
-          '
-
       - name: Dry run — built and verified, attaching nothing
         if: ${{ inputs.dry_run }}
         run: echo "dry_run - every build step and guard passed; release assets left untouched."
@@ -498,7 +455,7 @@ jobs:
           # Already squashfs: zipping it again buys nothing and costs a minute.
           compression-level: 0
 
-      - name: Attach the AppImage + deb, teach latest.json about Linux
+      - name: Attach the AppImage, teach latest.json about Linux
         if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -592,21 +549,6 @@ jobs:
           fi
 
           retry 5 upload "$APPIMAGE" "$SIG"
-
-          # The deb rides along unsigned and stays out of latest.json: Tauri's updater has no deb
-          # support, so there is nothing for a signature to be checked by. Debian users update by
-          # downloading the next one. Skipped entirely if it failed its check, which is a warning
-          # rather than an error: the release is complete without it.
-          DEB="$(ls target/release/bundle/deb/limusic_${VERSION}_*.deb 2>/dev/null | head -1 || true)"
-          if [ "$PRERELEASE" = true ]; then
-            echo "release candidate: no deb"
-          elif [ "${{ steps.deb_check.outcome }}" != "success" ]; then
-            echo "::warning::the deb failed its install check and was NOT attached — fix bundle.linux.deb.depends and re-dispatch"
-          elif [ -z "$DEB" ]; then
-            echo "::warning::no deb for $VERSION in target/release/bundle/deb — nothing attached"
-          else
-            retry 3 upload "$DEB"
-          fi
 
           # latest.json is the one thing both release workflows write, and they now run in parallel.
           # There is no compare-and-swap on release assets, so: merge, upload, read back, and retry

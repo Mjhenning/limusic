@@ -1,23 +1,13 @@
 #!/usr/bin/env bash
-# Cut a signed release: publish the tag with an empty updater manifest, start the three CI builds,
-# build the .rpm locally while they run, then wait and verify the whole thing landed.
+# Cut a signed release: publish the tag with an empty updater manifest, dispatch the three CI
+# builds, then wait and verify the self-updating artifacts landed. Nothing is built locally.
 #
-# ORDER MATTERS. The release is created and every workflow is dispatched BEFORE the local rpm
-# build, not after: CI's ~15 minutes and this machine's ~5 minutes then overlap instead of queueing.
-# The rpm is uploaded to the already-published release afterwards. The cost of that ordering is that
-# a failed rpm build leaves a published release with no rpm on it, recoverable with one
-# `gh release upload`, and the script tells you the exact command if it happens.
-#
-# Neither the AppImage nor the .deb is built here, and for the same reason: both inherit their
-# build host's glibc floor, and this machine is Fedora (the newest glibc in existence), so one built
-# here starts nowhere else. The deb is the worse of the two, because Tauri writes its Depends
-# verbatim from tauri.conf.json and never emits a libc6 constraint: a Fedora-built deb installs
-# cleanly on Debian and then dies at startup on a missing GLIBC symbol. Both are built by
-# .github/workflows/linux-release.yml in a pinned debian:bookworm container, which also attaches them,
-# adds the linux-x86_64 entry to latest.json and marks the release "Latest". Windows and macOS do
-# the same for their own entries. So this script publishes the release NOT-latest on purpose: until
-# CI has attached the binaries, the updater endpoint (.../releases/latest/download/latest.json)
-# keeps resolving to the previous, complete manifest instead of one with no platforms in it.
+# Each CI workflow attaches its signed artifact and merges its own entry into latest.json:
+# .github/workflows/linux-release.yml builds the AppImage in a pinned debian:bookworm container,
+# windows-release.yml builds the NSIS installer, and macos-release.yml builds the app tarball and
+# dmg. This script publishes the release NOT-latest on purpose: until all three have attached their
+# binaries, the updater endpoint (.../releases/latest/download/latest.json) keeps resolving to the
+# previous, complete manifest instead of one with no platforms in it.
 #
 # Usage:  scripts/release.sh ["release notes"]
 # Bump "version" in src-tauri/tauri.conf.json AND Cargo.toml BEFORE running (tauri.conf.json is the
@@ -52,7 +42,7 @@ VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
 [ "$VERSION" != "null" ] && [ -n "$VERSION" ] || die "no version in tauri.conf.json"
 TAG="v$VERSION"
 # A version with a `-` (1.1.0-rc.1) is a release candidate: published as a prerelease, never
-# Latest, no rpm, and reaching only installs on the beta channel (RELEASING.md §8).
+# Latest, and reaching only installs on the beta channel.
 RC=0; [[ "$VERSION" != *-* ]] || RC=1
 echo "==> Releasing $TAG$([ "$RC" = 0 ] || echo " (release candidate, beta channel only)")"
 
@@ -73,8 +63,7 @@ CARGO_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
 [ "$CARGO_VERSION" = "$VERSION" ] \
   || die "Cargo.toml says $CARGO_VERSION but src-tauri/tauri.conf.json says $VERSION. Bump both"
 
-# The rpm is built from this working tree; the tag is cut from remote master. Anything uncommitted
-# means the shipped rpm and the source the tag names are different code.
+# CI builds from the tag cut off remote master. Anything uncommitted here is not in that build.
 git diff --quiet && git diff --cached --quiet \
   || die "uncommitted changes to tracked files. Commit or stash them first"
 
@@ -188,8 +177,7 @@ BEFORE_MAC="$(latest_run "macOS release binaries")"
 # release-triggered run executes on the tag ref, so it could never reuse the previous release's
 # cache — Windows recompiled all of Rust from scratch every time, 11m25s of a 15m run. Dispatching
 # from master shares one cache across releases. All three workflows check out $TAG regardless, so
-# the binaries still come from the tagged source. They also run in parallel with each other, and now
-# with the local rpm build below as well.
+# the binaries still come from the tagged source. They run in parallel with each other.
 echo "==> Dispatching the build workflows…"
 gh workflow run "Linux release binaries"   --repo "$REPO" --ref master -f tag="$TAG"
 gh workflow run "Windows release binaries" --repo "$REPO" --ref master -f tag="$TAG"
@@ -199,39 +187,6 @@ RUN_LINUX="$(wait_for_run "Linux release binaries" "$BEFORE_LINUX" || true)"
 RUN_WIN="$(wait_for_run "Windows release binaries" "$BEFORE_WIN" || true)"
 RUN_MAC="$(wait_for_run "macOS release binaries" "$BEFORE_MAC" || true)"
 echo "    linux run ${RUN_LINUX:-?}, windows run ${RUN_WIN:-?}, macos run ${RUN_MAC:-?}"
-
-# No rpm for a release candidate: an rpm install can't take an update, so it can't be on the beta
-# channel, and the RC's only audience is the beta channel.
-if [ "$RC" = 1 ]; then
-  echo "==> Release candidate: no rpm"
-else
-  echo "==> Building the rpm locally while CI runs…"
-  if ! cargo tauri build --bundles rpm; then
-    echo >&2
-    echo "ERROR: the rpm build failed, but $TAG is already published and CI is building the rest." >&2
-    echo "       Fix it, then attach the rpm by hand:" >&2
-    echo "         cargo tauri build --bundles rpm" >&2
-    echo "         gh release upload $TAG target/release/bundle/rpm/limusic-$VERSION-*.rpm --clobber --repo $REPO" >&2
-    exit 1
-  fi
-
-  # Pin to $VERSION — a stale bundle from a previous build otherwise sorts first and gets shipped
-  # (e.g. an old 0.1.1 rpm uploaded to the 0.1.2 release).
-  RPM="$(ls target/release/bundle/rpm/limusic-${VERSION}-*.rpm 2>/dev/null | head -1)"
-  [ -n "$RPM" ] || die "no rpm for $VERSION in target/release/bundle/rpm"
-  # The rpm requires only what tauri.conf.json lists, and the binary links OpenSSL by soname (reqwest's
-  # native-tls, switched on by rustypipe-botguard). Fedora 45 moved libssl.so.3 out of the default
-  # install, so an rpm that doesn't ask for it installs and then can't start (#707). A build host on
-  # OpenSSL 4 links .so.4 and makes the list in tauri.conf.json wrong: stop before that ships.
-  for so in $(readelf -d target/release/limusic-app | sed -n 's/.*\[\(lib\(ssl\|crypto\)\.so\.[0-9]*\)\]/\1/p'); do
-    rpm -qpR "$RPM" | grep -qxF "$so()(64bit)" || die "the binary links $so but $(basename "$RPM") \
-doesn't require it. Fix bundle.linux.rpm.depends in src-tauri/tauri.conf.json, rebuild with
-  cargo tauri build --bundles rpm
-and attach it by hand: gh release upload $TAG $RPM --clobber --repo $REPO"
-  done
-  gh release upload "$TAG" "$RPM" --clobber --repo "$REPO"
-  echo "    attached $(basename "$RPM")"
-fi
 
 # ---------------------------------------------------------------------------
 # Wait for CI and check the release is actually complete. Without this the
@@ -273,8 +228,8 @@ if [ "$OK" = 1 ] && [ "$CI_OK" = 1 ] && [ "$RC" = 1 ]; then
   echo "==> $TAG is live on the beta channel: AppImage + Windows installer + macOS app, all three"
   echo "    platforms in the beta manifest. Stable installs are not offered it."
 elif [ "$OK" = 1 ] && [ "$CI_OK" = 1 ]; then
-  echo "==> $TAG is live and complete: rpm + deb + AppImage + Windows installers + macOS dmg, all"
-  echo "    three platforms in latest.json, marked Latest. Installed users will be prompted."
+  echo "==> $TAG is live and complete: NSIS + AppImage + macOS app/dmg, all three platforms in"
+  echo "    latest.json, marked Latest. Installed users will be prompted."
 else
   echo >&2
   echo "==> $TAG IS PUBLISHED BUT INCOMPLETE. Check what failed, then re-dispatch that workflow:" >&2
