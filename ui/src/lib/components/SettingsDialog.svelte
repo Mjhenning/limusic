@@ -43,7 +43,6 @@
 	import { lt } from '$lib/lt.svelte';
 	import AppearanceSettings from '$lib/components/AppearanceSettings.svelte';
 	import Changelog from '$lib/components/Changelog.svelte';
-	import DiscordSettings from '$lib/components/DiscordSettings.svelte';
 	import ExperimentalBadge from '$lib/components/ExperimentalBadge.svelte';
 	import { KARAOKE_TIERS, tierMB } from '$lib/karaoke-tiers';
 	import ScrobbleSettings from '$lib/components/ScrobbleSettings.svelte';
@@ -80,7 +79,6 @@
 			? [{ id: 'contributing' as const, label: t('settings.tabs.contributing'), hint: t('settings.tabs.contributing_hint'), icon: PencilEdit02Icon }]
 			: []),
 		{ id: 'hotkeys', label: t('settings.tabs.hotkeys'), hint: t('settings.tabs.hotkeys_hint'), icon: KeyboardIcon },
-		{ id: 'discord', label: t('settings.tabs.discord'), hint: t('settings.tabs.discord_hint'), icon: DiscordIcon },
 		{ id: 'scrobbling', label: t('settings.tabs.scrobbling'), hint: t('settings.tabs.scrobbling_hint'), icon: LastFmIcon },
 		{ id: 'integrations', label: t('settings.tabs.integrations'), hint: t('settings.tabs.integrations_hint'), icon: LinkSquare02Icon },
 		{ id: 'devices', label: t('settings.tabs.devices'), hint: t('settings.tabs.devices_hint'), icon: ComputerPhoneSyncIcon },
@@ -791,7 +789,7 @@
 {/snippet}
 
 <Dialog.Root bind:open={ui.settingsOpen}>
-	<!-- The Discord, Scrobbling and Appearance tabs put their live preview *beside* the controls rather than
+	<!-- The Integrations, Scrobbling and Appearance tabs put their live preview *beside* the controls rather than
 	     under them, so they need the extra width; every other tab reads better narrow. Deliberately not animated:
 	     transitioning the width relayouts the whole modal every frame, and WebKitGTK is the webview
 	     that would pay for it. -->
@@ -804,7 +802,7 @@
 				query = '';
 			}
 		}}
-		class="gap-0 overflow-hidden p-0 {tab === 'discord' || tab === 'scrobbling' || tab === 'themes' ? 'sm:max-w-5xl' : tab === 'hotkeys' ? 'sm:max-w-4xl' : 'sm:max-w-3xl'}"
+		class="gap-0 overflow-hidden p-0 {tab === 'integrations' || tab === 'scrobbling' || tab === 'themes' ? 'sm:max-w-5xl' : tab === 'hotkeys' ? 'sm:max-w-4xl' : 'sm:max-w-3xl'}"
 	>
 		<Dialog.Description class="sr-only">{t('settings.title')}</Dialog.Description>
 
@@ -924,12 +922,10 @@
 				<!-- Hidden, not unmounted, while a search shows: Esc brings the tab back as it was, an
 				     unsaved edit in it included. -->
 				<div class={searching ? 'hidden' : 'contents'}>
-				{#if loaded && tab === 'discord'}
-					<DiscordSettings {settings} />
-				{:else if loaded && tab === 'scrobbling'}
+				{#if loaded && tab === 'scrobbling'}
 					<ScrobbleSettings {settings} />
 				{:else if tab === 'integrations'}
-					<IntegrationsSettings />
+					<IntegrationsSettings {settings} />
 				{:else if tab === 'devices'}
 					<DevicesSettings />
 				{:else if tab === 'themes'}

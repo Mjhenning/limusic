@@ -39,6 +39,12 @@ export async function setIntegrationEnabled(
 }
 
 export async function setDiscordEnabled(on: boolean): Promise<void> {
-	await api.setSetting('discord_rpc', on ? 'true' : 'false');
+	const before = prefs.discordRpc;
 	prefs.discordRpc = on;
+	try {
+		await api.setSetting('discord_rpc', on ? 'true' : 'false');
+	} catch (e) {
+		prefs.discordRpc = before;
+		throw e;
+	}
 }

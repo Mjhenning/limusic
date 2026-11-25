@@ -568,7 +568,7 @@
 			"scrobbling": "Scrobbling",
 			"scrobbling_hint": "What scrobbling sends, and when a play counts.",
 			"integrations": "Integrations",
-			"integrations_hint": "Local control API and OBS Tuna output.",
+			"integrations_hint": "Discord Rich Presence, local control API and OBS Tuna output.",
 			"devices": "Devices",
 			"devices_hint": "Control this desktop from Limusic on your phone.",
 			"themes": "Appearance",

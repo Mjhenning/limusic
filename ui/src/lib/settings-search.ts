@@ -15,7 +15,6 @@ export type SettingsTab =
 	| 'playback'
 	| 'contributing'
 	| 'hotkeys'
-	| 'discord'
 	| 'scrobbling'
 	| 'integrations'
 	| 'devices'
@@ -42,7 +41,6 @@ const TABLE: [SettingsTab, K | null, Row[]][] = [
 	['playback', null, [['settings.tabs.playback', 'settings.tabs.playback_hint']]],
 	['contributing', null, [['settings.tabs.contributing', 'settings.tabs.contributing_hint']]],
 	['hotkeys', null, [['settings.tabs.hotkeys', 'settings.tabs.hotkeys_hint']]],
-	['discord', null, [['settings.tabs.discord', 'settings.tabs.discord_hint']]],
 	['scrobbling', null, [['settings.tabs.scrobbling', 'settings.tabs.scrobbling_hint']]],
 	['integrations', null, [['settings.tabs.integrations', 'settings.tabs.integrations_hint']]],
 	['devices', null, [['settings.tabs.devices', 'settings.tabs.devices_hint']]],
@@ -182,49 +180,60 @@ const TABLE: [SettingsTab, K | null, Row[]][] = [
 	['hotkeys', null, [['settings.hotkeys.enable', 'settings.hotkeys.description']]],
 
 	[
-		'discord',
-		null,
+		'integrations',
+		'settings.tabs.discord',
 		[
 			['settings.discord.enable', 'settings.discord.enable_hint'],
-			['settings.discord.show_paused', 'settings.discord.show_paused_hint'],
-			['settings.discord.hide_details', 'settings.discord.hide_details_hint']
+			[
+				'settings.discord.show_paused',
+				'settings.discord.show_paused_hint',
+				'settings.discord.enable'
+			],
+			[
+				'settings.discord.hide_details',
+				'settings.discord.hide_details_hint',
+				'settings.discord.enable'
+			]
 		]
 	],
-	// Everything below is gone under "Hide details": no `under`, since the hint would have to say
-	// "off". The search lands on the tab, where that switch is the third row.
+	// Every remaining row is folded behind Discord's enable switch. Rows also hidden by
+	// "Hide details" or "Cover" still land on that one visible switch.
 	[
-		'discord',
+		'integrations',
 		'settings.sections.discord_status',
 		[
-			['settings.discord.status_line', 'settings.discord.status_line_hint'],
-			['settings.discord.app_name', 'settings.discord.app_name_hint']
+			['settings.discord.status_line', 'settings.discord.status_line_hint', 'settings.discord.enable'],
+			['settings.discord.app_name', 'settings.discord.app_name_hint', 'settings.discord.enable']
 		]
 	],
 	[
-		'discord',
+		'integrations',
 		'settings.sections.discord_card',
 		[
-			['settings.discord.line1', 'settings.discord.line1_hint'],
-			['settings.discord.line2', 'settings.discord.line2_hint'],
-			['settings.discord.cover', 'settings.discord.cover_hint'],
-			['settings.discord.badge', 'settings.discord.badge_hint', 'settings.discord.cover'],
-			['settings.discord.line3', 'settings.discord.line3_hint', 'settings.discord.cover'],
-			['settings.discord.timestamps', 'settings.discord.timestamps_hint']
+			['settings.discord.line1', 'settings.discord.line1_hint', 'settings.discord.enable'],
+			['settings.discord.line2', 'settings.discord.line2_hint', 'settings.discord.enable'],
+			['settings.discord.cover', 'settings.discord.cover_hint', 'settings.discord.enable'],
+			['settings.discord.badge', 'settings.discord.badge_hint', 'settings.discord.enable'],
+			['settings.discord.line3', 'settings.discord.line3_hint', 'settings.discord.enable'],
+			['settings.discord.timestamps', 'settings.discord.timestamps_hint', 'settings.discord.enable']
 		]
 	],
 	[
-		'discord',
+		'integrations',
 		'settings.sections.discord_links',
 		[
-			['settings.discord.link_line1'],
-			['settings.discord.link_line2'],
-			['settings.discord.link_cover', undefined, 'settings.discord.cover']
+			['settings.discord.link_line1', undefined, 'settings.discord.enable'],
+			['settings.discord.link_line2', undefined, 'settings.discord.enable'],
+			['settings.discord.link_cover', undefined, 'settings.discord.enable']
 		]
 	],
 	[
-		'discord',
+		'integrations',
 		'settings.sections.discord_buttons',
-		[['settings.discord.button1'], ['settings.discord.button2']]
+		[
+			['settings.discord.button1', undefined, 'settings.discord.enable'],
+			['settings.discord.button2', undefined, 'settings.discord.enable']
+		]
 	],
 
 	[

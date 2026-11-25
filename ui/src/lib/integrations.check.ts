@@ -31,10 +31,14 @@ function rustFiles(dir: string): string[] {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const component = join(here, 'components', 'IntegrationsSettings.svelte');
+const discord = join(here, 'components', 'DiscordSettings.svelte');
+const dialog = join(here, 'components', 'SettingsDialog.svelte');
 const store = join(here, 'integrations.svelte.ts');
 const root = join(here, '..', '..', '..');
 const files = [
 	component,
+	discord,
+	dialog,
 	store,
 	join(here, 'api.ts'),
 	join(root, 'src-tauri', 'src', 'commands.rs'),
@@ -93,6 +97,53 @@ for (const [title, parent] of folded) {
 	ok(
 		SETTINGS.some((e) => e.tab === 'integrations' && e.title === title && e.under === parent),
 		`${title} is indexed under ${parent}`
+	);
+}
+
+// --- Discord lives in Integrations ------------------------------------------------------------
+const dialogSource = readFileSync(dialog, 'utf8');
+const discordSource = readFileSync(discord, 'utf8');
+ok(!dialogSource.includes('DiscordSettings'), 'SettingsDialog no longer renders a Discord tab');
+ok(!dialogSource.includes("id: 'discord'"), 'the Discord tab is gone from the tab rail');
+ok(ui.includes("import DiscordSettings from '$lib/components/DiscordSettings.svelte';"), 'Integrations imports Discord');
+ok(ui.includes('<DiscordSettings settings={appSettings} />'), 'Integrations renders Discord with the app settings');
+ok(!SETTINGS.some((e) => e.tab === 'discord'), 'settings search has no removed Discord tab');
+
+const discordEnableRow = "title: t('settings.discord.enable')";
+const discordFold = discordSource.indexOf('{#if enabled}');
+ok(discordFold > discordSource.indexOf(discordEnableRow), 'Discord details follow the enable row');
+ok(
+	discordSource.indexOf('data-settings-aside') > discordFold,
+	'the live preview is folded with Discord'
+);
+ok(
+	discordSource.indexOf("title: t('settings.discord.show_paused')") > discordFold,
+	'the card options are folded with Discord'
+);
+
+const discordRows = [
+	'settings.discord.show_paused',
+	'settings.discord.hide_details',
+	'settings.discord.status_line',
+	'settings.discord.app_name',
+	'settings.discord.line1',
+	'settings.discord.line2',
+	'settings.discord.cover',
+	'settings.discord.badge',
+	'settings.discord.line3',
+	'settings.discord.timestamps',
+	'settings.discord.link_line1',
+	'settings.discord.link_line2',
+	'settings.discord.link_cover',
+	'settings.discord.button1',
+	'settings.discord.button2'
+];
+for (const title of discordRows) {
+	ok(
+		SETTINGS.some(
+			(e) => e.tab === 'integrations' && e.title === title && e.under === 'settings.discord.enable'
+		),
+		`${title} is indexed under Discord's enable switch`
 	);
 }
 

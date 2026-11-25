@@ -9,6 +9,7 @@
 	import { Switch } from '$lib/components/ui/switch';
 	import * as Select from '$lib/components/ui/select';
 	import * as api from '$lib/api';
+	import DiscordSettings from '$lib/components/DiscordSettings.svelte';
 	import { copyText } from '$lib/clipboard';
 	import { integrations, syncIntegrations } from '$lib/integrations.svelte';
 	import { toast, ui } from '$lib/player.svelte';
@@ -18,6 +19,8 @@
 	const LABEL =
 		'mb-2 px-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground';
 	const CARD = 'divide-y divide-border/60 overflow-hidden rounded-xl border bg-card';
+
+	let { settings: appSettings }: { settings: Record<string, string> } = $props();
 
 	let settings = $state<api.IntegrationSettings | null>(null);
 	let status = $state<api.IntegrationStatus | null>(null);
@@ -323,6 +326,11 @@
 				})}
 			{/if}
 		</div>
+	</section>
+
+	<section class={GROUP}>
+		<h3 class={LABEL}>{t('settings.tabs.discord')}</h3>
+		<DiscordSettings settings={appSettings} />
 	</section>
 </div>
 

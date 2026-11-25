@@ -1,7 +1,7 @@
 <script lang="ts">
-	// The Discord tab: every Rich Presence control, with a live mock of the card beside them. The
-	// options are abstract on their own, so the preview is not decoration — it is how you tell what
-	// "line 2 shows the artist and album" actually does to your profile.
+	// The Discord section inside Integrations: every Rich Presence control, with a live mock of the
+	// card beside them. The options are abstract on their own, so the preview is not decoration — it
+	// is how you tell what "line 2 shows the artist and album" actually does to your profile.
 	//
 	// Saving is optimistic and debounced: the preview follows the switch instantly, the blob reaches
 	// SQLite once typing stops, and the presence thread re-pushes the card at once from there
@@ -15,7 +15,8 @@
 	import { Switch } from '$lib/components/ui/switch';
 	import * as Select from '$lib/components/ui/select';
 	import * as api from '$lib/api';
-	import { playback, prefs, toast } from '$lib/player.svelte';
+	import { discordEnabled, setDiscordEnabled } from '$lib/integrations.svelte';
+	import { playback, toast } from '$lib/player.svelte';
 	import { t } from '$lib/i18n.svelte';
 	import {
 		DISCORD_DEFAULTS,
@@ -32,9 +33,9 @@
 		'mb-2 px-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground';
 	const CARD = 'divide-y divide-border/60 overflow-hidden rounded-xl border bg-card';
 
-	// `prefs`, not the local `settings` record: the titlebar has its own Discord button, and two
-	// copies of the same flag meant toggling one left the other's indicator stale.
-	const enabled = $derived(prefs.discordRpc);
+	// The shared store, not the local `settings` record: the titlebar has its own Discord button, and
+	// two copies of the same flag meant toggling one left the other's indicator stale.
+	const enabled = $derived(discordEnabled);
 	// Seeded once from the record the modal already loaded, then owned here. Reading it in a
 	// $derived instead would fight the user: every keystroke would be overwritten by the last saved
 	// blob until the debounce landed.
@@ -56,12 +57,12 @@
 	}
 
 	async function setEnabled(on: boolean) {
-		prefs.discordRpc = on;
+		const before = settings.discord_rpc;
 		settings.discord_rpc = on ? 'true' : 'false';
 		try {
-			await api.setSetting('discord_rpc', settings.discord_rpc);
+			await setDiscordEnabled(on);
 		} catch (e) {
-			prefs.discordRpc = !on;
+			settings.discord_rpc = before;
 			toast.error(String(e));
 		}
 	}
@@ -171,36 +172,38 @@
 	</Select.Root>
 {/snippet}
 
-<!-- Options scroll, the preview does not. Side by side from `lg` up (where the modal is wide
-     enough for both), stacked below it — under `lg` the dialog is viewport-width and a column of
-     controls 200px wide is worse than scrolling past the card. -->
-<div class="flex min-h-0 flex-1 max-lg:flex-col">
-	<div class="min-w-0 flex-1 overflow-y-auto px-6 py-5">
-		<section class={GROUP}>
-			<div data-settings-card class={CARD}>
-				{@render row_({
-					title: t('settings.discord.enable'),
-					desc: t('settings.discord.enable_hint'),
-					control: enableSwitch
-				})}
-				{@render row_({
-					title: t('settings.discord.show_paused'),
-					desc: t('settings.discord.show_paused_hint'),
-					control: pausedSwitch
-				})}
-				{@render row_({
-					title: t('settings.discord.hide_details'),
-					desc: t('settings.discord.hide_details_hint'),
-					control: hideDetailsSwitch
-				})}
-			</div>
-		</section>
+<!-- The enable row stays visible; everything that only shapes the card folds away with it. The
+     preview sits beside the controls on wide dialogs and under them otherwise. -->
+<section class={GROUP}>
+	<div data-settings-card class={CARD}>
+		{@render row_({
+			title: t('settings.discord.enable'),
+			desc: t('settings.discord.enable_hint'),
+			control: enableSwitch
+		})}
+	</div>
+</section>
 
-		<!-- Everything below only shapes the card, so it is dimmed while presence is off and gone
-		     entirely under "hide details", where none of it reaches Discord at all. Leaving dead
-		     controls on screen would be the more confusing choice. -->
-		{#if !cfg.hide_details}
-		<div class={enabled ? '' : 'opacity-60'}>
+{#if enabled}
+	<div class="flex flex-col gap-5 2xl:flex-row">
+		<div class="min-w-0 flex-1">
+			<section class={GROUP}>
+				<div data-settings-card class={CARD}>
+					{@render row_({
+						title: t('settings.discord.show_paused'),
+						desc: t('settings.discord.show_paused_hint'),
+						control: pausedSwitch
+					})}
+					{@render row_({
+						title: t('settings.discord.hide_details'),
+						desc: t('settings.discord.hide_details_hint'),
+						control: hideDetailsSwitch
+					})}
+				</div>
+			</section>
+
+			<!-- "Hide details" means none of these reach Discord, so drop them instead of dimming them. -->
+			{#if !cfg.hide_details}
 			<section class={GROUP}>
 				<h3 class={LABEL}>{t('settings.sections.discord_status')}</h3>
 				<div data-settings-card class={CARD}>
@@ -279,14 +282,13 @@
 					{@render row_({ title: t('settings.discord.button2'), control: button2Picker })}
 				</div>
 			</section>
-		</div>
 		{/if}
-	</div>
+		</div>
 
-	<aside
-		data-settings-aside
-		class="flex shrink-0 flex-col bg-muted/30 px-5 py-5 lg:w-[22rem] lg:border-l max-lg:border-t"
-	>
+		<aside
+			data-settings-aside
+			class="flex shrink-0 flex-col bg-muted/30 px-5 py-5 2xl:w-[20rem] 2xl:border-l 2xl:py-0 2xl:pl-5"
+		>
 		<div class="mb-2.5 flex items-center gap-2">
 			<h3 class="text-[11px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
 				{t('settings.discord.preview')}
@@ -306,15 +308,16 @@
 		<Button
 			variant="ghost"
 			size="sm"
-			class="mt-3 h-7 w-fit gap-1.5 px-2 text-xs lg:mt-auto"
+			class="mt-3 h-7 w-fit gap-1.5 px-2 text-xs 2xl:mt-auto"
 			disabled={isDefault}
 			onclick={reset}
 		>
 			<HugeiconsIcon icon={ArrowTurnBackwardIcon} class="h-3.5 w-3.5" />
 			{t('settings.discord.reset')}
 		</Button>
-	</aside>
-</div>
+		</aside>
+	</div>
+{/if}
 
 {#snippet enableSwitch()}<Switch checked={enabled} onCheckedChange={setEnabled} />{/snippet}
 {#snippet pausedSwitch()}<Switch
