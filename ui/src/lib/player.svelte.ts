@@ -298,8 +298,8 @@ export function openKaraokeSettings(): void {
  */
 export const prefs = $state({
 	musicVideos: false,
-	/** `discord_rpc`. Two places toggle it (the titlebar button and the Discord settings tab) and
-	 *  each drew its own indicator, so turning it off in one left the other stale. One owner. */
+	/** `discord_rpc`. The titlebar menu and the Integrations settings tab toggle the same flag, so
+	 *  the shared `integrations` store is the only owner outside the backend. */
 	discordRpc: false,
 	/** Linux: mpv draws the music video under the page (nativevideo.rs) instead of a `<video>`
 	 *  element. Cleared if it turns out there is no GL surface, which hands the picture back. */
@@ -1580,7 +1580,7 @@ export const ui = $state({
 	toast: null as Toast | null,
 	settingsOpen: false, // the settings modal
 	tempoPitchOpen: false, // playback effects stay open when the current track menu is replaced
-	settingsFocus: null as 'lyrics' | 'limusic' | 'scrobbling' | 'devices' | 'karaoke' | null, // a section to open settings on, once
+	settingsFocus: null as 'lyrics' | 'limusic' | 'scrobbling' | 'devices' | 'karaoke' | 'integrations' | null, // a section to open settings on, once
 	scrobbleTrack: null as SongItem | null, // "Edit scrobble" from a track menu: the track to edit
 	ltOpen: false, // the Listen Together modal
 	linkOpen: false, // the "open a pasted link" modal

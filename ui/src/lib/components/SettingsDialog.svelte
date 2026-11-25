@@ -137,7 +137,11 @@
 			query = '';
 			// Opened on a section from elsewhere (the lyrics source picker): its tab, scrolled to it
 			// once the tab has rendered. The Last.fm menu and "Edit scrobble" open a whole tab.
-			if (ui.settingsFocus === 'scrobbling' || ui.settingsFocus === 'devices') {
+			if (
+				ui.settingsFocus === 'scrobbling' ||
+				ui.settingsFocus === 'devices' ||
+				ui.settingsFocus === 'integrations'
+			) {
 				tab = ui.settingsFocus;
 				ui.settingsFocus = null;
 				load();

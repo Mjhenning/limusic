@@ -32,12 +32,14 @@ function rustFiles(dir: string): string[] {
 const here = dirname(fileURLToPath(import.meta.url));
 const component = join(here, 'components', 'IntegrationsSettings.svelte');
 const discord = join(here, 'components', 'DiscordSettings.svelte');
+const titlebar = join(here, 'components', 'Titlebar.svelte');
 const dialog = join(here, 'components', 'SettingsDialog.svelte');
 const store = join(here, 'integrations.svelte.ts');
 const root = join(here, '..', '..', '..');
 const files = [
 	component,
 	discord,
+	titlebar,
 	dialog,
 	store,
 	join(here, 'api.ts'),
@@ -145,6 +147,44 @@ for (const title of discordRows) {
 		),
 		`${title} is indexed under Discord's enable switch`
 	);
+}
+
+// --- titlebar integrations menu ---------------------------------------------------------------
+const titlebarSource = readFileSync(titlebar, 'utf8');
+ok(!titlebarSource.includes('toggleDiscord'), 'the direct Discord button is gone');
+ok(!titlebarSource.includes('prefs.discordRpc'), 'the titlebar no longer owns the Discord flag');
+ok(titlebarSource.includes('openIntegrationMenu'), 'the integrations menu has an opener');
+ok(titlebarSource.includes('loadIntegrations'), 'the menu refreshes the shared store');
+for (const kind of ['discord', 'control', 'tuna']) {
+	ok(titlebarSource.includes(`toggleIntegration('${kind}')`), `the menu toggles ${kind}`);
+}
+ok(
+	(titlebarSource.match(/role="menuitemcheckbox"/g) ?? []).length === 3,
+	'the menu has exactly three toggle rows'
+);
+ok(
+	titlebarSource.includes("ui.settingsFocus = 'integrations'"),
+	'the menu can open the Integrations tab'
+);
+ok(
+	dialogSource.includes("ui.settingsFocus === 'integrations'"),
+	'SettingsDialog accepts the Integrations focus'
+);
+
+const en = JSON.parse(readFileSync(join(here, 'locales', 'en.json'), 'utf8'));
+for (const key of [
+	'menu_hint',
+	'open_settings',
+	'on',
+	'off',
+	'tooltip_on',
+	'tooltip_off',
+	'control_api_on',
+	'control_api_off',
+	'tuna_on',
+	'tuna_off'
+]) {
+	ok(typeof en.integrations[key] === 'string', `en.json has integrations.${key}`);
 }
 
 console.log('ok');

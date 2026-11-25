@@ -1284,6 +1284,16 @@
 		}
 	},
 	"integrations": {
+		"menu_hint": "Quick toggles for this device",
+		"open_settings": "Integration settings",
+		"on": "On",
+		"off": "Off",
+		"tooltip_on": "Integrations — at least one is on",
+		"tooltip_off": "Integrations — all off",
+		"control_api_on": "Control API on",
+		"control_api_off": "Control API off",
+		"tuna_on": "Tuna output on",
+		"tuna_off": "Tuna output off",
 		"discord_on": "Discord presence on",
 		"discord_off": "Discord presence off",
 		"discord_tooltip_on": "Discord presence on — click to turn off",

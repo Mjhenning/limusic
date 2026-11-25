@@ -3,8 +3,8 @@
 	// with a system frame (`win.chrome`, issue #65) this bar stays as a toolbar and only drops its
 	// own window buttons, since everything else on it is app navigation, not window management.
 	// Everything on the bar is a drag region except the buttons; double-click maximizes (Tauri's
-	// drag region itself). Right cluster: Last.fm scrobbler | separator | minimize / maximize /
-	// close — per the design, the scrobbler lives with the window controls but visually apart.
+	// drag region itself). Right cluster: integrations menu | Last.fm scrobbler | separator |
+	// minimize / maximize / close — the toggles live with the window controls but visually apart.
 	// Account (sign in/out) sits first in that cluster, in its own component.
 	import { onMount } from 'svelte';
 	import { afterNavigate } from '$app/navigation';
@@ -24,6 +24,7 @@
 		HotspotOfflineIcon,
 		UserGroup02Icon,
 		Link04Icon,
+		LinkSquare02Icon,
 		Settings02Icon
 	} from '@hugeicons/core-free-icons';
 	import LimusicLoader from './LimusicLoader.svelte';
@@ -32,7 +33,14 @@
 	import AccountMenu from './AccountMenu.svelte';
 	import { appIcon } from '$lib/appicon.svelte';
 	import * as api from '$lib/api';
-	import { openMiniPlayer, playback, prefs, refreshView, toast, ui } from '$lib/player.svelte';
+	import {
+		discordEnabled,
+		integrations,
+		loadIntegrations,
+		setDiscordEnabled,
+		setIntegrationEnabled
+	} from '$lib/integrations.svelte';
+	import { openMiniPlayer, playback, refreshView, toast, ui } from '$lib/player.svelte';
 	import { win } from '$lib/win.svelte';
 	import { lt } from '$lib/lt.svelte';
 	import { anchorMenu, fitMenu, NO_ANCHOR } from '$lib/menu';
@@ -62,27 +70,58 @@
 	const connecting = $derived(lastfm.connecting);
 	let menuOpen = $state(false);
 	let anchor = $state(NO_ANCHOR);
+	let integrationMenuOpen = $state(false);
+	let integrationAnchor = $state(NO_ANCHOR);
 
-	// Discord Rich Presence — a plain on/off toggle of the `discord_rpc` setting (the backend
-	// connects/clears the presence the moment it flips). Optimistic; reverted on failure. The flag
-	// lives in `prefs` because the Discord settings tab toggles the same thing: a local copy here
-	// went stale the moment the other one was used.
-	const discordOn = $derived(prefs.discordRpc);
+	// The titlebar is a second door to the same backend flags as the Integrations tab. The store is
+	// the only owner of their state, so a toggle here cannot leave an indicator stale over there.
+	const discordOn = $derived(discordEnabled);
+	const controlOn = $derived(integrations.controlApi);
+	const tunaOn = $derived(integrations.tuna);
+	const anyIntegrationOn = $derived(discordOn || controlOn || tunaOn);
 
-	async function toggleDiscord() {
-		const next = !discordOn;
-		prefs.discordRpc = next;
+	type IntegrationKind = 'discord' | 'control' | 'tuna';
+
+	async function toggleIntegration(kind: IntegrationKind) {
+		const on = kind === 'discord' ? !discordOn : kind === 'control' ? !controlOn : !tunaOn;
 		try {
-			await api.setSetting('discord_rpc', next ? 'true' : 'false');
-			toast.success(next ? t('integrations.discord_on') : t('integrations.discord_off'));
+			if (kind === 'discord') await setDiscordEnabled(on);
+			else await setIntegrationEnabled(kind, on);
+			const message =
+				kind === 'discord'
+					? on
+						? t('integrations.discord_on')
+						: t('integrations.discord_off')
+					: kind === 'control'
+						? on
+							? t('integrations.control_api_on')
+							: t('integrations.control_api_off')
+						: on
+							? t('integrations.tuna_on')
+							: t('integrations.tuna_off');
+			toast.success(message);
 		} catch (e) {
-			prefs.discordRpc = !next;
 			toast.error(String(e));
 		}
 	}
 
+	function openIntegrationMenu(e: MouseEvent) {
+		integrationAnchor = anchorMenu(e, { align: 'right' });
+		integrationMenuOpen = true;
+		void loadIntegrations().catch(() => {});
+	}
+
+	function openIntegrationSettings() {
+		integrationMenuOpen = false;
+		ui.settingsFocus = 'integrations';
+		ui.settingsOpen = true;
+	}
+
 	onMount(watchLastfm);
 	onMount(watchListenBrainz);
+	onMount(() => {
+		void loadIntegrations().catch(() => {});
+	});
 
 	function onScrobblerClick(e: MouseEvent) {
 		if (connecting) {
@@ -227,19 +266,22 @@
 			</span>
 		</button>
 
+		<!-- One menu for all optional outputs. The dot means at least one is live; the icon is the
+		     integrations label, not Discord's, so the button no longer implies it toggles only one. -->
 		<button
-			class="flex h-full w-8 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground {discordOn
+			class="flex h-full w-8 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground {anyIntegrationOn
 				? 'text-foreground'
 				: ''}"
-			onclick={toggleDiscord}
-			title={discordOn ? t('integrations.discord_tooltip_on') : t('integrations.discord_tooltip_off')}
-			aria-label={t('settings.general.discord_rpc')}
+			onclick={openIntegrationMenu}
+			title={anyIntegrationOn ? t('integrations.tooltip_on') : t('integrations.tooltip_off')}
+			aria-label={t('settings.tabs.integrations')}
+			aria-haspopup="menu"
+			aria-expanded={integrationMenuOpen}
 		>
 			<span class="relative">
-				<DiscordIcon class="h-4 w-4" />
-				<!-- Presence status dot, Discord-style: green = live, red = off. -->
+				<HugeiconsIcon icon={LinkSquare02Icon} class="h-4 w-4" />
 				<span
-					class="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full ring-[1.5px] ring-background {discordOn
+					class="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full ring-[1.5px] ring-background {anyIntegrationOn
 						? 'bg-emerald-500'
 						: 'bg-red-500'}"
 				></span>
@@ -373,6 +415,67 @@
 			onclick={disconnect}
 		>
 			<HugeiconsIcon icon={HotspotOfflineIcon} class="h-4 w-4" /> {t('integrations.disconnect')}
+		</button>
+	</div>
+{/if}
+
+{#if integrationMenuOpen}
+	<button
+		class="fixed inset-0 z-40 cursor-default"
+		onclick={() => (integrationMenuOpen = false)}
+		aria-label={t('common.close')}
+	></button>
+	<div
+		role="menu"
+		class="fixed z-50 min-w-64 animate-in rounded-lg border bg-popover p-1 text-popover-foreground shadow-xl duration-150 fade-in-0 zoom-in-95"
+		style={integrationAnchor.style}
+		{@attach fitMenu(integrationAnchor)}
+	>
+		<div class="flex items-center gap-2.5 px-2 py-2">
+			<HugeiconsIcon icon={LinkSquare02Icon} class="h-4 w-4 shrink-0" />
+			<div class="min-w-0">
+				<div class="text-sm font-medium leading-tight">{t('settings.tabs.integrations')}</div>
+				<div class="truncate text-xs text-muted-foreground">{t('integrations.menu_hint')}</div>
+			</div>
+		</div>
+		<div class="mx-1 my-1 h-px bg-border"></div>
+		<button
+			role="menuitemcheckbox"
+			aria-checked={discordOn}
+			class="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent/10"
+			onclick={() => toggleIntegration('discord')}
+		>
+			<DiscordIcon class="h-4 w-4 shrink-0" />
+			<span class="min-w-0 flex-1 truncate">{t('settings.discord.enable')}</span>
+			<span class="text-xs text-muted-foreground">{discordOn ? t('integrations.on') : t('integrations.off')}</span>
+		</button>
+		<button
+			role="menuitemcheckbox"
+			aria-checked={controlOn}
+			class="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent/10"
+			onclick={() => toggleIntegration('control')}
+		>
+			<HugeiconsIcon icon={Link04Icon} class="h-4 w-4 shrink-0" />
+			<span class="min-w-0 flex-1 truncate">{t('settings.integrations.control_api')}</span>
+			<span class="text-xs text-muted-foreground">{controlOn ? t('integrations.on') : t('integrations.off')}</span>
+		</button>
+		<button
+			role="menuitemcheckbox"
+			aria-checked={tunaOn}
+			class="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent/10"
+			onclick={() => toggleIntegration('tuna')}
+		>
+			<HugeiconsIcon icon={HotspotOfflineIcon} class="h-4 w-4 shrink-0" />
+			<span class="min-w-0 flex-1 truncate">{t('settings.integrations.tuna')}</span>
+			<span class="text-xs text-muted-foreground">{tunaOn ? t('integrations.on') : t('integrations.off')}</span>
+		</button>
+		<div class="mx-1 my-1 h-px bg-border"></div>
+		<button
+			role="menuitem"
+			class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent/10"
+			onclick={openIntegrationSettings}
+		>
+			<HugeiconsIcon icon={Settings02Icon} class="h-4 w-4" /> {t('integrations.open_settings')}
 		</button>
 	</div>
 {/if}
