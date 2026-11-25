@@ -133,6 +133,35 @@ display string.
 
 All paths are under the API base URL, for example `http://127.0.0.1:27199`.
 
+### Call index
+
+This table is the complete route set. `GET` routes are read-only; `POST` routes
+are the only mutations. `GET /api/v1/ws` is the upgrade route for the event
+stream described below.
+
+| Method & path | Purpose |
+| --- | --- |
+| `GET /api/v1/status` | Full playback and device snapshot |
+| `GET /api/v1/now-playing` | Current track and player-bar facts |
+| `GET /api/v1/queue` | Paged queue projection |
+| `POST /api/v1/playback/play` | Resume or start a restored queue |
+| `POST /api/v1/playback/pause` | Pause playback |
+| `POST /api/v1/playback/toggle` | Toggle play/pause |
+| `POST /api/v1/playback/next` | Skip to the next queue row |
+| `POST /api/v1/playback/previous` | Go back or rewind the current row |
+| `POST /api/v1/playback/seek` | Seek to a position |
+| `POST /api/v1/playback/volume` | Set volume |
+| `POST /api/v1/queue/remove` | Remove an upcoming row |
+| `POST /api/v1/queue/clear-queued` | Clear queued/play-next rows |
+| `POST /api/v1/queue/request` | Resolve and insert one input |
+| `POST /api/v1/queue/add` | Append one input before autoplay |
+| `POST /api/v1/queue/play-next` | Insert one input into the play-next block |
+| `GET /api/v1/ws` | Read-only WebSocket event stream |
+
+A self-check compares this table with `.route(...)` registrations in
+`src-tauri/src/control_api/handlers.rs`; adding a route without documenting it
+fails `npm test`.
+
 ### Read state
 
 #### `GET /api/v1/status`
@@ -315,6 +344,21 @@ JSON envelope, not `101`.
   rebound, or the app exits.
 
 Every frame has a `type` field.
+
+#### Close frames
+
+Server-initiated closes use WebSocket code `1001` (going away) with a textual
+reason. Treat a close as a hint to reconnect after the listener is back; the
+reason is not a command.
+
+| Reason | Trigger |
+| --- | --- |
+| `control API token regenerated` | The bearer token was rotated in Settings |
+| `control API disabled` | The enable switch was turned off |
+| `control API port changed` | The listener port changed |
+| `control API settings changed` | Any other control-API settings apply |
+| `control API shutting down` | The app is exiting |
+| `control API stopped` | Fallback when the close channel is already gone |
 
 #### `hello` and `resync`
 

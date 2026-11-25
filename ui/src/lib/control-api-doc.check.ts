@@ -1,0 +1,80 @@
+// Self-check for the Control API contract doc. `npm test` runs every *.check.ts,
+// so a route added in Rust without a matching call-index row fails the UI suite.
+//
+//     node --experimental-strip-types ui/src/lib/control-api-doc.check.ts
+//
+// It also keeps the WebSocket close-code section aligned with the code that
+// actually sends close frames.
+//
+// @ts-nocheck: it reads the sources with node:fs, and ui/ has no Node types.
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+function ok(cond: boolean, what: string): void {
+	if (!cond) throw new Error(`FAIL: ${what}`);
+}
+
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, '..', '..', '..');
+const read = (path: string) => readFileSync(path, 'utf8');
+
+const doc = read(join(root, 'docs', 'CONTROL-API.md'));
+const handlers = read(join(root, 'src-tauri', 'src', 'control_api', 'handlers.rs'));
+const server = read(join(root, 'src-tauri', 'src', 'control_api', 'server.rs'));
+const ws = read(join(root, 'src-tauri', 'src', 'control_api', 'ws.rs'));
+
+// --- call index vs. axum routes ---------------------------------------------------------------
+const start = doc.indexOf('### Call index');
+const end = doc.indexOf('### Read state', start);
+ok(start >= 0 && end > start, 'CONTROL-API.md has a Call index section');
+const section = doc.slice(start, end);
+
+const routes = new Set(
+	[...handlers.matchAll(/\.route\("(\/api\/v1\/[^"]+)",\s*(get|post)\(/g)].map(
+		(m) => `${m[2]!.toUpperCase()} ${m[1]}`
+	)
+);
+const documented = new Set(
+	[...section.matchAll(/^\| `((?:GET|POST) \/api\/v1\/[^`]+)` \|/gm)].map((m) => m[1]!)
+);
+
+ok(routes.size === 16, `handlers.rs registers 16 routes, found ${routes.size}`);
+ok(documented.size === routes.size, 'the call index has one row per registered route');
+for (const route of routes) ok(documented.has(route), `call index documents ${route}`);
+for (const route of documented) ok(routes.has(route), `call index row ${route} is a real route`);
+ok(documented.has('GET /api/v1/ws'), 'the WebSocket upgrade route is in the call index');
+
+// --- close frame semantics --------------------------------------------------------------------
+const closeStart = doc.indexOf('#### Close frames');
+const closeEnd = doc.indexOf('#### ', closeStart + 1);
+ok(closeStart >= 0 && closeEnd > closeStart, 'CONTROL-API.md has a Close frames section');
+const closeSection = doc.slice(closeStart, closeEnd);
+
+const sources = `${server}\n${handlers}\n${ws}`;
+const sourceReasons = new Set([
+	'control API token regenerated',
+	'control API disabled',
+	'control API port changed',
+	'control API settings changed',
+	'control API shutting down',
+	'control API stopped'
+]);
+const documentedReasons = new Set(
+	[...closeSection.matchAll(/^\| `(control API [^`]+)` \|/gm)].map((m) => m[1]!)
+);
+
+for (const reason of sourceReasons) {
+	ok(sources.includes(`"${reason}"`), `${reason} is present in the Rust sources`);
+	ok(documentedReasons.has(reason), `close frames documents ${reason}`);
+}
+for (const reason of documentedReasons) {
+	ok(sourceReasons.has(reason), `documented close reason ${reason} is real`);
+}
+for (const match of sources.matchAll(/(?:close_all|stop_control_api)\("([^"]+)"\)/g)) {
+	ok(sourceReasons.has(match[1]!), `sent close reason ${match[1]} is documented`);
+}
+ok(ws.includes('code: 1001'), 'ws.rs sends close code 1001');
+ok(closeSection.includes('1001'), 'the close-frame section names code 1001');
+
+console.log('ok');
