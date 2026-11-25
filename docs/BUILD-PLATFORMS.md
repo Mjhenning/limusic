@@ -6,9 +6,10 @@ step just emits `cargo:rustc-link-lib=mpv` (via `libmpv2-sys`), so "getting it t
 "putting libmpv's import library on the linker's search path"; "getting it to run" is "shipping the
 matching shared library next to the app."
 
-Bundle targets are set per platform: `tauri.conf.json` → `deb` + `rpm` + `appimage` (Linux),
-`tauri.windows.conf.json` → `nsis` + `msi`, `tauri.macos.conf.json` → `app` + `dmg`. Tauri
-auto-merges the platform file over the base for the current OS.
+Bundle targets are set per platform: `tauri.conf.json` → `appimage` (Linux),
+`tauri.windows.conf.json` → `nsis`, `tauri.macos.conf.json` → `app` + `dmg`. Tauri auto-merges the
+platform file over the base for the current OS. Only these self-updating formats are published;
+`deb`, `rpm`, and `msi` are no longer built.
 
 ## Common prerequisites (all platforms)
 
@@ -26,7 +27,7 @@ auto-merges the platform file over the base for the current OS.
 sudo dnf install mpv-libs mpv-libs-devel webkit2gtk4.1-devel \
   gcc gcc-c++ make openssl-devel librsvg2-devel   # + standard Tauri build deps
 cd ui && pnpm install && pnpm build
-cargo tauri build            # → target/release/bundle/rpm/limusic-*.rpm (plus a test-only .deb)
+cargo tauri build   # → target/release/bundle/appimage/limusic_*.AppImage
 ```
 
 ### Ubuntu / Debian
@@ -34,28 +35,20 @@ cargo tauri build            # → target/release/bundle/rpm/limusic-*.rpm (plus
 sudo apt install libmpv-dev libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
   libssl-dev libdbus-1-dev
 cd ui && pnpm install && pnpm build
-cargo tauri build --bundles deb   # → target/release/bundle/deb/limusic_*.deb
+cargo tauri build   # → target/release/bundle/appimage/limusic_*.AppImage
 ```
 
-- libmpv is system-provided (`mpv-libs`), found on the default linker path — no bundling needed.
+- libmpv is system-provided (`mpv-libs`) for a local build, found on the default linker path — no
+  bundling needed.
 - Media keys use **MPRIS** over D-Bus (needs a running session bus — normal on a desktop session).
-- **Neither the release AppImage nor the release .deb is built here.** Both inherit their build
-  host's glibc floor, and Fedora's is the newest that exists, so one built on this machine starts on
-  almost nothing else. `.github/workflows/linux-release.yml` builds both in a pinned `debian:bookworm`
-  container (glibc 2.36) and fails the build if anything bundled needs newer. Bookworm is as old
-  as it goes: Ubuntu 22.04 has no `libmpv2` and Debian 11 has no `webkit2gtk-4.1`. It also means
-  the AppImage bundles bookworm's mpv 0.35.1, so mpv options newer than 0.35 need a fallback
-  (`demuxer-cache-dir` was `cache-dir` there). A local
-  `cargo tauri build` still emits them into `target/release/bundle/` for testing; never upload those
-  to a release.
-- **A .deb declares only what `bundle.linux.deb.depends` in `tauri.conf.json` says it does.** Tauri
-  copies that list verbatim and never runs `dpkg-shlibdeps`, so nothing about the package is derived
-  from the binary: not the libraries it links, not its glibc floor. That is why the list is
-  `libwebkit2gtk-4.1-0` (which drags in gtk3, glib, cairo, libsoup and JavaScriptCore), `libmpv2`,
-  and a hand-written `libc6 (>= 2.36)` matching the CI container. If a future build links something
-  new, add it there by hand. A forgotten entry produces a package that installs cleanly and then
-  refuses to start, so the workflow's `Verify the .deb installs and resolves its libraries` step
-  installs it on a clean Debian 12 and fails on the first unresolved `ldd` line.
+- **The release AppImage is not built here.** It inherits its build host's glibc floor, and Fedora's
+  is the newest that exists, so one built on this machine starts on almost nothing else.
+  `.github/workflows/linux-release.yml` builds it in a pinned `debian:bookworm` container
+  (glibc 2.36) and fails the build if anything bundled needs newer. Bookworm is as old as it goes:
+  Ubuntu 22.04 has no `libmpv2` and Debian 11 has no `webkit2gtk-4.1`. It also means the AppImage
+  bundles bookworm's mpv 0.35.1, so mpv options newer than 0.35 need a fallback
+  (`demuxer-cache-dir` was `cache-dir` there). A local `cargo tauri build` still emits an AppImage
+  into `target/release/bundle/` for testing; never upload it to a release.
 - A freshly bundled AppDir is **not portable** until `scripts/fix-appdir-tls.sh` has run over it —
   linuxdeploy bundles the host's TLS trust stack (whose CA anchors live outside the bundle) and
   writes a `GIO_EXTRA_MODULES` containing a literal newline and a path into your own `target/` dir,
@@ -103,7 +96,7 @@ cargo tauri build --bundles deb   # → target/release/bundle/deb/limusic_*.deb
 6. **Build:**
    ```powershell
    cd ui; pnpm build; cd ..
-   cargo tauri build          # → target/release/bundle/{msi,nsis}/limusic_*.{msi,exe}
+   cargo tauri build          # → target/release/bundle/nsis/limusic_*-setup.exe
    ```
 7. **Check the import table:** `powershell -ExecutionPolicy Bypass -File scripts\check-windows-imports.ps1 -Exe target\release\limusic-app.exe`.
    Every load-time import is a DLL each user needs just to *start* the app (and auto-update ships
