@@ -1128,7 +1128,12 @@ pub fn run() {
             // Empty means the built-in default, which `LtSession` resolves when it connects. The
             // URL does not live here so that nothing ever has to hand it to the UI.
             let lt_url = db.get_setting("lt_server_url").unwrap_or_default();
-            let (lt, lt_sync_rx) = listentogether::LtSession::new(handle.clone(), lt_url);
+            let lt_shared_control =
+                db.get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY)
+                    .and_then(|json| serde_json::from_str::<crate::integrations::settings::ControlApiSettings>(&json).ok())
+                    .is_some_and(|settings| settings.shared_control);
+            let (lt, lt_sync_rx) =
+                listentogether::LtSession::new(handle.clone(), lt_url, lt_shared_control);
             // Device link: opens a socket only once the user has linked a device.
             let (link, link_rx) = devicelink::LinkSession::new(handle.clone(), db.clone());
 

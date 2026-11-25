@@ -519,6 +519,7 @@ mod tests {
                 is_video: false,
                 live: false,
                 queued_by: Some("friend".into()),
+                submitted_by: None,
                 queued: true,
                 queued_end: false,
             }),

@@ -20,11 +20,15 @@ pub struct Track {
     /// Track length in ms (0 if unknown). Only used for clamping/UI.
     #[serde(default)]
     pub duration_ms: i64,
-    /// Username of the guest who added this track to the shared queue (Spotify-Jam-style adds).
-    /// `None` for tracks from the host's own playlist. Stamped by the host client on enqueue
+    /// Visible requester: the guest who suggested the track, or a bot's `requested_by` from the
+    /// Control API. `None` for an unattributed local add. Stamped by the queueing client
     /// (mirrors Metrolist's `TrackInfo.SuggestedBy`, context/19 §3.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_by: Option<String>,
+    /// Room participant that actually queued this track when `queued_by` carries a bot's
+    /// requester instead. Defaulted so base clients and older devices ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_by: Option<String>,
 }
 
 /// A room participant.
@@ -50,6 +54,15 @@ pub struct RoomState {
     pub last_update_ms: i64,
     pub volume: f64,
     pub queue: Vec<Track>,
+    /// The relay understands the shared-control envelopes. Older clients ignore the field.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared_control_capable: bool,
+    /// The host has opted into shared control for this room.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared_control: bool,
+    /// The host itself is a fork that can apply shared-control requests.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_shared_control_capable: bool,
 }
 
 impl RoomState {
@@ -135,6 +148,9 @@ impl Playback {
 pub enum RemoteAction {
     Play,
     Pause,
+    /// Flip transport state on the acting device. Device-link clients from before this variant
+    /// ignore it; a Listen Together host applies it to its own player.
+    Toggle,
     Next,
     Previous,
     Seek {
@@ -201,6 +217,50 @@ pub enum RemoteAction {
     /// To a device that isn't playing: play what the player plays, from where it is now, with its
     /// queue (Continue here, asked from another device).
     TakeOver,
+}
+
+/// Optional host-authoritative control for Listen Together. These ride inside the existing opaque
+/// `remote` envelope, so no new `ServerMessage` variant is needed: a base client that ignores
+/// `ServerMessage::Remote` never sees them, and an older device-link client ignores the new kinds.
+///
+/// All capability fields default to false. A client that doesn't know about shared control is
+/// suggestion-only, exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SharedControlEnvelope {
+    /// Host: announce capability and turn room-wide shared control on or off. The relay answers with
+    /// a normal `sync_state` carrying the updated [`RoomState`] fields.
+    SetSharedControl {
+        #[serde(default, skip_serializing_if = "is_false")]
+        on: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        shared_control_capable: bool,
+    },
+    /// Guest: ask the host to apply an action. `id` correlates the matching `ControlResult`.
+    ControlRequest {
+        id: String,
+        action: RemoteAction,
+        #[serde(default, skip_serializing_if = "is_false")]
+        shared_control_capable: bool,
+        /// Username of the client sending the request, so the host can attribute rows whose
+        /// `queued_by` came from that client's bot rather than from the room itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submitted_by: Option<String>,
+    },
+    /// Host: the correlated answer, sent only to the requesting guest.
+    ControlResult {
+        id: String,
+        #[serde(default)]
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+impl SharedControlEnvelope {
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("serialize SharedControlEnvelope")
+    }
 }
 
 /// The player's queue, for the other devices' player views (device link). Sent as `link_status`
@@ -448,6 +508,7 @@ mod tests {
                 thumbnail: None,
                 duration_ms: 180_000,
                 queued_by: None,
+                submitted_by: None,
             }),
             queue: Some(vec![]),
             playing: true,
@@ -489,6 +550,79 @@ mod tests {
         assert_eq!(s.live_position_ms(15_000), 6000);
         // Never negative.
         assert_eq!(s.live_position_ms(5_000), 1000);
+    }
+
+    #[test]
+    fn shared_control_fields_are_additive() {
+        // A base client sees the old line unchanged: every new field is false and skipped.
+        let old = r#"{"room_code":"","host_id":"","users":[],"current_track":null,"is_playing":false,"position_ms":0,"last_update_ms":0,"volume":1.0,"queue":[]}"#;
+        assert_eq!(
+            serde_json::to_string(&RoomState { volume: 1.0, ..Default::default() }).unwrap(),
+            old
+        );
+        let fork = RoomState {
+            shared_control_capable: true,
+            shared_control: true,
+            host_shared_control_capable: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&fork).unwrap();
+        assert!(json.contains("\"shared_control_capable\":true"));
+        assert!(json.contains("\"shared_control\":true"));
+        assert!(json.contains("\"host_shared_control_capable\":true"));
+        // A fork state still parses on a client that only reads the old fields.
+        let back: RoomState = serde_json::from_str(&json).unwrap();
+        assert!(back.shared_control && back.host_shared_control_capable);
+        let base: RoomState = serde_json::from_str(old).unwrap();
+        assert!(!base.shared_control && !base.shared_control_capable);
+    }
+
+    #[test]
+    fn shared_control_envelopes_roundtrip_through_opaque_remote() {
+        let request = SharedControlEnvelope::ControlRequest {
+            id: "req-1".into(),
+            action: RemoteAction::Toggle,
+            shared_control_capable: true,
+            submitted_by: Some("room_guest".into()),
+        };
+        let wire = serde_json::json!({
+            "type": "remote",
+            "action": serde_json::to_value(&request).unwrap()
+        });
+        let decoded: ClientMessage = serde_json::from_value(wire).unwrap();
+        let ClientMessage::Remote { action, .. } = decoded else { panic!("not a remote") };
+        let back: SharedControlEnvelope = serde_json::from_value(action).unwrap();
+        assert_eq!(back, request);
+
+        let result = SharedControlEnvelope::ControlResult {
+            id: "req-1".into(),
+            ok: false,
+            error: Some("host lost the room".into()),
+        };
+        let json = result.to_value().to_string();
+        assert_eq!(
+            serde_json::from_value::<SharedControlEnvelope>(result.to_value()).unwrap(),
+            result
+        );
+        assert!(json.contains("\"ok\":false"));
+
+        // An older guest omits the submitter; the host still parses its request.
+        let old = serde_json::json!({
+            "kind": "control_request",
+            "id": "req-2",
+            "action": { "kind": "toggle" },
+            "shared_control_capable": true
+        });
+        let back: SharedControlEnvelope = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            back,
+            SharedControlEnvelope::ControlRequest {
+                id: "req-2".into(),
+                action: RemoteAction::Toggle,
+                shared_control_capable: true,
+                submitted_by: None,
+            }
+        );
     }
 
     /// The device-link wire lines, byte for byte. Android's `MessageCodecTest` holds the same
@@ -593,6 +727,7 @@ mod tests {
             thumbnail: None,
             duration_ms: 0,
             queued_by: None,
+            submitted_by: None,
         }
     }
 

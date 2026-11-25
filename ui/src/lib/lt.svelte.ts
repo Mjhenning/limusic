@@ -14,7 +14,11 @@ export const lt = $state<LtState>({
 	currentTrack: null,
 	queue: [],
 	pendingJoins: [],
-	suggestions: []
+	suggestions: [],
+	sharedControlEnabled: false,
+	sharedControlCapable: false,
+	sharedControl: false,
+	hostSharedControlCapable: false
 });
 
 /** True when we're in (or joining) a room. */

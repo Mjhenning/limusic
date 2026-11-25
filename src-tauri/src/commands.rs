@@ -1516,6 +1516,7 @@ fn shed_queue_context(s: SongItem) -> SongItem {
         queued_end: false,
         queued_from: None,
         queued_by: None,
+        submitted_by: None,
         autoplay: false,
         set_video_id: None,
         added_by: None,
@@ -3727,6 +3728,7 @@ mod tests {
             title: "Grace".into(),
             queued: true,
             queued_by: Some("simohypers".into()),
+            submitted_by: Some("room_guest".into()),
             autoplay: true,
             set_video_id: Some("SVI".into()),
             ..Default::default()
@@ -3790,7 +3792,8 @@ pub async fn set_integration_settings(
         &serde_json::to_string(&tuna).map_err(|e| e.to_string())?,
     );
     let reason = if previous.port != control_api.port { "port change" } else { "settings changed" };
-    manager.apply_settings(control_api, reason).await;
+    manager.apply_settings(control_api.clone(), reason).await;
+    state.lt.set_shared_control_enabled(control_api.shared_control).await;
     manager.apply_tuna_settings(tuna).await;
     Ok(())
 }

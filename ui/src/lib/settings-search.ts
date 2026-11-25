@@ -284,6 +284,11 @@ const TABLE: [SettingsTab, K | null, Row[]][] = [
 			['settings.integrations.enable', 'settings.integrations.enable_hint'],
 			['settings.integrations.status', undefined, 'settings.integrations.enable'],
 			[
+				'settings.integrations.shared_control',
+				'settings.integrations.shared_control_hint',
+				'settings.integrations.enable'
+			],
+			[
 				'settings.integrations.bind_mode',
 				'settings.integrations.bind_mode_hint',
 				'settings.integrations.enable'

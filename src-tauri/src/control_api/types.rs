@@ -13,6 +13,7 @@ use axum::{
     Json,
 };
 use innertube::SongItem;
+use listen_protocol::RemoteAction;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -154,6 +155,13 @@ impl ErrorBody {
 
     pub fn remote_linked() -> Self {
         Self::new(StatusCode::CONFLICT, "remote_linked", "another linked device is the player")
+    }
+
+    /// The host accepted a forwarded shared-control request but did not answer within the 15 s
+    /// correlation window, or the room changed while it was in flight. The action may still have
+    /// been applied; clients should re-read `/status` before retrying.
+    pub fn shared_control_failed(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, "shared_control_failed", message)
     }
 
     /// The 15 s wait ended before the queue fact changed. The skip may still finish (or be rolled
@@ -391,6 +399,8 @@ pub struct ApiTrack {
     pub is_video: bool,
     pub live: bool,
     pub queued_by: Option<String>,
+    /// Room participant that forwarded the row when `queued_by` is a bot's requester.
+    pub submitted_by: Option<String>,
     pub queued: bool,
     pub queued_end: bool,
 }
@@ -411,6 +421,7 @@ impl ApiTrack {
             is_video: item.is_video,
             live,
             queued_by: item.queued_by.clone(),
+            submitted_by: item.submitted_by.clone(),
             queued: item.queued,
             queued_end: item.queued_end,
         }
@@ -446,6 +457,9 @@ impl ApiTrack {
             is_video: get("is_video", "isVideo").and_then(Value::as_bool).unwrap_or(false),
             live: get("live", "live").and_then(Value::as_bool).unwrap_or(false),
             queued_by: get("queued_by", "queuedBy").and_then(Value::as_str).map(str::to_owned),
+            submitted_by: get("submitted_by", "submittedBy")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             queued: get("queued", "queued").and_then(Value::as_bool).unwrap_or(false),
             queued_end: get("queued_end", "queuedEnd").and_then(Value::as_bool).unwrap_or(false),
         }
@@ -825,7 +839,8 @@ pub struct OkResponse {
 }
 
 /// Body for `POST /api/v1/queue/request`. `input` may be a YouTube URL, an 11-character video id,
-/// or a text query. `requested_by` is stored as `SongItem.queued_by`. See [`ResolveError`] and the
+/// or a text query. `requested_by` is stored as `SongItem.queued_by`; in a shared room the
+/// forwarding client is also kept as `submitted_by`. See [`ResolveError`] and the
 /// response contract on [`QueueRequestResponse`].
 #[derive(Debug, Deserialize)]
 pub struct QueueRequest {
@@ -916,6 +931,18 @@ pub trait ControlApiContext: Send + Sync + 'static {
     /// True when a Listen Together guest session owns playback policy.
     async fn is_guest(&self) -> bool;
 
+    /// True when this guest may forward mutations to an opted-in fork host. Defaults to false so a
+    /// context without a room (including every test double) stays suggestion-only.
+    async fn shared_control_allowed(&self) -> bool {
+        false
+    }
+
+    /// Forward one mutation to the host and wait for its correlated answer. A timeout does not
+    /// prove the action failed; callers tell clients to re-read `/status` before retrying.
+    async fn forward_shared_control(&self, _action: RemoteAction) -> Result<(), String> {
+        Err("shared control is not available".into())
+    }
+
     /// Idempotent Play; starts a restored queue when mpv is idle. Returns the resulting state.
     async fn play(self: Arc<Self>) -> bool;
 
@@ -989,6 +1016,14 @@ impl ControlApiContext for crate::state::AppState {
 
     async fn is_guest(&self) -> bool {
         self.lt.is_guest().await
+    }
+
+    async fn shared_control_allowed(&self) -> bool {
+        self.lt.shared_control_allowed().await
+    }
+
+    async fn forward_shared_control(&self, action: RemoteAction) -> Result<(), String> {
+        self.lt.forward_shared_control(action).await
     }
 
     async fn play(self: Arc<Self>) -> bool {

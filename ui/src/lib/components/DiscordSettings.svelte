@@ -35,7 +35,7 @@
 
 	// The shared store, not the local `settings` record: the titlebar has its own Discord button, and
 	// two copies of the same flag meant toggling one left the other's indicator stale.
-	const enabled = $derived(discordEnabled);
+	const enabled = $derived(discordEnabled());
 	// Seeded once from the record the modal already loaded, then owned here. Reading it in a
 	// $derived instead would fight the user: every keystroke would be overwritten by the last saved
 	// blob until the debounce landed.
@@ -185,7 +185,7 @@
 </section>
 
 {#if enabled}
-	<div class="flex flex-col gap-5 2xl:flex-row">
+	<div class="flex flex-col gap-5 lg:flex-row">
 		<div class="min-w-0 flex-1">
 			<section class={GROUP}>
 				<div data-settings-card class={CARD}>
@@ -287,7 +287,7 @@
 
 		<aside
 			data-settings-aside
-			class="flex shrink-0 flex-col bg-muted/30 px-5 py-5 2xl:w-[20rem] 2xl:border-l 2xl:py-0 2xl:pl-5"
+			class="flex shrink-0 flex-col bg-muted/30 px-5 py-5 lg:w-[20rem] lg:border-l lg:py-0 lg:pl-5 max-lg:border-t"
 		>
 		<div class="mb-2.5 flex items-center gap-2">
 			<h3 class="text-[11px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
@@ -308,7 +308,7 @@
 		<Button
 			variant="ghost"
 			size="sm"
-			class="mt-3 h-7 w-fit gap-1.5 px-2 text-xs 2xl:mt-auto"
+			class="mt-3 h-7 w-fit gap-1.5 px-2 text-xs lg:mt-auto"
 			disabled={isDefault}
 			onclick={reset}
 		>

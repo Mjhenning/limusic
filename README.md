@@ -303,6 +303,14 @@ cargo run -p sync-server        # plain WebSocket on 0.0.0.0:8080
 Front it with something that terminates TLS (Tailscale Funnel, Cloudflare
 Tunnel), then paste the `wss://` URL into the Listen Together panel in the app.
 
+Between fork clients, a host can turn on **Shared Listen Together control** in
+Settings ▸ Integrations. Guests' Control API mutations are then forwarded to
+that host and applied as if the host issued them; base clients still join and
+suggest tracks, but cannot control playback. Queue rows keep both names when a
+bot request crosses a room: the forwarding client and the bot's `requested_by`.
+See [docs/CONTROL-API.md](docs/CONTROL-API.md#shared-listen-together-control) for
+the opt-in rules and timeouts.
+
 ---
 
 ## Translations

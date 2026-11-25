@@ -9,11 +9,15 @@ pub struct ControlApiSettings {
     pub enabled: bool,
     pub bind: String,
     pub port: u16,
+    /// Host opt-in for shared Listen Together control. Old saved payloads predate it and read as
+    /// false. `#[serde(default)]` keeps that upgrade silent.
+    #[serde(default)]
+    pub shared_control: bool,
 }
 
 impl Default for ControlApiSettings {
     fn default() -> Self {
-        Self { enabled: false, bind: "127.0.0.1".to_string(), port: 27199 }
+        Self { enabled: false, bind: "127.0.0.1".to_string(), port: 27199, shared_control: false }
     }
 }
 
@@ -110,6 +114,7 @@ mod tests {
         assert!(!s.control_api.enabled);
         assert_eq!(s.control_api.bind, "127.0.0.1");
         assert_eq!(s.control_api.port, 27199);
+        assert!(!s.control_api.shared_control);
         assert!(!s.tuna.enabled);
         assert_eq!(s.tuna.url, "http://127.0.0.1:1608/");
     }
@@ -120,6 +125,10 @@ mod tests {
         let j = serde_json::to_string(&s).unwrap();
         let s2: IntegrationSettings = serde_json::from_str(&j).unwrap();
         assert_eq!(s, s2);
+        // A payload saved before the fork added shared control still loads as opt-out.
+        let old = r#"{"control_api":{"enabled":true,"bind":"0.0.0.0","port":27199},"tuna":{"enabled":false,"url":"http://127.0.0.1:1608/"}}"#;
+        let old: IntegrationSettings = serde_json::from_str(old).unwrap();
+        assert!(!old.control_api.shared_control);
     }
 
     #[test]

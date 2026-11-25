@@ -2,6 +2,7 @@
 	import * as Dialog from '$lib/components/ui/dialog';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
+	import { Switch } from '$lib/components/ui/switch';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
 	import {
 		Copy01Icon,
@@ -20,7 +21,12 @@
 	import * as api from '$lib/api';
 	import { copyText } from '$lib/clipboard';
 	import { ui, toast } from '$lib/player.svelte';
-	import { lt } from '$lib/lt.svelte';
+	import {
+		integrations,
+		loadIntegrations,
+		setSharedControlEnabled
+	} from '$lib/integrations.svelte';
+	import { applyLtState, lt } from '$lib/lt.svelte';
 	import { t } from '$lib/i18n.svelte';
 	import { makeInvite, parseInvite } from '$lib/invite';
 
@@ -30,6 +36,7 @@
 	let showServer = $state(false);
 	let inviteInput = $state('');
 	let busy = $state(false);
+	let sharedBusy = $state(false);
 	let copied = $state(false);
 
 	// Seed inputs when the modal opens: remembered name + the persisted server URL. `serverUrl` is
@@ -41,6 +48,10 @@
 			serverUrl = lt.serverUrl;
 			showServer = false;
 			copied = false;
+			// The titlebar can open this dialog before Settings has ever run. Refresh the shared
+			// integration flags so the host's shared-control switch cannot look available while the
+			// Control API is actually off.
+			void loadIntegrations().catch(() => {});
 		}
 	});
 
@@ -60,6 +71,12 @@
 				: t('dialogs.listen_together.status_disconnected')
 	);
 	const others = $derived(lt.users.filter((u) => u.user_id !== lt.myId).length);
+	const sharedControlLabel = $derived(
+		lt.sharedControl
+			? t('dialogs.listen_together.shared_control_on')
+			: t('dialogs.listen_together.shared_control_off')
+	);
+	const controlOn = $derived(integrations.controlApi);
 
 	function rememberName() {
 		localStorage.setItem('lt_name', name.trim());
@@ -74,6 +91,19 @@
 	function normalize(url: string): string {
 		const u = url.trim();
 		return u === lt.defaultServerUrl ? '' : u;
+	}
+
+	async function toggleSharedControl(on: boolean) {
+		if (!controlOn || !isHost || sharedBusy) return;
+		sharedBusy = true;
+		try {
+			await setSharedControlEnabled(on);
+			applyLtState(await api.ltGetState());
+		} catch (e) {
+			toast.error(String(e));
+		} finally {
+			sharedBusy = false;
+		}
 	}
 
 	function toggleServerPanel() {
@@ -286,6 +316,31 @@
 							? t('dialogs.listen_together.hosting')
 							: t('dialogs.listen_together.listening')}
 					</div>
+					{#if inRoom}
+						<p class="mt-1 text-center text-[11px] text-muted-foreground">
+							{sharedControlLabel}
+						</p>
+					{/if}
+					{#if isHost}
+						<div
+							class="mt-3 flex items-center justify-between gap-3 rounded-xl border bg-background/60 px-3 py-2.5 text-left"
+						>
+							<div class="min-w-0">
+								<p class="text-xs font-medium">{t('dialogs.listen_together.shared_control')}</p>
+								<p class="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+									{controlOn
+										? t('dialogs.listen_together.shared_control_hint')
+										: t('dialogs.listen_together.shared_control_requires_api')}
+								</p>
+							</div>
+							<Switch
+								checked={controlOn && lt.sharedControlEnabled}
+								disabled={!controlOn || sharedBusy}
+								aria-label={t('dialogs.listen_together.shared_control')}
+								onCheckedChange={toggleSharedControl}
+							/>
+						</div>
+					{/if}
 
 					<!-- Spaced out because this gets read aloud and typed by hand. The left padding
 					     puts the trailing letter-space back on the right so it stays centred. -->

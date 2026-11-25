@@ -322,6 +322,13 @@
 				<span class="min-w-0 truncate text-sm font-medium {active ? 'text-primary' : ''}">
 					{song.title}
 				</span>
+				{#if song.submitted_by && song.submitted_by !== song.queued_by}
+					<span
+						class="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+					>
+						{song.submitted_by}
+					</span>
+				{/if}
 				{#if song.queued_by}
 					<span
 						class="shrink-0 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary"

@@ -859,6 +859,7 @@ mod tests {
             thumbnail: Some("/home/me/cover.jpg".into()),
             duration_ms: 0,
             queued_by: None,
+            submitted_by: None,
         }
     }
 

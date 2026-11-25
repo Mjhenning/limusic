@@ -23,7 +23,7 @@ use crate::db::{now_secs, Db, StoredAccount};
 use crate::devicelink::{LinkCommand, LinkSession, Publish, RemoteView};
 use crate::discord::DiscordHandle;
 use crate::integrations::hub::HubEvent;
-use crate::listentogether::{LtSession, SyncCommand};
+use crate::listentogether::{stamp_shared_action, LtSession, SyncCommand};
 use crate::media::MediaHandle;
 use crate::orchestrator::{Orchestrator, PlaybackData, PlaybackPing, ResolveError};
 
@@ -4912,6 +4912,16 @@ impl AppState {
     /// Apply one sync command from the connection (the bridge task drives this). Guest playback +
     /// host seeding. See `crate::listentogether`.
     pub async fn apply_sync(self: &std::sync::Arc<Self>, cmd: SyncCommand) {
+        // A shared-control request is host-side policy, not guest playback: apply it through the
+        // same device-link path as a media key and answer the guest without disturbing tempo.
+        if let SyncCommand::SharedControlRequest { id, from, action, submitted_by } = &cmd {
+            let (id, from, action, submitted_by) =
+                (id.clone(), from.clone(), action.clone(), submitted_by.clone());
+            let action = stamp_shared_action(action, submitted_by.as_deref());
+            self.apply_link(LinkCommand::Remote(action)).await;
+            self.lt.send_control_result(id, from, Ok(())).await;
+            return;
+        }
         // Membership has already changed. Finish any earlier effect request, restore the shared
         // clock, then seed/apply playback. Later non-1x commands recheck membership under the lock.
         if let Err(error) = self.reset_tempo(false).await {
@@ -4954,6 +4964,8 @@ impl AppState {
             }
             SyncCommand::SyncQueue { queue } => self.lt_mirror_queue(queue).await,
             SyncCommand::GuestAdd { track } => self.lt_enqueue_track(track).await,
+            // Handled before the common setup above; see the early branch at the top.
+            SyncCommand::SharedControlRequest { .. } => {}
         }
     }
 
@@ -5475,15 +5487,7 @@ impl AppState {
             false => items,
             true => {
                 let by = self.lt.my_username().await.unwrap_or_else(|| "Host".into());
-                items
-                    .into_iter()
-                    .map(|mut i| {
-                        if i.queued_by.as_deref().unwrap_or("").trim().is_empty() {
-                            i.queued_by = Some(by.clone());
-                        }
-                        i
-                    })
-                    .collect()
+                stamp_host_attribution(items, &by)
             }
         };
         self.insert_queued(items, next, from.clone()).await;
@@ -5911,6 +5915,9 @@ impl AppState {
                 RemoteAction::Pause => {
                     let _ = self.player.pause();
                 }
+                RemoteAction::Toggle => {
+                    let _ = self.resume_or_toggle().await;
+                }
                 RemoteAction::Next => self.next_in_queue_local().await,
                 RemoteAction::Previous => self.prev_in_queue().await,
                 RemoteAction::Seek { position_ms } => {
@@ -6227,6 +6234,21 @@ impl AppState {
     }
 }
 
+/// Attribute room adds without losing a bot's requester. A nameless add keeps the old single pill
+/// (the host); when `queued_by` is a bot's `requested_by`, the host becomes `submitted_by` so the
+/// queue can show both names. A guest's forwarded row already carries its submitter and is left
+/// alone.
+fn stamp_host_attribution(mut items: Vec<SongItem>, by: &str) -> Vec<SongItem> {
+    for item in &mut items {
+        if item.queued_by.as_deref().unwrap_or("").trim().is_empty() {
+            item.queued_by = Some(by.to_string());
+        } else if item.submitted_by.is_none() {
+            item.submitted_by = Some(by.to_string());
+        }
+    }
+    items
+}
+
 pub(crate) fn song_to_track(s: &SongItem) -> Track {
     Track {
         id: s.video_id.clone(),
@@ -6235,6 +6257,7 @@ pub(crate) fn song_to_track(s: &SongItem) -> Track {
         thumbnail: s.thumbnail.clone(),
         duration_ms: parse_duration_ms(s.duration.as_deref()),
         queued_by: s.queued_by.clone(),
+        submitted_by: s.submitted_by.clone(),
     }
 }
 
@@ -6397,6 +6420,7 @@ fn track_to_song(t: &Track) -> SongItem {
         added_at: None,
         rating: None,
         queued_by: t.queued_by.clone(),
+        submitted_by: t.submitted_by.clone(),
         queued: false,
         queued_end: false,
         queued_from: None,
@@ -7241,10 +7265,10 @@ mod tests {
         history_threshold, is_mix, loudness_gain, merge_radio, next_index, parse_duration_ms,
         persist_fingerprint, playlist_context, prefer_version, prev_track_title, put_url,
         queue_fingerprint, queue_neighbors_from_snapshot, radio_seed_for, remote_list,
-        retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into, swap_version,
-        trim_played, twin_position, unshuffled, upcoming_queued, AppState, HubDedupe, QueueState,
-        RepeatMode, VideoUrls, CONTROL_API_SEARCH_RECORD_HISTORY, KEEP_PLAYED,
-        LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
+        retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into,
+        stamp_host_attribution, swap_version, trim_played, twin_position, unshuffled,
+        upcoming_queued, AppState, HubDedupe, QueueState, RepeatMode, VideoUrls,
+        CONTROL_API_SEARCH_RECORD_HISTORY, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
     };
 
     #[test]
@@ -7260,6 +7284,33 @@ mod tests {
         assert!(!dedupe.suppress_queue_event(at));
         assert!(dedupe.suppress_queue_event(at + Duration::from_millis(20)));
         assert!(!dedupe.suppress_queue_event(at + Duration::from_millis(120)));
+    }
+
+    #[test]
+    fn host_attribution_keeps_bot_requester_and_room_submitter_apart() {
+        let rows = stamp_host_attribution(
+            vec![
+                innertube::SongItem { video_id: "bot".into(), ..Default::default() },
+                innertube::SongItem {
+                    video_id: "api".into(),
+                    queued_by: Some("twitch_viewer".into()),
+                    ..Default::default()
+                },
+                innertube::SongItem {
+                    video_id: "guest".into(),
+                    queued_by: Some("twitch_viewer".into()),
+                    submitted_by: Some("room_guest".into()),
+                    ..Default::default()
+                },
+            ],
+            "host_name",
+        );
+        assert_eq!(rows[0].queued_by.as_deref(), Some("host_name"));
+        assert!(rows[0].submitted_by.is_none(), "one name stays one pill");
+        assert_eq!(rows[1].queued_by.as_deref(), Some("twitch_viewer"));
+        assert_eq!(rows[1].submitted_by.as_deref(), Some("host_name"));
+        assert_eq!(rows[2].queued_by.as_deref(), Some("twitch_viewer"));
+        assert_eq!(rows[2].submitted_by.as_deref(), Some("room_guest"));
     }
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live

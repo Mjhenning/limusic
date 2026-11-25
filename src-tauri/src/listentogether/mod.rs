@@ -7,6 +7,7 @@
 //! No back-reference to `AppState` (avoids an Arc cycle): everything the connection needs is the
 //! `AppHandle` (to emit UI events) and the sync channel.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,11 +15,12 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use listen_protocol::{
-    ClientMessage, Playback, PlaybackKind, RoomState, ServerMessage, Suggestion, Track, User,
+    ClientMessage, Playback, PlaybackKind, RemoteAction, RoomState, ServerMessage,
+    SharedControlEnvelope, Suggestion, Track, User,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -53,6 +55,14 @@ pub enum SyncCommand {
     /// `queued_by` already stamped with the guest's name).
     GuestAdd {
         track: Track,
+    },
+    /// Host: an opted-in guest asked this player to apply a control. The bridge applies it through
+    /// `AppState::apply_link` and sends the correlated result back to `from`.
+    SharedControlRequest {
+        id: String,
+        from: String,
+        action: RemoteAction,
+        submitted_by: Option<String>,
     },
     /// We just became host of a freshly-created room — seed the room with our current now-playing.
     HostSeed,
@@ -91,6 +101,11 @@ impl Status {
 /// clearing the field is how a self-hoster comes back to the default.
 pub(crate) const DEFAULT_SERVER: &str = "wss://sync.limusic.app/ws";
 
+/// How long a guest's local Control API waits for the host's correlated answer. Matches the HTTP
+/// side's longest mutation deadline: a request that outlives this answers `shared_control_failed`
+/// instead of leaving the caller waiting forever.
+pub(crate) const SHARED_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The previous default, a Tailscale Funnel address some ISP filters reset (#627). Builds that
 /// pre-filled the server field saved it into the setting and minted it into invites, so it still
 /// arrives from both. It means the default, so it is stored as empty and moves with
@@ -123,6 +138,14 @@ struct Inner {
     pending_joins: Vec<(String, String)>, // (user_id, username)
     suggestions: Vec<Suggestion>,
     outbound: Option<mpsc::UnboundedSender<ClientMessage>>,
+    /// Persisted host opt-in. Survives leaving rooms so the next room starts with the same policy.
+    shared_control_enabled: bool,
+    /// What the relay advertises in `RoomState`.
+    shared_control_capable: bool,
+    /// The current host's opt-in, mirrored from `RoomState`.
+    shared_control: bool,
+    /// The current host's fork capability, mirrored from `RoomState`.
+    host_shared_control_capable: bool,
 }
 
 impl Default for Role {
@@ -154,6 +177,9 @@ impl Inner {
         self.pending_joins.clear();
         self.suggestions.clear();
         self.outbound = None;
+        self.shared_control_capable = false;
+        self.shared_control = false;
+        self.host_shared_control_capable = false;
         self.status_connected = false;
         self.connecting = false;
         self.requesting = false;
@@ -164,6 +190,9 @@ impl Inner {
         self.users = state.users.clone();
         self.current_track = state.current_track.clone();
         self.queue = state.queue.clone();
+        self.shared_control_capable = state.shared_control_capable;
+        self.shared_control = state.shared_control;
+        self.host_shared_control_capable = state.host_shared_control_capable;
     }
 }
 
@@ -173,6 +202,10 @@ pub struct LtSession {
     sync_tx: mpsc::UnboundedSender<SyncCommand>,
     /// Bumped to cancel the running connection loop (leave / new connection).
     gen: AtomicU64,
+    /// Guest requests waiting for `control_result`, keyed by correlation id.
+    pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>>,
+    /// Monotonic suffix for correlation ids; the generation prefix makes them unique across rooms.
+    control_id: AtomicU64,
 }
 
 impl LtSession {
@@ -180,16 +213,23 @@ impl LtSession {
     pub fn new(
         app: AppHandle,
         server_url: String,
+        shared_control_enabled: bool,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<SyncCommand>) {
         // rustls needs a process-wide crypto provider before the first `wss://` handshake.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (sync_tx, sync_rx) = mpsc::unbounded_channel();
-        let inner = Inner { server_url: stored_url(server_url), ..Inner::default() };
+        let inner = Inner {
+            server_url: stored_url(server_url),
+            shared_control_enabled,
+            ..Inner::default()
+        };
         let s = Arc::new(LtSession {
             app,
             inner: Arc::new(Mutex::new(inner)),
             sync_tx,
             gen: AtomicU64::new(0),
+            pending_control: Arc::new(Mutex::new(HashMap::new())),
+            control_id: AtomicU64::new(0),
         });
         (s, sync_rx)
     }
@@ -213,6 +253,111 @@ impl LtSession {
 
     pub async fn is_host(&self) -> bool {
         self.inner.lock().await.role == Role::Host
+    }
+
+    /// Persist and announce the host's opt-in. The setting applies to the next room too; while a
+    /// room is live the relay publishes a fresh `sync_state` so every guest sees the change.
+    pub async fn set_shared_control_enabled(&self, on: bool) {
+        let host = {
+            let mut inner = self.inner.lock().await;
+            inner.shared_control_enabled = on;
+            inner.role == Role::Host
+        };
+        if host {
+            self.announce_shared_control().await;
+        }
+        self.emit_state().await;
+    }
+
+    async fn announce_shared_control(&self) {
+        let on = self.inner.lock().await.shared_control_enabled;
+        self.send(ClientMessage::Remote {
+            action: SharedControlEnvelope::SetSharedControl { on, shared_control_capable: true }
+                .to_value(),
+            to: None,
+        })
+        .await;
+    }
+
+    /// True when a local Control API mutation may be forwarded to this room's host instead of being
+    /// rejected with `listen_together_guest`. All three facts come from the authoritative state;
+    /// an older relay or host leaves at least one of them false.
+    pub async fn shared_control_allowed(&self) -> bool {
+        let inner = self.inner.lock().await;
+        inner.role == Role::Guest
+            && inner.shared_control_capable
+            && inner.shared_control
+            && inner.host_shared_control_capable
+            && inner.outbound.is_some()
+    }
+
+    /// Guest: forward one API mutation to the host and wait for the correlated answer.
+    pub async fn forward_shared_control(&self, action: RemoteAction) -> Result<(), String> {
+        if !self.shared_control_allowed().await {
+            return Err("this host has not enabled shared control".into());
+        }
+        let id = format!(
+            "{}-{}",
+            self.gen.load(Ordering::SeqCst),
+            self.control_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let (tx, rx) = oneshot::channel();
+        self.pending_control.lock().await.insert(id.clone(), tx);
+        let submitted_by = self.my_username().await;
+        self.send(ClientMessage::Remote {
+            action: SharedControlEnvelope::ControlRequest {
+                id: id.clone(),
+                action: stamp_shared_action(action, submitted_by.as_deref()),
+                shared_control_capable: true,
+                submitted_by,
+            }
+            .to_value(),
+            to: None,
+        })
+        .await;
+
+        let result = match tokio::time::timeout(SHARED_CONTROL_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("the Listen Together connection closed".into()),
+            Err(_) => {
+                self.pending_control.lock().await.remove(&id);
+                Err("the host did not answer within 15 seconds".into())
+            }
+        };
+        result
+    }
+
+    async fn settle_control(&self, id: String, result: Result<(), String>) {
+        if let Some(tx) = self.pending_control.lock().await.remove(&id) {
+            let _ = tx.send(result);
+        }
+    }
+
+    async fn fail_pending(&self, reason: &str) {
+        let pending = std::mem::take(&mut *self.pending_control.lock().await);
+        for (_, tx) in pending {
+            let _ = tx.send(Err(reason.to_string()));
+        }
+    }
+
+    /// Host: answer a guest's request after the bridge applied it. Only a host can send results;
+    /// the relay checks that before routing them.
+    pub(crate) async fn send_control_result(
+        &self,
+        id: String,
+        to: String,
+        result: Result<(), String>,
+    ) {
+        self.send(ClientMessage::Remote {
+            action: SharedControlEnvelope::ControlResult {
+                id,
+                ok: result.is_ok(),
+                error: result.err(),
+            }
+            .to_value(),
+            to: Some(to),
+        })
+        .await;
     }
 
     /// Our own display name in the room (None outside one) — stamps the host's queue adds.
@@ -302,6 +447,7 @@ impl LtSession {
         self.send(ClientMessage::LeaveRoom).await;
         self.gen.fetch_add(1, Ordering::SeqCst); // cancel the connection loop
         self.inner.lock().await.reset_room();
+        self.fail_pending("the Listen Together room was left").await;
         let _ = self.sync_tx.send(SyncCommand::Release);
         self.emit_state().await;
     }
@@ -323,6 +469,7 @@ impl LtSession {
             inner.connecting = true;
             inner.requesting = true; // waiting for the room to materialize
         }
+        self.fail_pending("the Listen Together room changed").await;
         self.emit_state().await;
         let gen = self.gen.load(Ordering::SeqCst);
         let me = self.clone();
@@ -485,12 +632,50 @@ impl LtSession {
         sanitize(&mut sm);
         match sm {
             ServerMessage::Pong => return false,
-            // Device link messages: the server never sends them to a Listen Together socket.
+            // Device link messages: the server never sends them to a Listen Together socket,
+            // except `Remote`, which is also how optional shared control travels.
             ServerMessage::LinkJoined { .. }
             | ServerMessage::PairCode { .. }
             | ServerMessage::Paired { .. }
-            | ServerMessage::Remote { .. }
             | ServerMessage::LinkStatus { .. } => return false,
+
+            ServerMessage::Remote { from, action } => {
+                let Ok(envelope) = serde_json::from_value::<SharedControlEnvelope>(action) else {
+                    return false;
+                };
+                match envelope {
+                    // The relay already applied the change and sent a fresh `sync_state`.
+                    SharedControlEnvelope::SetSharedControl { .. } => {}
+                    SharedControlEnvelope::ControlRequest { id, action, submitted_by, .. } => {
+                        let allowed = {
+                            let inner = self.inner.lock().await;
+                            inner.role == Role::Host
+                                && inner.shared_control
+                                && inner.host_shared_control_capable
+                        };
+                        if !allowed {
+                            return false;
+                        }
+                        let _ = self.sync_tx.send(SyncCommand::SharedControlRequest {
+                            id,
+                            from,
+                            action,
+                            submitted_by,
+                        });
+                    }
+                    SharedControlEnvelope::ControlResult { id, ok, error } => {
+                        self.settle_control(
+                            id,
+                            if ok {
+                                Ok(())
+                            } else {
+                                Err(error.unwrap_or_else(|| "the host refused the control".into()))
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
 
             ServerMessage::RoomCreated { room_code: _, user_id, session_token, state } => {
                 {
@@ -501,6 +686,8 @@ impl LtSession {
                     inner.session_token = Some(session_token);
                     inner.absorb(&state);
                 }
+                // Tell the relay our persisted opt-in before any guest can ask to control us.
+                self.announce_shared_control().await;
                 // Seed the room with whatever we're currently playing.
                 let _ = self.sync_tx.send(SyncCommand::HostSeed);
             }
@@ -545,7 +732,9 @@ impl LtSession {
                     inner.my_id = Some(user_id);
                     inner.absorb(&state);
                 }
-                if !is_host {
+                if is_host {
+                    self.announce_shared_control().await;
+                } else {
                     let _ = self.sync_tx.send(SyncCommand::ApplyState(state));
                 }
             }
@@ -594,6 +783,10 @@ impl LtSession {
                     became
                 };
                 if became_host {
+                    // The relay cleared the old host's opt-in; announce ours and pull the reset
+                    // state before any new guest can ask to control us.
+                    self.announce_shared_control().await;
+                    self.request_sync().await;
                     // We now control playback locally — stop applying remote sync.
                     let _ = self.sync_tx.send(SyncCommand::Release);
                     self.emit_notice("You're the host now.").await;
@@ -627,6 +820,9 @@ impl LtSession {
                     return false;
                 }
                 track.queued_by = Some(suggestion.from_username.clone());
+                // Also set the submitter so the host's enqueue path doesn't overwrite the guest's
+                // name with the host's when a bot's requester is absent. The UI dedupes equal names.
+                track.submitted_by = Some(suggestion.from_username.clone());
                 let title = track.title.clone();
                 self.send(ClientMessage::ApproveSuggestion { id: suggestion.id }).await;
                 let _ = self.sync_tx.send(SyncCommand::GuestAdd { track });
@@ -645,6 +841,11 @@ impl LtSession {
                 return true;
             }
             ServerMessage::Error { code, message } => {
+                // The relay has no correlation id on a refusal, but a host that turned shared
+                // control off mid-flight applies to every waiting guest request.
+                if code == "shared_control_unavailable" {
+                    self.fail_pending(&message).await;
+                }
                 self.emit_notice(&message).await;
                 // Any error that arrives before we're actually in a room means create/join failed:
                 // close instead of leaving the UI spinning on "waiting for the host". Once in a
@@ -705,6 +906,7 @@ impl LtSession {
         }
         self.gen.fetch_add(1, Ordering::SeqCst);
         self.inner.lock().await.reset_room();
+        self.fail_pending("the Listen Together room closed").await;
         let _ = self.sync_tx.send(SyncCommand::Release);
         self.emit_state().await;
     }
@@ -735,6 +937,10 @@ impl LtSession {
                 .map(|(id, name)| serde_json::json!({ "userId": id, "username": name }))
                 .collect::<Vec<_>>(),
             "suggestions": inner.suggestions,
+            "sharedControlEnabled": inner.shared_control_enabled,
+            "sharedControlCapable": inner.shared_control_capable,
+            "sharedControl": inner.shared_control,
+            "hostSharedControlCapable": inner.host_shared_control_capable,
         })
     }
 
@@ -755,6 +961,35 @@ impl LtSession {
 /// local paths, and the username in them, off the relay; guests couldn't play the file anyway.
 pub(crate) fn shareable(t: &Track) -> bool {
     t.id.len() == 11 && t.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Stamp the room client onto every track in a forwarded queue action. `queued_by` keeps the
+/// bot's requester when there is one; the submitter is carried separately so the host can show
+/// both names (guest → twitch user) instead of overwriting one with the other.
+pub(crate) fn stamp_shared_action(action: RemoteAction, by: Option<&str>) -> RemoteAction {
+    let Some(by) = by.filter(|by| !by.trim().is_empty()) else {
+        return action;
+    };
+    let stamp = |mut tracks: Vec<Track>| {
+        for track in &mut tracks {
+            if track.submitted_by.is_none() {
+                track.submitted_by = Some(by.to_string());
+            }
+            if track.queued_by.as_deref().unwrap_or("").trim().is_empty() {
+                track.queued_by = Some(by.to_string());
+            }
+        }
+        tracks
+    };
+    match action {
+        RemoteAction::PlayNext { tracks, from } => {
+            RemoteAction::PlayNext { tracks: stamp(tracks), from }
+        }
+        RemoteAction::AddToQueue { tracks, from } => {
+            RemoteAction::AddToQueue { tracks: stamp(tracks), from }
+        }
+        other => other,
+    }
 }
 
 fn keep_shareable(p: &mut Playback) {
@@ -873,6 +1108,7 @@ mod tests {
             thumbnail: None,
             duration_ms: 0,
             queued_by: None,
+            submitted_by: None,
         }
     }
 
@@ -898,6 +1134,28 @@ mod tests {
 
         assert!(!shareable(&track("../../etc/pas")));
         assert!(shareable(&track("a-B_c123456")));
+    }
+
+    #[test]
+    fn forwarded_rows_keep_both_the_submitter_and_the_bot_requester() {
+        let mut guest = track("dQw4w9WgXcQ");
+        guest.queued_by = Some("twitch_viewer".into());
+        let action = stamp_shared_action(
+            RemoteAction::PlayNext { tracks: vec![guest], from: None },
+            Some("room_guest"),
+        );
+        let RemoteAction::PlayNext { tracks, .. } = action else { unreachable!() };
+        assert_eq!(tracks[0].submitted_by.as_deref(), Some("room_guest"));
+        assert_eq!(tracks[0].queued_by.as_deref(), Some("twitch_viewer"));
+
+        // No requester from the bot: the room client is the only name, once.
+        let action = stamp_shared_action(
+            RemoteAction::AddToQueue { tracks: vec![track("a-B_c123456")], from: None },
+            Some("room_guest"),
+        );
+        let RemoteAction::AddToQueue { tracks, .. } = action else { unreachable!() };
+        assert_eq!(tracks[0].submitted_by.as_deref(), Some("room_guest"));
+        assert_eq!(tracks[0].queued_by.as_deref(), Some("room_guest"));
     }
 
     /// The bug: a dead address ahead of a live one used to cost a full OS SYN timeout (~127s on

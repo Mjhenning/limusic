@@ -260,6 +260,11 @@
 					control: controlStatus
 				})}
 				{@render row({
+					title: t('settings.integrations.shared_control'),
+					desc: t('settings.integrations.shared_control_hint'),
+					control: sharedControlSwitch
+				})}
+				{@render row({
 					title: t('settings.integrations.bind_mode'),
 					desc: t('settings.integrations.bind_mode_hint'),
 					control: bindPicker,
@@ -364,6 +369,14 @@
 
 {#snippet controlStatus()}
 	<span class={badgeClass(controlBadge.bad)}>{controlBadge.text}</span>
+{/snippet}
+
+{#snippet sharedControlSwitch()}
+	<Switch
+		checked={settings?.control_api.shared_control ?? false}
+		disabled={applying || !settings}
+		onCheckedChange={(on) => setControl({ shared_control: on })}
+	/>
 {/snippet}
 
 {#snippet bindPicker()}

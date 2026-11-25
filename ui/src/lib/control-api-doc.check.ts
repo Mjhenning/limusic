@@ -23,6 +23,8 @@ const doc = read(join(root, 'docs', 'CONTROL-API.md'));
 const handlers = read(join(root, 'src-tauri', 'src', 'control_api', 'handlers.rs'));
 const server = read(join(root, 'src-tauri', 'src', 'control_api', 'server.rs'));
 const ws = read(join(root, 'src-tauri', 'src', 'control_api', 'ws.rs'));
+const protocol = read(join(root, 'crates', 'listen-protocol', 'src', 'lib.rs'));
+const sync = read(join(root, 'crates', 'sync-server', 'src', 'main.rs'));
 
 // --- call index vs. axum routes ---------------------------------------------------------------
 const start = doc.indexOf('### Call index');
@@ -76,5 +78,24 @@ for (const match of sources.matchAll(/(?:close_all|stop_control_api)\("([^"]+)"\
 }
 ok(ws.includes('code: 1001'), 'ws.rs sends close code 1001');
 ok(closeSection.includes('1001'), 'the close-frame section names code 1001');
+
+// --- optional shared Listen Together control --------------------------------------------------
+const sharedStart = doc.indexOf('## Shared Listen Together control');
+const sharedEnd = doc.indexOf('## Examples', sharedStart);
+ok(sharedStart >= 0 && sharedEnd > sharedStart, 'CONTROL-API.md documents shared control');
+const sharedSection = doc.slice(sharedStart, sharedEnd);
+for (const text of [
+	'listen_together_guest',
+	'shared_control_failed',
+	'15 s',
+	'base clients',
+	'/queue/request'
+]) {
+	ok(sharedSection.includes(text), `shared-control docs mention ${text}`);
+}
+ok(handlers.includes('forward_shared_control'), 'handlers forward opted-in guest mutations');
+ok(protocol.includes('SharedControlEnvelope'), 'the wire shape is in listen-protocol');
+ok(sync.includes('MAX_SHARED_CONTROL'), 'the relay bounds shared-control envelopes');
+ok(doc.includes('| 502 | `shared_control_failed` |'), 'the error table has shared_control_failed');
 
 console.log('ok');

@@ -1,5 +1,6 @@
 //! HTTP handlers and bearer-token middleware for the local control API.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use innertube::SongItem;
+use listen_protocol::RemoteAction;
 
 use super::types::{
     duration_secs, ApiJson, ApiQuery, ApiShared, ApiTrack, ErrorBody, NextResponse,
@@ -101,7 +104,8 @@ async fn status(State(shared): State<Arc<ApiShared>>) -> Response {
 }
 
 /// `GET /api/v1/now-playing`: the currently heard track and its transport facts. `now` is the
-/// shared queue-row projection, so it carries `album_id`, `queued_by` and the queue flags;
+/// shared queue-row projection, so it carries `album_id`, `queued_by`, `submitted_by` and the
+/// queue flags;
 /// `position` and `duration` are seconds. See [`NowPlayingResponse`].
 async fn now_playing(State(shared): State<Arc<ApiShared>>) -> Response {
     let snap = shared.context.playback_snapshot().await;
@@ -141,6 +145,42 @@ async fn guard(shared: &ApiShared) -> Result<(), ErrorBody> {
     Ok(())
 }
 
+/// A guest in an opted-in fork room forwards its mutation to the host and answers from the
+/// correlated result. Everywhere else this returns `None` so the handler's normal guard and apply
+/// path run unchanged. The response builder is only called after the host has answered.
+async fn forward_if_guest<F, Fut>(
+    shared: &ApiShared,
+    action: RemoteAction,
+    response: F,
+) -> Result<Option<Response>, ErrorBody>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Response>,
+{
+    if !shared.context.is_guest().await {
+        return Ok(None);
+    }
+    if !shared.context.shared_control_allowed().await {
+        return Err(ErrorBody::listen_together_guest());
+    }
+    shared
+        .context
+        .forward_shared_control(action)
+        .await
+        .map_err(ErrorBody::shared_control_failed)?;
+    Ok(Some(response().await))
+}
+
+macro_rules! forward_guest {
+    ($shared:expr, $action:expr, $response:expr) => {
+        match forward_if_guest($shared, $action, $response).await {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(error) => return error.into_response(),
+        }
+    };
+}
+
 fn bad_request(error: &'static str, message: impl Into<String>) -> ErrorBody {
     ErrorBody::new(StatusCode::BAD_REQUEST, error, message)
 }
@@ -162,6 +202,9 @@ async fn mutation_lock(shared: &ApiShared) -> Result<tokio::sync::OwnedMutexGuar
 
 /// `POST /api/v1/playback/play`: idempotent. Starts a restored queue when mpv is idle.
 async fn play(State(shared): State<Arc<ApiShared>>) -> Response {
+    forward_guest!(&shared, RemoteAction::Play, || async {
+        Json(PlaybackStateResponse { ok: true, playing: true }).into_response()
+    });
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -171,6 +214,9 @@ async fn play(State(shared): State<Arc<ApiShared>>) -> Response {
 
 /// `POST /api/v1/playback/pause`: idempotent. Safe on an idle or already-paused queue.
 async fn pause(State(shared): State<Arc<ApiShared>>) -> Response {
+    forward_guest!(&shared, RemoteAction::Pause, || async {
+        Json(PlaybackStateResponse { ok: true, playing: false }).into_response()
+    });
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -180,6 +226,18 @@ async fn pause(State(shared): State<Arc<ApiShared>>) -> Response {
 
 /// `POST /api/v1/playback/toggle`: flips transport state and reports the final state.
 async fn toggle(State(shared): State<Arc<ApiShared>>) -> Response {
+    // The mirrored snapshot is the guest's view of host state; Toggle is applied there, so the
+    // post-command state is its inverse.
+    let playing = !shared
+        .context
+        .playback_snapshot()
+        .await
+        .get("paused")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    forward_guest!(&shared, RemoteAction::Toggle, || async {
+        Json(PlaybackStateResponse { ok: true, playing }).into_response()
+    });
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -198,6 +256,9 @@ async fn toggle(State(shared): State<Arc<ApiShared>>) -> Response {
 /// does **not** by itself prove failure; clients should use an HTTP timeout of at least 20 s and
 /// re-read `/status` before retrying.
 async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
+    forward_guest!(&shared, RemoteAction::Next, || async {
+        Json(NextResponse { ok: true, current: current_api_track(&shared).await }).into_response()
+    });
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -241,6 +302,14 @@ async fn next(State(shared): State<Arc<ApiShared>>) -> Response {
 /// `restarted` (which branch ran) and `current` (the row now playing). The read-only queue
 /// `previous` field is always current-1.
 async fn previous(State(shared): State<Arc<ApiShared>>) -> Response {
+    forward_guest!(&shared, RemoteAction::Previous, || async {
+        Json(PreviousResponse {
+            ok: true,
+            restarted: false,
+            current: current_api_track(&shared).await,
+        })
+        .into_response()
+    });
     let _lock = match mutation_lock(&shared).await {
         Ok(lock) => lock,
         Err(error) => return error.into_response(),
@@ -271,8 +340,10 @@ async fn seek(
     State(shared): State<Arc<ApiShared>>,
     ApiJson(body): ApiJson<SeekRequest>,
 ) -> Response {
-    if let Err(error) = guard(&shared).await {
-        return error.into_response();
+    if !shared.context.is_guest().await {
+        if let Err(error) = guard(&shared).await {
+            return error.into_response();
+        }
     }
     if !body.position_sec.is_finite() || body.position_sec < 0.0 {
         return bad_request("invalid_position", "position must be finite and non-negative")
@@ -284,6 +355,13 @@ async fn seek(
         return bad_request("invalid_position", "position exceeds the current duration")
             .into_response();
     }
+    forward_guest!(
+        &shared,
+        RemoteAction::Seek { position_ms: (body.position_sec * 1000.0).round() as i64 },
+        || async {
+            Json(SeekResponse { ok: true, position_sec: body.position_sec }).into_response()
+        }
+    );
     match shared.context.clone().seek(body.position_sec).await {
         Ok(position) => Json(SeekResponse { ok: true, position_sec: position }).into_response(),
         Err(message) => ErrorBody::playback_error(message).into_response(),
@@ -295,13 +373,20 @@ async fn volume(
     State(shared): State<Arc<ApiShared>>,
     ApiJson(body): ApiJson<VolumeRequest>,
 ) -> Response {
-    if let Err(error) = guard(&shared).await {
-        return error.into_response();
+    if !shared.context.is_guest().await {
+        if let Err(error) = guard(&shared).await {
+            return error.into_response();
+        }
     }
     if !(0..=100).contains(&body.volume) {
         return bad_request("invalid_volume", "volume must be an integer from 0 to 100")
             .into_response();
     }
+    forward_guest!(
+        &shared,
+        RemoteAction::SetVolume { volume: body.volume as f64 / 100.0 },
+        || async { Json(VolumeResponse { ok: true, volume: body.volume }).into_response() }
+    );
     match shared.context.clone().set_volume(body.volume).await {
         Ok(()) => Json(VolumeResponse { ok: true, volume: body.volume }).into_response(),
         Err(message) => ErrorBody::playback_error(message).into_response(),
@@ -323,8 +408,12 @@ async fn remove(
         Ok(lock) => lock,
         Err(error) => return error.into_response(),
     };
-    if let Err(error) = guard(&shared).await {
-        return error.into_response();
+    // A guest may be forwarding; `forward_guest!` below applies the same opt-in check before any
+    // local mutation. Other callers still go through the shared guard first.
+    if !shared.context.is_guest().await {
+        if let Err(error) = guard(&shared).await {
+            return error.into_response();
+        }
     }
     let snap = shared.context.queue_snapshot().await;
     let current =
@@ -343,6 +432,17 @@ async fn remove(
             return ErrorBody::queue_changed().into_response();
         }
     }
+    let id = snap
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rows| rows.get(body.index))
+        .and_then(row_video_id)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    forward_guest!(&shared, RemoteAction::Remove { index: body.index, id }, || async {
+        Json(OkResponse { ok: true }).into_response()
+    });
     shared.context.clone().remove_at(body.index).await;
     Json(OkResponse { ok: true }).into_response()
 }
@@ -353,6 +453,9 @@ async fn clear_queued(State(shared): State<Arc<ApiShared>>) -> Response {
         Ok(lock) => lock,
         Err(error) => return error.into_response(),
     };
+    forward_guest!(&shared, RemoteAction::ClearQueued, || async {
+        Json(OkResponse { ok: true }).into_response()
+    });
     if let Err(error) = guard(&shared).await {
         return error.into_response();
     }
@@ -385,9 +488,40 @@ fn resolve_error(error: ResolveError) -> ErrorBody {
     }
 }
 
+/// The relay only accepts YouTube ids, which is also what a host can apply. A local-file row
+/// cannot cross the wire; refusing it here keeps the guest's API from claiming a successful add.
+fn shared_track(item: &SongItem) -> Option<listen_protocol::Track> {
+    let track = listen_protocol::Track {
+        id: item.video_id.clone(),
+        title: item.title.clone(),
+        artist: item.artists.clone(),
+        thumbnail: item.thumbnail.clone(),
+        duration_ms: duration_secs(item.duration.as_deref()).unwrap_or(0) as i64 * 1000,
+        queued_by: item.queued_by.clone(),
+        submitted_by: item.submitted_by.clone(),
+    };
+    crate::listentogether::shareable(&track).then_some(track)
+}
+
+/// After a forwarded add, answer with the guest's mirrored row. The host's broadcast reaches this
+/// client through the same Listen Together state pump, so a missing row is represented by a default
+/// track rather than a second round trip.
+async fn forwarded_queue_response(shared: &ApiShared, video_id: &str) -> Response {
+    let snap = shared.context.queue_snapshot().await;
+    let items =
+        snap.get("items").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    let position = items
+        .iter()
+        .position(|row| row_video_id(row).and_then(serde_json::Value::as_str) == Some(video_id))
+        .unwrap_or(0);
+    let row = items.get(position).cloned().unwrap_or(serde_json::Value::Null);
+    Json(QueueRequestResponse { ok: true, position, item: ApiTrack::from_value(&row) })
+        .into_response()
+}
+
 /// `POST /api/v1/queue/request`: resolve one song and add it to the queue. The response is
 /// `{ok, position, item}`; `position` is the final zero-based index and `item` is the queued
-/// [`ApiTrack`], including `is_video`, `duration_sec` and `queued_by`.
+/// [`ApiTrack`], including `is_video`, `duration_sec`, `queued_by` and `submitted_by`.
 ///
 /// `max_duration_sec` measures the version that will actually play: the queued `video_id`'s own
 /// duration, never its counterpart's. No extra `/player` lookup is made. It fails closed with 422
@@ -398,9 +532,6 @@ fn resolve_error(error: ResolveError) -> ErrorBody {
 /// previous skip never leaves this endpoint guessing: it holds the same mutation lock as other
 /// current-track/queue changes.
 async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Response {
-    if let Err(error) = guard(&shared).await {
-        return error.into_response();
-    }
     let parsed = match parse_input(&body.input) {
         Ok(parsed) => parsed,
         Err(error) => return parse_error(error).into_response(),
@@ -434,6 +565,31 @@ async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Res
         if !by.is_empty() {
             item.queued_by = Some(by.to_string());
         }
+    }
+    if shared.context.is_guest().await {
+        if !shared.context.shared_control_allowed().await {
+            return ErrorBody::listen_together_guest().into_response();
+        }
+        let Some(track) = shared_track(&item) else {
+            return ErrorBody::shared_control_failed(
+                "that track cannot be shared with the Listen Together host",
+            )
+            .into_response();
+        };
+        // `from` names an album/playlist source in the link protocol, not a requester. API
+        // requests have no source, so leave it empty; attribution rides on the track itself.
+        let from = None;
+        let action = if body.play_next.unwrap_or(true) {
+            RemoteAction::PlayNext { tracks: vec![track], from }
+        } else {
+            RemoteAction::AddToQueue { tracks: vec![track], from }
+        };
+        forward_guest!(&shared, action, || async {
+            forwarded_queue_response(&shared, &item.video_id).await
+        });
+    }
+    if let Err(error) = guard(&shared).await {
+        return error.into_response();
     }
     let _lock = match mutation_lock(&shared).await {
         Ok(lock) => lock,
@@ -537,6 +693,7 @@ mod tests {
         autoplay: bool,
         queued: bool,
         queued_by: Option<String>,
+        submitted_by: Option<String>,
         album: Option<String>,
         album_id: Option<String>,
     }
@@ -544,6 +701,12 @@ mod tests {
     #[derive(Debug)]
     struct MockContext {
         guest: bool,
+        /// Opt-in state reported by the mock `shared_control_allowed`.
+        shared_control: bool,
+        /// Actions the mock host received, in order.
+        forwarded: StdMutex<Vec<RemoteAction>>,
+        /// Simulated correlated failure from the host.
+        forward_error: Option<String>,
         linked: bool,
         restarted: bool,
         hub: tokio::sync::broadcast::Sender<HubEvent>,
@@ -578,6 +741,9 @@ mod tests {
             let (hub, _) = tokio::sync::broadcast::channel(64);
             Self {
                 guest: false,
+                shared_control: false,
+                forwarded: StdMutex::new(Vec::new()),
+                forward_error: None,
                 linked: false,
                 restarted: false,
                 hub,
@@ -613,6 +779,7 @@ mod tests {
                         autoplay: false,
                         queued: false,
                         queued_by: Some("friend".into()),
+                        submitted_by: Some("room_guest".into()),
                         album: Some("Mr. Brightside Album".into()),
                         album_id: Some("MPREb_LU3E5vWgwfG".into()),
                     },
@@ -622,6 +789,7 @@ mod tests {
                         autoplay: false,
                         queued: false,
                         queued_by: Some("friend".into()),
+                        submitted_by: Some("room_guest".into()),
                         ..Default::default()
                     },
                     MockRow {
@@ -658,7 +826,7 @@ mod tests {
     impl ControlApiContext for MockContext {
         async fn playback_snapshot(&self) -> Value {
             json!({
-                "now": { "videoId": "abc", "queued_by": "friend" },
+                "now": { "videoId": "abc", "queued_by": "friend", "submitted_by": "room_guest" },
                 "paused": self.event_paused.load(Ordering::SeqCst),
                 "position": self.position,
                 "duration": self.duration,
@@ -684,6 +852,9 @@ mod tests {
                     });
                     if let Some(by) = &row.queued_by {
                         item.as_object_mut().unwrap().insert("queued_by".into(), json!(by));
+                    }
+                    if let Some(by) = &row.submitted_by {
+                        item.as_object_mut().unwrap().insert("submitted_by".into(), json!(by));
                     }
                     item
                 })
@@ -718,6 +889,18 @@ mod tests {
 
         async fn is_guest(&self) -> bool {
             self.guest
+        }
+
+        async fn shared_control_allowed(&self) -> bool {
+            self.guest && self.shared_control
+        }
+
+        async fn forward_shared_control(&self, action: RemoteAction) -> Result<(), String> {
+            self.forwarded.lock().unwrap().push(action);
+            match self.forward_error.clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
 
         async fn play(self: Arc<Self>) -> bool {
@@ -848,6 +1031,7 @@ mod tests {
                             autoplay: false,
                             queued: next,
                             queued_by: item.queued_by.clone(),
+                            submitted_by: item.submitted_by.clone(),
                             album: item.album.clone(),
                             album_id: item.album_id.clone(),
                         },
@@ -993,6 +1177,7 @@ mod tests {
         assert_eq!(json["listen_together_role"], "none");
         assert_eq!(json["remote_linked"], false);
         assert_eq!(json["now"]["queued_by"], "friend");
+        assert_eq!(json["now"]["submitted_by"], "room_guest");
         assert_eq!(json["position"], 1.0);
     }
 
@@ -1002,6 +1187,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = json_body(response).await;
         assert_eq!(json["now"]["queued_by"], "friend");
+        assert_eq!(json["now"]["submitted_by"], "room_guest");
         assert_eq!(json["now"]["album"], "Mr. Brightside Album");
         assert_eq!(json["now"]["album_id"], "MPREb_LU3E5vWgwfG");
         assert_eq!(json["position"], 1.0);
@@ -1018,6 +1204,7 @@ mod tests {
         assert_eq!(json["offset"], 0);
         assert_eq!(json["next"]["video_id"], "b");
         assert_eq!(json["next"]["queued_by"], "friend");
+        assert_eq!(json["next"]["submitted_by"], "room_guest");
         assert_eq!(json["next_is_autoplay_fetch"], false);
         assert!(json["previous"].is_null());
         assert!(json.get("currentIndex").is_none());
@@ -1111,6 +1298,38 @@ mod tests {
         assert!(ctx.removals.lock().unwrap().is_empty());
         assert_eq!(ctx.clears.load(Ordering::SeqCst), 0);
         assert!(ctx.inserted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn opted_in_guest_forwards_play_without_mutating_the_local_player() {
+        let (app, ctx) = test_router_with(MockContext {
+            guest: true,
+            shared_control: true,
+            ..Default::default()
+        });
+        let response =
+            request(app, "/api/v1/playback/play", json!({}), Some("Bearer abc123")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["playing"], true);
+        assert!(matches!(&ctx.forwarded.lock().unwrap()[..], [RemoteAction::Play]));
+        assert_eq!(ctx.play_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn forwarded_control_failure_is_a_gateway_error() {
+        let (app, ctx) = test_router_with(MockContext {
+            guest: true,
+            shared_control: true,
+            forward_error: Some("the host did not answer within 15 seconds".into()),
+            ..Default::default()
+        });
+        let response =
+            request(app, "/api/v1/playback/pause", json!({}), Some("Bearer abc123")).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let json = json_body(response).await;
+        assert_eq!(json["error"], "shared_control_failed");
+        assert!(json["message"].as_str().unwrap().contains("15 seconds"));
+        assert_eq!(ctx.pause_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2058,7 +2277,7 @@ mod tests {
     }
 
     fn control_settings(port: u16, enabled: bool) -> ControlApiSettings {
-        ControlApiSettings { enabled, bind: "127.0.0.1".into(), port }
+        ControlApiSettings { enabled, bind: "127.0.0.1".into(), port, shared_control: false }
     }
 
     async fn start_manager(db: Arc<Db>, port: u16, token: &str) -> IntegrationsManager {

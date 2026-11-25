@@ -94,6 +94,7 @@ parsing the message.
 | 422 | `too_long` | Track exceeds `max_duration_sec` |
 | 422 | `explicit_content` | Track is explicit and `reject_explicit` was set |
 | 500 | `playback_error` | Player operation failed |
+| 502 | `shared_control_failed` | Shared-control host did not answer within 15 s; re-read `/status` before retrying |
 | 503 | `busy` | Mutation lock waited 10 s; retry later |
 | 503 | `too_many_clients` | Eight WebSocket clients are already connected |
 | 504 | `next_timeout` | Skip did not become current within 15 s |
@@ -121,13 +122,17 @@ exposed.
   "is_video": false,
   "live": false,
   "queued_by": "bot",
+  "submitted_by": "room_guest",
   "queued": false,
   "queued_end": false
 }
 ```
 
 Optional metadata may be `null`. `duration_sec` is seconds; `duration` is the
-display string.
+display string. `queued_by` is the visible requester: a room guest in Listen
+Together, or a bot's `requested_by`. When a bot's requester differs from the
+room client that forwarded the row, `submitted_by` carries that client too; the
+queue shows both pills.
 
 ## HTTP endpoints
 
@@ -302,7 +307,7 @@ or text query and inserts it.
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `input` | string | required | URL, video id, or search query |
-| `requested_by` | string? | `null` | Stored as `queued_by` |
+| `requested_by` | string? | `null` | Stored as `queued_by`; in shared mode `submitted_by` also names the forwarding room client |
 | `max_duration_sec` | integer? | `null` | Reject tracks longer than this |
 | `allow_duplicates` | bool | `false` | Skip this request's duplicate check |
 | `play_next` | bool? | `true` | Insert into the Play-next block; `false` appends before autoplay |
@@ -444,6 +449,33 @@ total timeouts are unchanged; this is a control-API-specific ceiling.
 A timeout returns `504` with `error: "resolve_timeout"` ("song resolution did
 not finish within 12 s"). No queue row is inserted. Retrying the same input is
 safe, but check `409 duplicate` in case an earlier attempt completed.
+
+## Shared Listen Together control
+
+A guest normally gets `409 listen_together_guest`: the room's host owns playback.
+This fork can forward a mutation to that host when all of the following are
+true:
+
+- the guest and host both run this fork, and the relay is this project's
+  `sync-server` (a base client or base server never sets the capability flags);
+- **Settings ▸ Integrations ▸ Control API ▸ Shared Listen Together control**
+  is on **on the host**;
+- the guest is connected to that room and its Control API is enabled.
+
+The guest sends the same HTTP request it would send locally. It waits at most
+15 s for a correlated answer from the host, then returns the normal success
+body with the guest's current mirrored track/queue. A timeout answers `502
+shared_control_failed`; the action may still have been applied, so re-read
+`GET /api/v1/status` before retrying. With no opt-in the old `409
+listen_together_guest` is unchanged.
+
+The wire change is additive: defaulted fields in the existing room state, and
+new kinds inside the existing opaque `remote` envelope. No `ServerMessage`
+variant was added, so base clients keep joining unchanged and remain
+suggestion-only. Shared forward covers playback, seek, volume, and queue edits
+including `/queue/request`. Queue facts that the host decides locally, such as
+the three-second Previous rewind and the app's duplicate-prevention setting,
+are not replicated into the forwarded response.
 
 ## Examples
 

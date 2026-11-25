@@ -31,7 +31,9 @@ ok(!conf.plugins.updater.pubkey.includes('MDAwMDAw'), 'no all-zero placeholder k
 
 const commands = read('src-tauri/src/commands.rs');
 ok(commands.includes('pub(crate) const UPDATES_DISABLED: bool = false;'), 'updater kill switch is off');
-ok(commands.includes(`const BETA_MANIFEST: &str = "${BETA}";`), 'beta manifest comes from the fork');
+// rustfmt wraps this long constant, so match the declaration and URL separately.
+ok(commands.includes('const BETA_MANIFEST: &str ='), 'the beta manifest constant exists');
+ok(commands.includes(`"${BETA}"`), 'beta manifest comes from the fork');
 ok(!commands.includes('SimoHypers/limusic'), 'no upstream manifest URL remains');
 ok(!commands.includes('limusic-updates-disabled'), 'no discard endpoint remains');
 

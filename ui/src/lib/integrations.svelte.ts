@@ -10,8 +10,12 @@ export const integrations = $state({
 	loaded: false
 });
 
-/** Discord's flag already lives in `prefs`; expose it here so callers have one menu model. */
-export const discordEnabled = $derived(prefs.discordRpc);
+/** Discord's flag already lives in `prefs`; expose a reader so callers have one menu model.
+ * A module cannot export `$derived` state (vite-plugin-svelte rejects it at compile time), so
+ * components call this inside their own `$derived`, which still tracks `prefs.discordRpc`. */
+export function discordEnabled(): boolean {
+	return prefs.discordRpc;
+}
 
 export function syncIntegrations(next: api.IntegrationSettings): void {
 	integrations.controlApi = next.control_api.enabled;
@@ -33,6 +37,16 @@ export async function setIntegrationEnabled(
 	const settings = await api.getIntegrationSettings();
 	if (kind === 'control') settings.control_api.enabled = on;
 	else settings.tuna.enabled = on;
+	await api.setIntegrationSettings(settings);
+	syncIntegrations(settings);
+	return settings;
+}
+
+/** Shared-control opt-in lives with the Control API settings even though it is toggled in the
+ * Listen Together dialog. Read-modify-write so a titlebar toggle cannot clobber bind/port/token. */
+export async function setSharedControlEnabled(on: boolean): Promise<api.IntegrationSettings> {
+	const settings = await api.getIntegrationSettings();
+	settings.control_api.shared_control = on;
 	await api.setIntegrationSettings(settings);
 	syncIntegrations(settings);
 	return settings;

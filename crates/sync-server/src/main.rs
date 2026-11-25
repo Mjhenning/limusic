@@ -14,7 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use listen_protocol::{
-    ClientMessage, Playback, PlaybackKind, RoomState, ServerMessage, Suggestion, Track, User,
+    ClientMessage, Playback, PlaybackKind, RoomState, ServerMessage, SharedControlEnvelope,
+    Suggestion, Track, User,
 };
 use rand::Rng;
 use tokio::net::{TcpListener, TcpStream};
@@ -45,6 +46,8 @@ const IDLE_LIMIT: Duration = Duration::from_secs(90);
 const MAX_LINK_ROOMS: usize = 2000;
 /// Largest `link_status` kept. The player's queue window (~120 rows) is about half of it.
 const MAX_LINK_STATUS: usize = 64 * 1024;
+/// Largest shared-control envelope. A request carries one track, not a whole queue window.
+const MAX_SHARED_CONTROL: usize = 32 * 1024;
 const MAX_LINK_DEVICES: usize = 8;
 /// A link room with no device connected is forgotten after this. Its devices just join again.
 const LINK_IDLE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
@@ -94,6 +97,10 @@ struct Room {
     pair: Option<(String, Instant)>,
     /// Link rooms: the player's last `link_status` (its queue), kept unread for devices that join.
     status: Option<serde_json::Value>,
+    /// Listen Together: the current host opted into shared control.
+    shared_control: bool,
+    /// Listen Together: the current host advertised that it can apply shared-control requests.
+    host_shared_control_capable: bool,
 }
 
 impl Room {
@@ -113,6 +120,8 @@ impl Room {
             idle_since: None,
             pair: None,
             status: None,
+            shared_control: false,
+            host_shared_control_capable: false,
         }
     }
 
@@ -140,6 +149,11 @@ impl Room {
             last_update_ms: self.last_update_ms,
             volume: self.volume,
             queue: self.queue.clone(),
+            // The relay supports the envelopes in every room it owns, but shared control is only
+            // offered in Listen Together rooms, never in device-link rooms.
+            shared_control_capable: !self.link,
+            shared_control: !self.link && self.shared_control,
+            host_shared_control_capable: !self.link && self.host_shared_control_capable,
         }
     }
 
@@ -176,6 +190,12 @@ impl Room {
         // A new player's queue is its own, which it sends next.
         if self.host_id != id {
             self.status = None;
+        }
+        if self.host_id != id {
+            // The new host has not announced its own opt-in/capability yet. The client asks for a
+            // fresh `sync_state` on `host_changed`, which is where it learns the reset.
+            self.shared_control = false;
+            self.host_shared_control_capable = false;
         }
         self.host_id = id.clone();
         self.broadcast(&ServerMessage::HostChanged { host_id: id }, None);
@@ -708,23 +728,98 @@ impl Server {
 
             ClientMessage::Remote { action, to } => {
                 let (Some(me), Some(code)) = (uid.clone(), room_code.clone()) else { return };
-                let rooms = self.rooms.lock().await;
-                let Some(room) = rooms.get(&code) else { return };
-                if !room.link || !room.peers.contains_key(&me) {
+                let mut rooms = self.rooms.lock().await;
+                let Some(room) = rooms.get_mut(&code) else { return };
+                if !room.peers.contains_key(&me) {
                     return;
                 }
-                // Forwarded, not applied (nor read): the device runs it and publishes the result.
-                let named = to.is_some();
-                let target = to.unwrap_or_else(|| room.host_id.clone());
-                if target == me || !room.peers.get(&target).is_some_and(|p| p.connected) {
-                    let _ = tx.send(if named {
-                        err("no_device", "That device isn't online.")
-                    } else {
-                        err("no_player", "No other device is playing right now.")
-                    });
+
+                // Device link keeps its old behaviour: a control is forwarded unread to whoever
+                // owns playback. It never sees the shared-control fields.
+                if room.link {
+                    let named = to.is_some();
+                    let target = to.unwrap_or_else(|| room.host_id.clone());
+                    if target == me || !room.peers.get(&target).is_some_and(|p| p.connected) {
+                        let _ = tx.send(if named {
+                            err("no_device", "That device isn't online.")
+                        } else {
+                            err("no_player", "No other device is playing right now.")
+                        });
+                        return;
+                    }
+                    room.send_to(&target, ServerMessage::Remote { from: me, action });
                     return;
                 }
-                room.send_to(&target, ServerMessage::Remote { from: me, action });
+
+                if action.to_string().len() > MAX_SHARED_CONTROL {
+                    let _ = tx.send(err("too_large", "That control request is too big."));
+                    return;
+                }
+                let Ok(envelope) = serde_json::from_value::<SharedControlEnvelope>(action) else {
+                    // Base clients send device-link actions only to link rooms; ignore anything
+                    // else rather than turning this socket into a control channel.
+                    return;
+                };
+                match envelope {
+                    SharedControlEnvelope::SetSharedControl { on, shared_control_capable } => {
+                        if !room.is_host(&me) {
+                            return;
+                        }
+                        room.host_shared_control_capable = shared_control_capable;
+                        room.shared_control = on && shared_control_capable;
+                        let state = room.wire_state(&code);
+                        room.broadcast(&ServerMessage::SyncState { state }, None);
+                    }
+                    SharedControlEnvelope::ControlRequest {
+                        id,
+                        action,
+                        shared_control_capable,
+                        submitted_by,
+                    } => {
+                        // Only an opted-in capable host may apply. Answer that first so a fork
+                        // guest learns why nothing happened; a base guest is suggestion-only
+                        // because it never sets the capability flag and is simply ignored.
+                        if !room.shared_control || !room.host_shared_control_capable {
+                            let _ = tx.send(err(
+                                "shared_control_unavailable",
+                                "The host hasn't enabled shared control.",
+                            ));
+                            return;
+                        }
+                        if !shared_control_capable || room.link {
+                            return;
+                        }
+                        let host = room.host_id.clone();
+                        if host == me || !room.peers.get(&host).is_some_and(|p| p.connected) {
+                            let _ = tx.send(err(
+                                "shared_control_unavailable",
+                                "The host isn't online right now.",
+                            ));
+                            return;
+                        }
+                        let action = SharedControlEnvelope::ControlRequest {
+                            id,
+                            action,
+                            shared_control_capable,
+                            submitted_by,
+                        }
+                        .to_value();
+                        room.send_to(&host, ServerMessage::Remote { from: me, action });
+                    }
+                    SharedControlEnvelope::ControlResult { id, ok, error } => {
+                        // Results come only from the host and only go back to the named guest.
+                        if !room.is_host(&me) {
+                            return;
+                        }
+                        let Some(target) = to.filter(|to| to != &me) else { return };
+                        if !room.peers.get(&target).is_some_and(|p| p.connected) {
+                            return;
+                        }
+                        let action =
+                            SharedControlEnvelope::ControlResult { id, ok, error }.to_value();
+                        room.send_to(&target, ServerMessage::Remote { from: me, action });
+                    }
+                }
             }
 
             ClientMessage::LinkStatus { status } => {
@@ -1089,6 +1184,7 @@ mod tests {
             thumbnail: None,
             duration_ms: 0,
             queued_by: None,
+            submitted_by: None,
         };
         host.send(&server, ClientMessage::Suggest { track }).await;
         guest.drain();
@@ -1267,6 +1363,7 @@ mod tests {
             thumbnail: None,
             duration_ms: 0,
             queued_by: None,
+            submitted_by: None,
         });
         p.playing = true;
         send(&mut host, ClientMessage::Playback(p)).await;
@@ -1460,6 +1557,7 @@ mod tests {
             thumbnail: None,
             duration_ms: 0,
             queued_by: None,
+            submitted_by: None,
         });
         p.playing = true;
         ClientMessage::Playback(p)
@@ -1641,6 +1739,158 @@ mod tests {
         a.drain();
         a.send(&server, take_over("b")).await;
         assert_eq!(error_code(&a.drain()), Some("no_device"));
+    }
+
+    #[tokio::test]
+    async fn shared_control_is_opt_in_and_host_authoritative() {
+        let server = Server::default();
+        let (mut host, mut guest, _) = room_with_guest(&server).await;
+        let request = |capable: bool| ClientMessage::Remote {
+            action: SharedControlEnvelope::ControlRequest {
+                id: "r1".into(),
+                action: listen_protocol::RemoteAction::Toggle,
+                shared_control_capable: capable,
+                submitted_by: Some("guest".into()),
+            }
+            .to_value(),
+            to: None,
+        };
+
+        // No opt-in: a guest cannot drive the room, capable or not.
+        guest.send(&server, request(true)).await;
+        assert_eq!(error_code(&guest.drain()), Some("shared_control_unavailable"));
+        assert!(host.drain().is_empty());
+        guest.send(&server, request(false)).await;
+        assert_eq!(error_code(&guest.drain()), Some("shared_control_unavailable"));
+
+        // Only the host announces capability + opt-in; the state travels on the existing
+        // `sync_state` message, with no new ServerMessage variant.
+        host.send(
+            &server,
+            ClientMessage::Remote {
+                action: SharedControlEnvelope::SetSharedControl {
+                    on: true,
+                    shared_control_capable: true,
+                }
+                .to_value(),
+                to: None,
+            },
+        )
+        .await;
+        for conn in [&mut host, &mut guest] {
+            let got = conn.drain();
+            assert!(
+                got.iter().any(|m| matches!(
+                    m,
+                    ServerMessage::SyncState { state }
+                        if state.shared_control
+                            && state.shared_control_capable
+                            && state.host_shared_control_capable
+                )),
+                "{got:?}"
+            );
+        }
+
+        guest.send(&server, request(true)).await;
+        let got = host.drain();
+        assert!(
+            matches!(&got[..], [ServerMessage::Remote { from, action }]
+                if *from == guest.id()
+                    && action["kind"] == "control_request"
+                    && action["id"] == "r1"
+                    && action["submitted_by"] == "guest"),
+            "{got:?}"
+        );
+        assert!(guest.drain().is_empty());
+
+        // A guest cannot forge the answer; only the host's result is routed back.
+        guest
+            .send(
+                &server,
+                ClientMessage::Remote {
+                    action: SharedControlEnvelope::ControlResult {
+                        id: "r1".into(),
+                        ok: true,
+                        error: None,
+                    }
+                    .to_value(),
+                    to: Some(host.id()),
+                },
+            )
+            .await;
+        assert!(host.drain().is_empty());
+        host.send(
+            &server,
+            ClientMessage::Remote {
+                action: SharedControlEnvelope::ControlResult {
+                    id: "r1".into(),
+                    ok: true,
+                    error: None,
+                }
+                .to_value(),
+                to: Some(guest.id()),
+            },
+        )
+        .await;
+        let got = guest.drain();
+        assert!(
+            matches!(&got[..], [ServerMessage::Remote { from, action }]
+                if *from == host.id()
+                    && action["kind"] == "control_result"
+                    && action["ok"].as_bool() == Some(true)),
+            "{got:?}"
+        );
+
+        // Incapable guests stay suggestion-only even after the opt-in.
+        guest.send(&server, request(false)).await;
+        assert!(guest.drain().is_empty());
+        assert!(host.drain().is_empty());
+
+        host.send(
+            &server,
+            ClientMessage::Remote {
+                action: SharedControlEnvelope::SetSharedControl {
+                    on: false,
+                    shared_control_capable: true,
+                }
+                .to_value(),
+                to: None,
+            },
+        )
+        .await;
+        host.drain();
+        guest.drain();
+        guest.send(&server, request(true)).await;
+        assert_eq!(error_code(&guest.drain()), Some("shared_control_unavailable"));
+        assert!(host.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn host_handoff_clears_shared_control_until_the_new_host_announces() {
+        let server = Server::default();
+        let (mut host, mut guest, _) = room_with_guest(&server).await;
+        host.send(
+            &server,
+            ClientMessage::Remote {
+                action: SharedControlEnvelope::SetSharedControl {
+                    on: true,
+                    shared_control_capable: true,
+                }
+                .to_value(),
+                to: None,
+            },
+        )
+        .await;
+        host.drain();
+        guest.drain();
+        host.send(&server, ClientMessage::TransferHost { user_id: guest.id() }).await;
+        host.drain();
+        guest.drain();
+        let rooms = server.rooms.lock().await;
+        let room = &rooms[&host.code.clone().unwrap()];
+        assert_eq!(room.host_id, guest.id());
+        assert!(!room.shared_control);
+        assert!(!room.host_shared_control_capable);
     }
 
     #[tokio::test]

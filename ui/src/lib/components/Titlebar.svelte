@@ -75,7 +75,7 @@
 
 	// The titlebar is a second door to the same backend flags as the Integrations tab. The store is
 	// the only owner of their state, so a toggle here cannot leave an indicator stale over there.
-	const discordOn = $derived(discordEnabled);
+	const discordOn = $derived(discordEnabled());
 	const controlOn = $derived(integrations.controlApi);
 	const tunaOn = $derived(integrations.tuna);
 	const anyIntegrationOn = $derived(discordOn || controlOn || tunaOn);

@@ -71,6 +71,18 @@ ok(ui.includes('syncIntegrations(loaded)'), 'the initial load syncs the shared s
 ok(ui.includes('syncIntegrations(next)'), 'an apply syncs the shared store');
 ok(storeSource.includes('setIntegrationEnabled'), 'the shared store can toggle control/Tuna');
 ok(storeSource.includes('setDiscordEnabled'), 'the shared store can toggle Discord');
+ok(
+	storeSource.includes('export async function setSharedControlEnabled'),
+	'the shared store can toggle the host opt-in without clobbering other settings'
+);
+ok(
+	storeSource.includes('export function discordEnabled()'),
+	'Discord state is exported as a reader, not module-level derived state'
+);
+ok(
+	!/export (?:const|let) \w+ = \$derived/.test(storeSource),
+	'the shared store does not export derived state'
+);
 
 const enableRow = "title: t('settings.integrations.enable')";
 const controlFold = ui.indexOf('{#if enabled}');
@@ -81,8 +93,16 @@ const tunaFold = ui.indexOf('{#if tunaEnabled}');
 ok(tunaFold > ui.indexOf(tunaEnableRow), 'Tuna details follow their enable row');
 ok(tunaFold < ui.indexOf("title: t('settings.integrations.tuna_url')"), 'Tuna URL is folded');
 
+ok(ui.includes('setControl({ shared_control: on })'), 'shared control is saved with Control API settings');
+ok(ui.includes('settings?.control_api.shared_control'), 'the shared-control switch reads persisted state');
+ok(
+	readFileSync(join(here, 'api.ts'), 'utf8').includes('shared_control: boolean'),
+	'the UI settings type carries shared_control'
+);
+
 const folded: [string, string][] = [
 	['settings.integrations.status', 'settings.integrations.enable'],
+	['settings.integrations.shared_control', 'settings.integrations.enable'],
 	['settings.integrations.bind_mode', 'settings.integrations.enable'],
 	['settings.integrations.port', 'settings.integrations.enable'],
 	['settings.integrations.token', 'settings.integrations.enable'],
@@ -118,6 +138,10 @@ ok(
 	discordSource.indexOf('data-settings-aside') > discordFold,
 	'the live preview is folded with Discord'
 );
+ok(discordSource.includes('lg:flex-row'), 'the preview sits beside the controls on wide dialogs');
+ok(!discordSource.includes('2xl:flex-row'), 'the preview is not stranded at an unreachable width');
+ok(discordSource.includes('max-lg:border-t'), 'the stacked preview keeps its separator');
+ok(dialogSource.includes('sm:max-w-5xl'), 'the Integrations dialog is wide enough for that split');
 ok(
 	discordSource.indexOf("title: t('settings.discord.show_paused')") > discordFold,
 	'the card options are folded with Discord'
@@ -148,6 +172,24 @@ for (const title of discordRows) {
 		`${title} is indexed under Discord's enable switch`
 	);
 }
+
+// --- shared-control switch in the Listen Together dialog ---------------------------------------
+const ltDialog = readFileSync(join(here, 'components', 'ListenTogether.svelte'), 'utf8');
+ok(ltDialog.includes('setSharedControlEnabled(on)'), 'the room toggle saves the host opt-in');
+ok(ltDialog.includes('controlOn && lt.sharedControlEnabled'), 'the switch reflects both gates');
+ok(ltDialog.includes('disabled={!controlOn || sharedBusy}'), 'the switch is disabled without the API');
+ok(ltDialog.includes('void loadIntegrations().catch'), 'opening the dialog refreshes the API flag');
+
+// --- queue requester pills -------------------------------------------------------------------
+const trackRowSource = readFileSync(join(here, 'components', 'TrackRow.svelte'), 'utf8');
+const apiTypes = readFileSync(join(here, 'api.ts'), 'utf8');
+ok(apiTypes.includes('submitted_by?: string'), 'queue rows carry a separate submitter');
+ok(trackRowSource.includes('song.submitted_by'), 'queue rows render the submitter');
+ok(trackRowSource.includes('song.queued_by'), 'queue rows render the visible requester');
+ok(
+	trackRowSource.indexOf('song.submitted_by') < trackRowSource.indexOf('song.queued_by'),
+	'the submitter pill comes before the requester pill'
+);
 
 // --- titlebar integrations menu ---------------------------------------------------------------
 const titlebarSource = readFileSync(titlebar, 'utf8');
@@ -185,6 +227,12 @@ for (const key of [
 	'tuna_off'
 ]) {
 	ok(typeof en.integrations[key] === 'string', `en.json has integrations.${key}`);
+}
+for (const key of ['shared_control', 'shared_control_hint', 'shared_control_requires_api']) {
+	ok(
+		typeof en.dialogs.listen_together[key] === 'string',
+		`en.json has dialogs.listen_together.${key}`
+	);
 }
 
 console.log('ok');

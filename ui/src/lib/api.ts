@@ -46,8 +46,10 @@ export interface SongItem {
 	 *  Together guest's queue) — the menu hides the action rather than offering a dead one.
 	 *  Library ▸ Songs is not Liked Music: this is a feedback write, not a rating. */
 	library?: { in_library: boolean; add_token?: string; remove_token?: string };
-	/** Listen Together: name of the guest who added this queue item (session adds only). */
+	/** Listen Together: visible requester — a room guest or a bot's `requested_by`. */
 	queued_by?: string;
+	/** Room client that forwarded the row when `queued_by` is a bot's requester. */
+	submitted_by?: string;
 	/** Queued to play next ("Play next", or a guest's session add) — the "Next in queue" block. */
 	queued?: boolean;
 	/** Appended by "Add to queue" — its own block at the tail of the queue. */
@@ -1655,8 +1657,10 @@ export interface LtTrack {
 	artist: string;
 	thumbnail?: string | null;
 	duration_ms: number;
-	/** Name of the guest who added this track to the session queue. */
+	/** Visible requester — a room guest or a bot's `requested_by`. */
 	queued_by?: string | null;
+	/** Room client that forwarded the row when `queued_by` is a bot's requester. */
+	submitted_by?: string | null;
 }
 export interface LtPendingJoin {
 	userId: string;
@@ -1684,6 +1688,12 @@ export interface LtState {
 	queue: LtTrack[];
 	pendingJoins: LtPendingJoin[];
 	suggestions: LtSuggestion[];
+	/** Persisted host opt-in; forwarded Control API mutations require it. */
+	sharedControlEnabled: boolean;
+	/** Relay/host/guest capability facts mirrored from the room state. */
+	sharedControlCapable: boolean;
+	sharedControl: boolean;
+	hostSharedControlCapable: boolean;
 }
 
 export const ltGetState = () => invoke<LtState>('lt_get_state');
@@ -1755,6 +1765,8 @@ export interface ControlApiSettings {
 	enabled: boolean;
 	bind: string;
 	port: number;
+	/** Host opt-in: let fork guests forward Control API mutations to this player. */
+	shared_control: boolean;
 }
 
 export interface TunaSettings {
