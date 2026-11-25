@@ -1,9 +1,9 @@
 name: Windows fork NSIS build
 
-# Manual, unsigned build of this fork's Windows NSIS installer. It deliberately has no release,
-# signing or updater-artifact steps: the fork disables the updater, so no signature artifact is
-# produced or wanted. Run it from Actions ▸ Windows fork NSIS build ▸ Run workflow, then download the
-# limusic-windows-nsis artifact. Nothing is pushed and no release is created.
+# Manual, unsigned build of this fork's Windows NSIS installer. It deliberately has no release or
+# signing steps: `tauri build --no-sign` skips updater signatures even though release builds use
+# the fork public key. Run it from Actions ▸ Windows fork NSIS build ▸ Run workflow, then download
+# the limusic-windows-nsis artifact. Nothing is pushed and no release is created.
 
 on:
   workflow_dispatch:
@@ -181,9 +181,9 @@ jobs:
           (cd ui && pnpm build)
           # beforeBuildCommand is emptied because pnpm build was just run from ui/. Left on, tauri
           # would run pnpm from the repo root and pick a project by filesystem accident.
-          # --bundles nsis matches this fork's manual Windows build; the updater is disabled, so no
-          # updater signature artifact is expected.
-          tauri build --bundles nsis --config '{"build":{"beforeBuildCommand":""}}'
+          # --bundles nsis matches this fork's manual Windows build. --no-sign is required because
+          # the release config embeds the updater public key but this build has no signing secret.
+          tauri build --bundles nsis --no-sign --config '{"build":{"beforeBuildCommand":""}}'
 
       - name: Import table check
         shell: pwsh
