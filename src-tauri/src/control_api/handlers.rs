@@ -2506,6 +2506,7 @@ mod tests {
             bind: "127.0.0.1".into(),
             port,
             shared_control: false,
+            shared_control_server: String::new(),
             queue_dedupe_window: 10,
         }
     }

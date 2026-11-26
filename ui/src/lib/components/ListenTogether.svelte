@@ -26,7 +26,7 @@
 		loadIntegrations,
 		setSharedControlEnabled
 	} from '$lib/integrations.svelte';
-	import { applyLtState, lt } from '$lib/lt.svelte';
+	import { lt } from '$lib/lt.svelte';
 	import { t } from '$lib/i18n.svelte';
 	import { makeInvite, parseInvite } from '$lib/invite';
 
@@ -35,6 +35,7 @@
 	let serverUrl = $state('');
 	let showServer = $state(false);
 	let inviteInput = $state('');
+	let sharedServer = $state('');
 	let busy = $state(false);
 	let sharedBusy = $state(false);
 	let copied = $state(false);
@@ -48,10 +49,11 @@
 			serverUrl = lt.serverUrl;
 			showServer = false;
 			copied = false;
-			// The titlebar can open this dialog before Settings has ever run. Refresh the shared
-			// integration flags so the host's shared-control switch cannot look available while the
-			// Control API is actually off.
-			void loadIntegrations().catch(() => {});
+			// The titlebar can open this dialog before Settings has ever run. Refresh the API flag
+			// and the configured fork relay so the pre-hosting switch knows both gates.
+			void loadIntegrations()
+				.then((loaded) => (sharedServer = loaded.control_api.shared_control_server ?? ''))
+				.catch(() => {});
 		}
 	});
 
@@ -79,6 +81,7 @@
 				: t('dialogs.listen_together.shared_control_off')
 	);
 	const controlOn = $derived(integrations.controlApi);
+	const sharedServerConfigured = $derived(!!sharedServer.trim());
 
 	function rememberName() {
 		localStorage.setItem('lt_name', name.trim());
@@ -96,11 +99,13 @@
 	}
 
 	async function toggleSharedControl(on: boolean) {
-		if (!controlOn || !isHost || sharedBusy) return;
+		if (!controlOn || !sharedServerConfigured || sharedBusy) return;
 		sharedBusy = true;
 		try {
-			await setSharedControlEnabled(on);
-			applyLtState(await api.ltGetState());
+			await setSharedControlEnabled(on, sharedServer);
+			serverUrl = lt.serverUrl;
+			// Make the relay swap visible: the invite is minted from this value.
+			if (on) showServer = true;
 		} catch (e) {
 			toast.error(String(e));
 		} finally {
@@ -250,6 +255,26 @@
 								{t('dialogs.listen_together.host_blurb')}
 							</p>
 						</div>
+						<div
+							class="flex items-center justify-between gap-3 rounded-xl border bg-background/60 px-3 py-2.5 text-left"
+						>
+							<div class="min-w-0">
+								<p class="text-xs font-medium">{t('dialogs.listen_together.shared_control')}</p>
+								<p class="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+									{!controlOn
+										? t('dialogs.listen_together.shared_control_requires_api')
+										: !sharedServerConfigured
+											? t('dialogs.listen_together.shared_control_needs_server')
+											: t('dialogs.listen_together.shared_control_setup_hint')}
+								</p>
+							</div>
+							<Switch
+								checked={controlOn && lt.sharedControlEnabled}
+								disabled={!controlOn || !sharedServerConfigured || sharedBusy}
+								aria-label={t('dialogs.listen_together.shared_control')}
+								onCheckedChange={toggleSharedControl}
+							/>
+						</div>
 						<Button type="submit" class="w-full" disabled={busy}>
 							{t('dialogs.listen_together.start_button')}
 						</Button>
@@ -323,27 +348,6 @@
 							{sharedControlLabel}
 						</p>
 					{/if}
-					{#if isHost}
-						<div
-							class="mt-3 flex items-center justify-between gap-3 rounded-xl border bg-background/60 px-3 py-2.5 text-left"
-						>
-							<div class="min-w-0">
-								<p class="text-xs font-medium">{t('dialogs.listen_together.shared_control')}</p>
-								<p class="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
-									{controlOn
-										? t('dialogs.listen_together.shared_control_hint')
-										: t('dialogs.listen_together.shared_control_requires_api')}
-								</p>
-							</div>
-							<Switch
-								checked={controlOn && lt.sharedControlEnabled}
-								disabled={!controlOn || sharedBusy}
-								aria-label={t('dialogs.listen_together.shared_control')}
-								onCheckedChange={toggleSharedControl}
-							/>
-						</div>
-					{/if}
-
 					<!-- Spaced out because this gets read aloud and typed by hand. The left padding
 					     puts the trailing letter-space back on the right so it stays centred. -->
 					<div class="mt-3 select-all pl-[0.3em] font-mono text-3xl font-semibold tracking-[0.3em]">

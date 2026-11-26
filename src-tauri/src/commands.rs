@@ -2624,6 +2624,9 @@ pub async fn lt_get_state(state: St<'_>) -> Result<serde_json::Value, String> {
 /// Set + persist the sync server URL (e.g. the Tailscale Funnel `wss://…` address).
 #[tauri::command]
 pub async fn lt_set_server_url(state: St<'_>, url: String) -> Result<(), String> {
+    if state.lt.in_room().await {
+        return Err("Leave Listen Together before changing the server.".to_string());
+    }
     let url = url.trim().to_string();
     state.db.set_setting("lt_server_url", &url);
     state.lt.set_server_url(url).await;
@@ -3783,6 +3786,11 @@ pub async fn set_integration_settings(
         .get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY)
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
+    // The opt-in changes which relay a room must use, so it is a pre-hosting choice. Other
+    // Control API fields stay editable while a bot is connected; only this one is locked.
+    if previous.shared_control != control_api.shared_control && state.lt.in_room().await {
+        return Err("Leave Listen Together before changing shared control.".to_string());
+    }
     db.set_setting(
         crate::integrations::settings::CONTROL_API_SETTINGS_KEY,
         &serde_json::to_string(&control_api).map_err(|e| e.to_string())?,

@@ -482,8 +482,15 @@ true:
 - the guest and host both run this fork, and the relay is this project's
   `sync-server` (a base client or base server never sets the capability flags);
 - **Settings ▸ Integrations ▸ Control API ▸ Shared Listen Together control**
-  is on **on the host**;
-- the guest is connected to that room and its Control API is enabled.
+  is on **on the host**, with **Shared-control server** pointing at that relay;
+- the guest joined the room through the invite minted after the switch was
+  turned on, and its Control API is enabled.
+
+The opt-in is a pre-hosting choice. Turning it on switches Listen Together to
+**Shared-control server**, saves the previous/default relay, and makes the
+room's invite carry the fork address. Turning it off restores the saved relay.
+The switch is unavailable while a room is active, because changing relay would
+drop everybody in it.
 
 The guest sends the same HTTP request it would send locally. It waits at most
 15 s for a correlated answer from the host, then returns the normal success
@@ -501,8 +508,9 @@ answers `502 shared_control_failed` with the host's reason and inserts nothing.
 
 The default server is `wss://sync.limusic.app/ws`, the upstream relay. It does
 not advertise shared-control capability, so a bare room code cannot forward
-mutations. Set **Listen Together ▸ Server** to this fork's `sync-server` on both
-devices before joining.
+mutations. Set **Shared-control server** to this fork's `sync-server` before
+turning the switch on; the app swaps relays for you and puts the address in the
+invite.
 
 The Listen Together dialog and guest `409 listen_together_guest` message now
 name the first missing fact: an unsupported relay, a host that has not opted

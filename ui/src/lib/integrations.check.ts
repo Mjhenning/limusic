@@ -93,7 +93,11 @@ const tunaFold = ui.indexOf('{#if tunaEnabled}');
 ok(tunaFold > ui.indexOf(tunaEnableRow), 'Tuna details follow their enable row');
 ok(tunaFold < ui.indexOf("title: t('settings.integrations.tuna_url')"), 'Tuna URL is folded');
 
-ok(ui.includes('setControl({ shared_control: on })'), 'shared control is saved with Control API settings');
+ok(
+	ui.includes('onCheckedChange={toggleSharedControl}') &&
+		ui.includes('setSharedControlEnabled(on, sharedServerInput)'),
+	'shared control is saved with Control API settings'
+);
 ok(ui.includes('settings?.control_api.shared_control'), 'the shared-control switch reads persisted state');
 ok(ui.includes('setControl({ queue_dedupe_window })'), 'the queue window is saved live with Control API settings');
 ok(
@@ -179,15 +183,40 @@ for (const title of discordRows) {
 	);
 }
 
-// --- shared-control switch in the Listen Together dialog ---------------------------------------
+// --- shared-control switch in the Listen Together Host setup ------------------------------------
 const ltDialog = readFileSync(join(here, 'components', 'ListenTogether.svelte'), 'utf8');
-ok(ltDialog.includes('setSharedControlEnabled(on)'), 'the room toggle saves the host opt-in');
+const integrationStore = readFileSync(join(here, 'integrations.svelte.ts'), 'utf8');
+const integrationSettings = readFileSync(join(here, 'components', 'IntegrationsSettings.svelte'), 'utf8');
+ok(
+	ltDialog.includes('setSharedControlEnabled(on, sharedServer)'),
+	'the pre-host toggle saves the opt-in with its relay'
+);
 ok(ltDialog.includes('controlOn && lt.sharedControlEnabled'), 'the switch reflects both gates');
-ok(ltDialog.includes('disabled={!controlOn || sharedBusy}'), 'the switch is disabled without the API');
-ok(ltDialog.includes('void loadIntegrations().catch'), 'opening the dialog refreshes the API flag');
+ok(
+	ltDialog.includes('disabled={!controlOn || !sharedServerConfigured || sharedBusy}'),
+	'the switch needs the API and a configured relay'
+);
+ok(ltDialog.includes('void loadIntegrations()'), 'opening the dialog refreshes the API flag');
 ok(
 	ltDialog.includes('lt.sharedControlReason'),
 	'the dialog explains why shared control is unavailable'
+);
+ok(
+	integrationStore.includes('Leave Listen Together before changing shared control'),
+	'both switches are locked while a room is active'
+);
+ok(
+	integrationStore.includes('BEFORE_SERVER_KEY') && integrationStore.includes('ACTIVE_SERVER_KEY'),
+	'the relay swap remembers the previous server'
+);
+ok(
+	integrationSettings.includes('roomActive') &&
+		integrationSettings.includes('shared_control_server'),
+	'the settings toggle obeys the same idle + relay rule'
+);
+ok(
+	readFileSync(join(here, 'api.ts'), 'utf8').includes('shared_control_server: string'),
+	'the integration settings type carries the fork relay URL'
 );
 ok(
 	readFileSync(join(here, 'lt.svelte.ts'), 'utf8').includes('sharedControlReason: null'),

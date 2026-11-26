@@ -92,14 +92,26 @@ for (const text of [
 	'/queue/request',
 	'sync.limusic.app',
 	'not advertise shared-control capability',
-	'the first missing fact'
+	'the first missing fact',
+	'Shared-control server',
+	'pre-hosting choice',
+	'restores the saved relay',
+	'invite minted after'
 ]) {
 	ok(sharedSection.includes(text), `shared-control docs mention ${text}`);
 }
 const types = read(join(root, 'src-tauri', 'src', 'control_api', 'types.rs'));
 const lt = read(join(root, 'src-tauri', 'src', 'listentogether', 'mod.rs'));
+const integrationSettings = read(join(root, 'src-tauri', 'src', 'integrations', 'settings.rs'));
+const commands = read(join(root, 'src-tauri', 'src', 'commands.rs'));
 ok(types.includes('listen_together_guest_with'), 'guest errors carry the room blocker');
 ok(lt.includes('sharedControlReason'), 'the room snapshot carries the diagnostic reason');
+ok(
+	integrationSettings.includes('shared_control_server'),
+	'the fork relay URL is persisted with the API settings'
+);
+ok(commands.includes('before changing shared control'), 'backend locks the opt-in while in a room');
+ok(commands.includes('before changing the server'), 'backend locks relay edits while in a room');
 ok(handlers.includes('forward_shared_control'), 'handlers forward opted-in guest mutations');
 ok(protocol.includes('SharedControlEnvelope'), 'the wire shape is in listen-protocol');
 ok(sync.includes('MAX_SHARED_CONTROL'), 'the relay bounds shared-control envelopes');

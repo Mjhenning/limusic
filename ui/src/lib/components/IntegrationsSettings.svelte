@@ -11,7 +11,12 @@
 	import * as api from '$lib/api';
 	import DiscordSettings from '$lib/components/DiscordSettings.svelte';
 	import { copyText } from '$lib/clipboard';
-	import { integrations, syncIntegrations } from '$lib/integrations.svelte';
+	import {
+		integrations,
+		setSharedControlEnabled,
+		syncIntegrations
+	} from '$lib/integrations.svelte';
+	import { lt } from '$lib/lt.svelte';
 	import { toast, ui } from '$lib/player.svelte';
 	import { t } from '$lib/i18n.svelte';
 
@@ -32,6 +37,7 @@
 	let applying = $state(false);
 	let error = $state('');
 	let portInput = $state('27199');
+	let sharedServerInput = $state('');
 	let dedupeInput = $state('10');
 	let urlInput = $state('http://127.0.0.1:1608/');
 	let testMessage = $state<{ ok: boolean; text: string } | null>(null);
@@ -45,6 +51,10 @@
 		const port = Number(portInput);
 		return Number.isInteger(port) && port >= 1024 && port <= 65535;
 	});
+	const sharedServerValid = $derived(
+		sharedServerInput.trim() === '' || /^wss?:\/\/[^/?#\s]+/i.test(sharedServerInput.trim())
+	);
+	const roomActive = $derived(lt.role !== 'none' || lt.requesting || lt.status === 'connecting');
 	const dedupeValid = $derived.by(() => {
 		const distance = Number(dedupeInput);
 		return Number.isInteger(distance) && distance >= 0 && distance <= 50;
@@ -114,6 +124,7 @@
 			status = currentStatus;
 			token = currentToken;
 			portInput = String(loaded.control_api.port);
+			sharedServerInput = loaded.control_api.shared_control_server ?? '';
 			dedupeInput = String(loaded.control_api.queue_dedupe_window ?? 10);
 			urlInput = loaded.tuna.url;
 			api.getLocalIpv4Addresses().then((ips) => (localIps = ips)).catch(() => {});
@@ -144,7 +155,7 @@
 
 	async function apply(next: api.IntegrationSettings) {
 		if (applying) return;
-		if (!portValid || !dedupeValid || !urlValid) return;
+		if (!portValid || !sharedServerValid || !dedupeValid || !urlValid) return;
 		error = '';
 		applying = true;
 		try {
@@ -152,6 +163,7 @@
 			settings = next;
 			syncIntegrations(next);
 			portInput = String(next.control_api.port);
+			sharedServerInput = next.control_api.shared_control_server;
 			dedupeInput = String(next.control_api.queue_dedupe_window);
 			urlInput = next.tuna.url;
 			await refreshStatus();
@@ -188,6 +200,36 @@
 		const queue_dedupe_window = Number(dedupeInput);
 		if (!Number.isInteger(queue_dedupe_window)) return;
 		setControl({ queue_dedupe_window });
+	}
+
+	function saveSharedServer() {
+		if (!sharedServerValid) return;
+		setControl({ shared_control_server: sharedServerInput.trim() });
+	}
+
+	async function toggleSharedControl(on: boolean) {
+		if (roomActive || applying) return;
+		if (on && !sharedServerInput.trim()) {
+			error = t('settings.integrations.shared_control_server_required');
+			return;
+		}
+		if (on && !sharedServerValid) {
+			error = t('settings.integrations.shared_control_server_invalid');
+			return;
+		}
+		error = '';
+		applying = true;
+		try {
+			const next = await setSharedControlEnabled(on, sharedServerInput);
+			settings = next;
+			syncIntegrations(next);
+			sharedServerInput = next.control_api.shared_control_server;
+			await refreshStatus();
+		} catch (e) {
+			error = t('settings.integrations.apply_error', { reason: String(e) });
+		} finally {
+			applying = false;
+		}
 	}
 
 	function saveUrl() {
@@ -274,8 +316,15 @@
 				})}
 				{@render row({
 					title: t('settings.integrations.shared_control'),
-					desc: t('settings.integrations.shared_control_hint'),
+					desc: roomActive
+						? t('settings.integrations.shared_control_idle_hint')
+						: t('settings.integrations.shared_control_hint'),
 					control: sharedControlSwitch
+				})}
+				{@render row({
+					title: t('settings.integrations.shared_control_server'),
+					desc: t('settings.integrations.shared_control_server_hint'),
+					control: sharedServerField
 				})}
 				{@render row({
 					title: t('settings.integrations.queue_dedupe_window'),
@@ -392,9 +441,28 @@
 {#snippet sharedControlSwitch()}
 	<Switch
 		checked={settings?.control_api.shared_control ?? false}
-		disabled={applying || !settings}
-		onCheckedChange={(on) => setControl({ shared_control: on })}
+		disabled={applying || !settings || roomActive}
+		onCheckedChange={toggleSharedControl}
 	/>
+{/snippet}
+
+{#snippet sharedServerField()}
+	<div>
+		<Input
+			bind:value={sharedServerInput}
+			spellcheck={false}
+			class="font-mono text-xs"
+			placeholder={t('settings.integrations.shared_control_server_placeholder')}
+			disabled={applying || !settings}
+			onblur={saveSharedServer}
+			aria-label={t('settings.integrations.shared_control_server')}
+		/>
+		{#if !sharedServerValid}
+			<p class="mt-1.5 text-xs text-destructive">
+				{t('settings.integrations.shared_control_server_invalid')}
+			</p>
+		{/if}
+	</div>
 {/snippet}
 
 {#snippet bindPicker()}
