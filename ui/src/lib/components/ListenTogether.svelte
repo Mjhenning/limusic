@@ -24,6 +24,7 @@
 	import {
 		integrations,
 		loadIntegrations,
+		setClientControl,
 		setSharedControlEnabled
 	} from '$lib/integrations.svelte';
 	import { lt } from '$lib/lt.svelte';
@@ -71,6 +72,7 @@
 	);
 	const others = $derived(lt.users.filter((u) => u.user_id !== lt.myId).length);
 	const controlOn = $derived(integrations.controlApi);
+	const clientControlOn = $derived(integrations.clientControl);
 	const sharedControlLabel = $derived(
 		lt.sharedControlReason
 			? lt.sharedControlReason
@@ -78,9 +80,9 @@
 				? lt.sharedControlEnabled
 					? t('dialogs.listen_together.shared_control_on')
 					: t('dialogs.listen_together.shared_control_off')
-				: controlOn
+				: clientControlOn
 					? t('dialogs.listen_together.shared_control_guest_on')
-					: t('dialogs.listen_together.shared_control_requires_api')
+					: t('dialogs.listen_together.shared_control_requires_client_control')
 	);
 
 	function rememberName() {
@@ -107,6 +109,14 @@
 			toast.error(String(e));
 		} finally {
 			sharedBusy = false;
+		}
+	}
+
+	async function toggleClientControl(on: boolean) {
+		try {
+			await setClientControl(on);
+		} catch (e) {
+			toast.error(String(e));
 		}
 	}
 
@@ -387,6 +397,27 @@
 
 				<!-- Everything that grows with the room scrolls; the invite and the footer do not. -->
 				<div class="-mx-1 flex min-w-0 max-h-[38vh] flex-col gap-5 overflow-y-auto px-1">
+					<!-- Guest opt-in for this desktop's player buttons. Deliberately separate from the
+					     Control API switch: a guest should be able to press play without running a
+					     local HTTP server, and an API user should be able to opt out of remote play. -->
+					{#if !isHost && lt.sharedControl && lt.hostSharedControlCapable}
+						<div
+							class="flex items-center justify-between gap-3 rounded-xl border bg-background/60 px-3 py-2.5 text-left"
+						>
+							<div class="min-w-0">
+								<p class="text-xs font-medium">{t('dialogs.listen_together.client_control')}</p>
+								<p class="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+									{t('dialogs.listen_together.client_control_hint')}
+								</p>
+							</div>
+							<Switch
+								checked={clientControlOn}
+								aria-label={t('dialogs.listen_together.client_control')}
+								onCheckedChange={toggleClientControl}
+							/>
+						</div>
+					{/if}
+
 					<!-- Host-only readiness panel for the hidden control channel. It lives here, with the
 					     other room facts, rather than in Settings: the counter only means something while
 					     this room is live. -->

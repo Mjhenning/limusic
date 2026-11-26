@@ -16,7 +16,9 @@
 		if (lt.role === 'host' && lt.sharedControlEnabled) return t('player.shared_host');
 		if (lt.role === 'guest' && lt.hostSharedControlCapable && lt.sharedControl) {
 			if (!integrations.loaded) return '';
-			return integrations.controlApi ? t('player.shared_guest') : t('player.shared_needs_api');
+			return integrations.clientControl
+				? t('player.shared_guest')
+				: t('player.shared_needs_client_control');
 		}
 		return '';
 	});

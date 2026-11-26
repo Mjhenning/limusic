@@ -207,12 +207,32 @@ ok(
 	'a guest sees its own shared-control access, not the host opt-in switch'
 );
 ok(
-	ltDialog.includes(': controlOn\n\t\t\t\t\t? t(\'dialogs.listen_together.shared_control_guest_on\')'),
-	'the guest status also requires the local Control API'
+	ltDialog.includes(
+		": clientControlOn\n\t\t\t\t\t? t('dialogs.listen_together.shared_control_guest_on')"
+	),
+	'the guest status follows the separate client-control opt-in'
+);
+const uiForward = appState.slice(
+	appState.indexOf('async fn forward_guest_ui_control'),
+	appState.indexOf('async fn apply_shared_control_flags')
 );
 ok(
-	appState.includes('CONTROL_API_SETTINGS_KEY') && appState.includes('is_some_and(|s| s.enabled)'),
-	'UI forwarding requires the local Control API'
+	uiForward.includes('LT_CLIENT_CONTROL_KEY') && uiForward.includes('v == "true"'),
+	'UI forwarding requires the client-control opt-in'
+);
+ok(
+	!uiForward.includes('CONTROL_API_SETTINGS_KEY'),
+	'UI forwarding does not require the local Control API'
+);
+ok(
+	storeSource.includes('clientControl: false') &&
+		storeSource.includes('export async function setClientControl'),
+	'client control starts off and can be toggled from the room'
+);
+ok(
+	ltDialog.includes('onCheckedChange={toggleClientControl}') &&
+		ltDialog.includes('clientControlOn'),
+	'the connected guest section has the client-control switch'
 );
 
 // --- UI transport buttons over the hidden link -----------------------------------------------
@@ -350,6 +370,9 @@ for (const key of [
 	'shared_control_hint',
 	'shared_control_requires_api',
 	'shared_control_guest_on',
+	'shared_control_requires_client_control',
+	'client_control',
+	'client_control_hint',
 	'control_link',
 	'control_link_ready',
 	'control_link_preparing',
@@ -371,15 +394,15 @@ ok(
 	'the badge stays quiet when the room cannot offer shared control'
 );
 ok(
-	badgeSource.includes('integrations.controlApi'),
-	'the guest badge reflects whether local Control API is enabled'
+	badgeSource.includes('integrations.clientControl'),
+	'the guest badge reflects the separate client-control opt-in'
 );
 ok(playerBar.includes('<SharedControlBadge />'), 'the main player bar shows the badge');
 ok(miniPlayer.includes('<SharedControlBadge onArt />'), 'the mini player shows the badge');
 for (const key of [
 	'shared_host',
 	'shared_guest',
-	'shared_needs_api',
+	'shared_needs_client_control',
 	'shared_sending',
 	'shared_sent',
 	'shared_failed',

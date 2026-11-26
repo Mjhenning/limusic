@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 pub const CONTROL_API_SETTINGS_KEY: &str = "integrations.control_api";
 pub const TUNA_SETTINGS_KEY: &str = "integrations.tuna";
 pub const CONTROL_API_TOKEN_KEY: &str = "integrations.control_api_token";
+/// Guest opt-in for forwarding player buttons over a shared-control link. Kept separate from the
+/// Control API: running a local HTTP server and pressing play in a friend's room are different
+/// decisions. Stored as the string `"true"`/`"false"` like the other webview-readable settings.
+pub const LT_CLIENT_CONTROL_KEY: &str = "lt_client_control";
 
 /// Default number of queue rows on either side of the current track protected from a repeat
 /// request. Stored with the Control API settings but read per request, so UI edits take effect

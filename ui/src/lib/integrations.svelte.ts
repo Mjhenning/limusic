@@ -5,9 +5,14 @@ import * as api from './api';
 import { prefs } from './player.svelte';
 import { applyLtState, inRoom, lt } from './lt.svelte';
 
+export const LT_CLIENT_CONTROL_KEY = 'lt_client_control';
+
 export const integrations = $state({
 	controlApi: false,
 	tuna: false,
+	/// Guest opt-in for player buttons in a shared room. Independent of `controlApi` and off until
+	/// the user turns it on inside the connected Listen Together section.
+	clientControl: false,
 	loaded: false
 });
 
@@ -25,9 +30,27 @@ export function syncIntegrations(next: api.IntegrationSettings): void {
 }
 
 export async function loadIntegrations(): Promise<api.IntegrationSettings> {
-	const settings = await api.getIntegrationSettings();
+	const [settings, all] = await Promise.all([
+		api.getIntegrationSettings(),
+		api.getSettings()
+	]);
+	// Missing means never opted in. Keep this a plain string setting so the Rust transport guard
+	// and the badge read the same persisted value.
+	integrations.clientControl = all[LT_CLIENT_CONTROL_KEY] === 'true';
 	syncIntegrations(settings);
 	return settings;
+}
+
+/** Toggle only this desktop's player buttons. The Control API server is untouched. */
+export async function setClientControl(on: boolean): Promise<void> {
+	const before = integrations.clientControl;
+	integrations.clientControl = on;
+	try {
+		await api.setSetting(LT_CLIENT_CONTROL_KEY, on ? 'true' : 'false');
+	} catch (e) {
+		integrations.clientControl = before;
+		throw e;
+	}
 }
 
 /** Read-modify-write so a titlebar toggle cannot clobber other integration settings. */

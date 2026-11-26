@@ -4356,14 +4356,13 @@ impl AppState {
         if !self.lt.is_guest().await || !self.lt.shared_control_allowed().await {
             return false;
         }
-        let api_enabled = self
+        // Only the desktop's own buttons use this gate. Control API clients still forward through
+        // their own API-enabled path, so turning the HTTP server off never breaks an existing bot.
+        let client_control = self
             .db
-            .get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY)
-            .and_then(|s| {
-                serde_json::from_str::<crate::integrations::settings::ControlApiSettings>(&s).ok()
-            })
-            .is_some_and(|s| s.enabled);
-        if !api_enabled {
+            .get_setting(crate::integrations::settings::LT_CLIENT_CONTROL_KEY)
+            .is_some_and(|v| v == "true");
+        if !client_control {
             return false;
         }
         self.emit_control_feedback(true, None, "Sending…");
