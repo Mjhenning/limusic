@@ -50,6 +50,7 @@
 	import TrackMenu from './TrackMenu.svelte';
 	import DevicePicker from './DevicePicker.svelte';
 	import { link } from '$lib/link.svelte';
+	import { inRoom } from '$lib/lt.svelte';
 	import { currentLocale, t } from '$lib/i18n.svelte';
 	import LiveBadge from './LiveBadge.svelte';
 	import SharedControlBadge from './SharedControlBadge.svelte';
@@ -433,6 +434,7 @@
 				class="text-muted-foreground"
 				onclick={toggleMute}
 				aria-label={playback.volume === 0 ? t('player.unmute') : t('player.mute')}
+				title={inRoom() ? t('player.volume_local_hint') : undefined}
 			>
 				<!-- icon swap via altIcon/showAlt — `icon` is frozen at mount (see play/pause above) -->
 				<HugeiconsIcon
@@ -454,6 +456,7 @@
 				onwheel={wheelVolume}
 				aria-label={t('player.volume')}
 				aria-valuetext={volumePct}
+				title={inRoom() ? t('player.volume_local_hint') : undefined}
 			/>
 			<!-- The level as a number while the slider is in use (#609), hidden the rest of the time so
 			     the bar stays quiet. Out of the flow, left of the speaker where the bar is empty: a

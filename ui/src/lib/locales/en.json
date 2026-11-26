@@ -285,6 +285,7 @@
 		"shared_sending": "Sending…",
 		"shared_sent": "Sent to host",
 		"shared_failed": "Not sent",
+		"volume_local_hint": "Volume stays on this device in Listen Together.",
 		"queue": "Queue",
 		"lyrics": "Lyrics",
 		"karaoke": "Karaoke: remove vocals",

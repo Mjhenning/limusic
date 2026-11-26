@@ -377,9 +377,18 @@ for (const key of [
 	'shared_needs_api',
 	'shared_sending',
 	'shared_sent',
-	'shared_failed'
+	'shared_failed',
+	'volume_local_hint'
 ]) {
 	ok(typeof en.player[key] === 'string', `en.json has player.${key}`);
 }
+ok(
+	playerBar.includes("title={inRoom() ? t('player.volume_local_hint') : undefined}"),
+	'the player bar explains that room volume is local'
+);
+ok(
+	miniPlayer.includes("title={inRoom() ? t('player.volume_local_hint') : undefined}"),
+	'the mini player explains that room volume is local'
+);
 
 console.log('ok');

@@ -45,6 +45,7 @@
 		wheelVolume
 	} from '$lib/player.svelte';
 	import { thumb } from '$lib/thumb';
+	import { inRoom } from '$lib/lt.svelte';
 	import LyricsView from './LyricsView.svelte';
 	import M3SeekWave from './M3SeekWave.svelte';
 	import Marquee from './Marquee.svelte';
@@ -297,11 +298,13 @@
 						onchange={(e) => commitVolume(Number(e.currentTarget.value))}
 						onwheel={wheelVolume}
 						aria-label={t('a11y.volume')}
+						title={inRoom() ? t('player.volume_local_hint') : undefined}
 					/>
 					<button
 						class={artBtn}
 						onclick={toggleMute}
 						aria-label={playback.volume === 0 ? t('player.unmute') : t('player.mute')}
+						title={inRoom() ? t('player.volume_local_hint') : undefined}
 					>
 						<!-- icon swap via altIcon/showAlt — `icon` is frozen at mount -->
 						<HugeiconsIcon
