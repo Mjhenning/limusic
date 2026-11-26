@@ -95,7 +95,7 @@ ok(tunaFold < ui.indexOf("title: t('settings.integrations.tuna_url')"), 'Tuna UR
 
 ok(
 	ui.includes('onCheckedChange={toggleSharedControl}') &&
-		ui.includes('setSharedControlEnabled(on, sharedServerInput)'),
+		ui.includes('setSharedControlEnabled(on)'),
 	'shared control is saved with Control API settings'
 );
 ok(ui.includes('settings?.control_api.shared_control'), 'the shared-control switch reads persisted state');
@@ -188,13 +188,13 @@ const ltDialog = readFileSync(join(here, 'components', 'ListenTogether.svelte'),
 const integrationStore = readFileSync(join(here, 'integrations.svelte.ts'), 'utf8');
 const integrationSettings = readFileSync(join(here, 'components', 'IntegrationsSettings.svelte'), 'utf8');
 ok(
-	ltDialog.includes('setSharedControlEnabled(on, sharedServer)'),
-	'the pre-host toggle saves the opt-in with its relay'
+	ltDialog.includes('setSharedControlEnabled(on)'),
+	'the pre-host toggle saves only the opt-in'
 );
 ok(ltDialog.includes('controlOn && lt.sharedControlEnabled'), 'the switch reflects both gates');
 ok(
-	ltDialog.includes('disabled={!controlOn || !sharedServerConfigured || sharedBusy}'),
-	'the switch needs the API and a configured relay'
+	ltDialog.includes('disabled={!controlOn || sharedBusy}'),
+	'the switch needs only the Control API'
 );
 ok(ltDialog.includes('void loadIntegrations()'), 'opening the dialog refreshes the API flag');
 ok(
@@ -206,17 +206,17 @@ ok(
 	'both switches are locked while a room is active'
 );
 ok(
-	integrationStore.includes('BEFORE_SERVER_KEY') && integrationStore.includes('ACTIVE_SERVER_KEY'),
-	'the relay swap remembers the previous server'
+	!integrationStore.includes('BEFORE_SERVER_KEY') && !integrationStore.includes('ACTIVE_SERVER_KEY'),
+	'no relay swap state remains'
 );
 ok(
 	integrationSettings.includes('roomActive') &&
-		integrationSettings.includes('shared_control_server'),
-	'the settings toggle obeys the same idle + relay rule'
+		integrationSettings.includes('settings?.control_api.shared_control'),
+	'the settings toggle obeys the same idle rule'
 );
 ok(
-	readFileSync(join(here, 'api.ts'), 'utf8').includes('shared_control_server: string'),
-	'the integration settings type carries the fork relay URL'
+	!readFileSync(join(here, 'api.ts'), 'utf8').includes('shared_control_server'),
+	'the integration settings type no longer carries a relay URL'
 );
 ok(
 	readFileSync(join(here, 'lt.svelte.ts'), 'utf8').includes('sharedControlReason: null'),

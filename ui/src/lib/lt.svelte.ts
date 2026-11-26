@@ -16,6 +16,7 @@ export const lt = $state<LtState>({
 	pendingJoins: [],
 	suggestions: [],
 	sharedControlEnabled: false,
+	sharedControlLinkReady: false,
 	sharedControlCapable: false,
 	sharedControl: false,
 	hostSharedControlCapable: false,

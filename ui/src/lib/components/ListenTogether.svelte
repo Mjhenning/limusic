@@ -35,7 +35,6 @@
 	let serverUrl = $state('');
 	let showServer = $state(false);
 	let inviteInput = $state('');
-	let sharedServer = $state('');
 	let busy = $state(false);
 	let sharedBusy = $state(false);
 	let copied = $state(false);
@@ -50,10 +49,8 @@
 			showServer = false;
 			copied = false;
 			// The titlebar can open this dialog before Settings has ever run. Refresh the API flag
-			// and the configured fork relay so the pre-hosting switch knows both gates.
-			void loadIntegrations()
-				.then((loaded) => (sharedServer = loaded.control_api.shared_control_server ?? ''))
-				.catch(() => {});
+			// so the pre-hosting switch reflects the persisted state.
+			void loadIntegrations().catch(() => {});
 		}
 	});
 
@@ -76,12 +73,11 @@
 	const sharedControlLabel = $derived(
 		lt.sharedControlReason
 			? lt.sharedControlReason
-			: lt.sharedControl
+			: lt.sharedControlEnabled
 				? t('dialogs.listen_together.shared_control_on')
 				: t('dialogs.listen_together.shared_control_off')
 	);
 	const controlOn = $derived(integrations.controlApi);
-	const sharedServerConfigured = $derived(!!sharedServer.trim());
 
 	function rememberName() {
 		localStorage.setItem('lt_name', name.trim());
@@ -99,13 +95,10 @@
 	}
 
 	async function toggleSharedControl(on: boolean) {
-		if (!controlOn || !sharedServerConfigured || sharedBusy) return;
+		if (!controlOn || sharedBusy) return;
 		sharedBusy = true;
 		try {
-			await setSharedControlEnabled(on, sharedServer);
-			serverUrl = lt.serverUrl;
-			// Make the relay swap visible: the invite is minted from this value.
-			if (on) showServer = true;
+			await setSharedControlEnabled(on);
 		} catch (e) {
 			toast.error(String(e));
 		} finally {
@@ -263,14 +256,12 @@
 								<p class="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
 									{!controlOn
 										? t('dialogs.listen_together.shared_control_requires_api')
-										: !sharedServerConfigured
-											? t('dialogs.listen_together.shared_control_needs_server')
-											: t('dialogs.listen_together.shared_control_setup_hint')}
+										: t('dialogs.listen_together.shared_control_setup_hint')}
 								</p>
 							</div>
 							<Switch
 								checked={controlOn && lt.sharedControlEnabled}
-								disabled={!controlOn || !sharedServerConfigured || sharedBusy}
+								disabled={!controlOn || sharedBusy}
 								aria-label={t('dialogs.listen_together.shared_control')}
 								onCheckedChange={toggleSharedControl}
 							/>

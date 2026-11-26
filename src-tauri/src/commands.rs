@@ -3786,8 +3786,8 @@ pub async fn set_integration_settings(
         .get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY)
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
-    // The opt-in changes which relay a room must use, so it is a pre-hosting choice. Other
-    // Control API fields stay editable while a bot is connected; only this one is locked.
+    // The opt-in prepares a hidden device-link room when a room starts, so it is a pre-hosting
+    // choice. Other Control API fields stay editable while a bot is connected; only this one is locked.
     if previous.shared_control != control_api.shared_control && state.lt.in_room().await {
         return Err("Leave Listen Together before changing shared control.".to_string());
     }

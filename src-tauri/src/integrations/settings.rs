@@ -23,11 +23,6 @@ pub struct ControlApiSettings {
     /// false. `#[serde(default)]` keeps that upgrade silent.
     #[serde(default)]
     pub shared_control: bool,
-    /// Fork sync-server URL used when shared control is enabled. Empty means "not configured";
-    /// the Host-tab switch refuses to turn on until this is set. `#[serde(default)]` keeps old
-    /// saved payloads loadable.
-    #[serde(default)]
-    pub shared_control_server: String,
     /// Rows within this distance of the current track are protected from repeat requests. Old
     /// saved payloads predate it and read as the default.
     #[serde(default = "default_queue_dedupe_window")]
@@ -41,7 +36,6 @@ impl Default for ControlApiSettings {
             bind: "127.0.0.1".to_string(),
             port: 27199,
             shared_control: false,
-            shared_control_server: String::new(),
             queue_dedupe_window: DEFAULT_QUEUE_DEDUPE_WINDOW,
         }
     }
@@ -115,30 +109,8 @@ pub fn validate_and_normalize_control_api_settings(
     if s.queue_dedupe_window > MAX_QUEUE_DEDUPE_WINDOW {
         return Err(format!("queue dedupe window must be between 0 and {MAX_QUEUE_DEDUPE_WINDOW}"));
     }
-    s.shared_control_server = s.shared_control_server.trim().to_string();
-    validate_shared_control_server_url(&s.shared_control_server)?;
     s.bind = bind;
     Ok(s)
-}
-
-/// The opt-in server is optional until shared control is switched on, so an empty value is valid.
-/// Anything set must be a websocket URL the app can actually hand to `lt_set_server_url`.
-pub fn validate_shared_control_server_url(url: &str) -> Result<(), String> {
-    let u = url.trim();
-    if u.is_empty() {
-        return Ok(());
-    }
-    let lower = u.to_ascii_lowercase();
-    if !(lower.starts_with("ws://") || lower.starts_with("wss://")) {
-        return Err("shared-control server must start with ws:// or wss://".to_string());
-    }
-    let rest = if lower.starts_with("wss://") { &u[6..] } else { &u[5..] };
-    let authority =
-        rest.split('/').next().unwrap_or("").split(['?', '#']).next().unwrap_or("").trim();
-    if authority.is_empty() {
-        return Err("shared-control server must include a host".to_string());
-    }
-    Ok(())
 }
 
 pub fn validate_tuna_url(url: &str) -> Result<(), String> {
@@ -166,7 +138,6 @@ mod tests {
         assert_eq!(s.control_api.bind, "127.0.0.1");
         assert_eq!(s.control_api.port, 27199);
         assert!(!s.control_api.shared_control);
-        assert_eq!(s.control_api.shared_control_server, "");
         assert_eq!(s.control_api.queue_dedupe_window, DEFAULT_QUEUE_DEDUPE_WINDOW);
         assert!(!s.tuna.enabled);
         assert_eq!(s.tuna.url, "http://127.0.0.1:1608/");
@@ -182,8 +153,11 @@ mod tests {
         let old = r#"{"control_api":{"enabled":true,"bind":"0.0.0.0","port":27199},"tuna":{"enabled":false,"url":"http://127.0.0.1:1608/"}}"#;
         let old: IntegrationSettings = serde_json::from_str(old).unwrap();
         assert!(!old.control_api.shared_control);
-        assert_eq!(old.control_api.shared_control_server, "");
         assert_eq!(old.control_api.queue_dedupe_window, DEFAULT_QUEUE_DEDUPE_WINDOW);
+        // The short-lived relay field is ignored, so downgrading needs no migration.
+        let legacy = r#"{"control_api":{"enabled":false,"bind":"127.0.0.1","port":27199,"shared_control":true,"shared_control_server":"wss://old.example/ws"},"tuna":{"enabled":false,"url":"http://127.0.0.1:1608/"}}"#;
+        let legacy: IntegrationSettings = serde_json::from_str(legacy).unwrap();
+        assert!(legacy.control_api.shared_control);
     }
 
     #[test]
@@ -224,24 +198,6 @@ mod tests {
         }
         s.queue_dedupe_window = MAX_QUEUE_DEDUPE_WINDOW + 1;
         assert!(validate_and_normalize_control_api_settings(s).is_err());
-    }
-
-    #[test]
-    fn validate_shared_control_server() {
-        assert!(validate_shared_control_server_url("").is_ok());
-        assert!(validate_shared_control_server_url("wss://relay.example/ws").is_ok());
-        assert!(validate_shared_control_server_url("ws://127.0.0.1:8080").is_ok());
-        assert!(validate_shared_control_server_url("file:///etc/passwd").is_err());
-        assert!(validate_shared_control_server_url("https://example.com/ws").is_err());
-        assert!(validate_shared_control_server_url("wss://").is_err());
-        assert!(validate_shared_control_server_url("wss:///ws").is_err());
-
-        let mut s = ControlApiSettings::default();
-        s.shared_control_server = "  wss://relay.example/ws  ".into();
-        assert_eq!(
-            validate_and_normalize_control_api_settings(s).unwrap().shared_control_server,
-            "wss://relay.example/ws"
-        );
     }
 
     #[test]

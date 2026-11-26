@@ -43,47 +43,12 @@ export async function setIntegrationEnabled(
 	return settings;
 }
 
-const BEFORE_SERVER_KEY = 'lt_shared_control_server_before';
-const ACTIVE_SERVER_KEY = 'lt_shared_control_server_active';
-
-/** Set the host opt-in and swap the Listen Together relay with it.
- *
- * This is deliberately a pre-hosting change: switching relay mid-room would drop everybody.
- * Turning on stores the current relay and switches to the configured fork server; turning off
- * restores the stored relay only if the user has not manually picked another one meanwhile.
- */
-export async function setSharedControlEnabled(
-	on: boolean,
-	server: string
-): Promise<api.IntegrationSettings> {
+/** Set the host opt-in. The hidden link room is keyed by the room code, which only exists after
+ *  hosting starts, so this stays a pre-hosting choice. The relay is never swapped. */
+export async function setSharedControlEnabled(on: boolean): Promise<api.IntegrationSettings> {
 	if (inRoom() || lt.requesting || lt.status === 'connecting') {
 		throw new Error('Leave Listen Together before changing shared control.');
 	}
-	const relay = server.trim();
-	if (on && !relay) {
-		throw new Error('Set a shared-control server in Integrations first.');
-	}
-
-	const current = lt.serverUrl.trim();
-	let nextServer = current;
-	if (on) {
-		localStorage.setItem(ACTIVE_SERVER_KEY, relay);
-		if (current !== relay) {
-			localStorage.setItem(BEFORE_SERVER_KEY, current);
-			nextServer = relay;
-		} else if (!localStorage.getItem(BEFORE_SERVER_KEY)) {
-			localStorage.setItem(BEFORE_SERVER_KEY, current);
-		}
-	} else {
-		const active = localStorage.getItem(ACTIVE_SERVER_KEY) ?? relay;
-		if (current === active) {
-			nextServer = localStorage.getItem(BEFORE_SERVER_KEY) ?? '';
-		}
-		localStorage.removeItem(BEFORE_SERVER_KEY);
-		localStorage.removeItem(ACTIVE_SERVER_KEY);
-	}
-	if (nextServer !== current) await api.ltSetServerUrl(nextServer);
-
 	const settings = await api.getIntegrationSettings();
 	settings.control_api.shared_control = on;
 	await api.setIntegrationSettings(settings);

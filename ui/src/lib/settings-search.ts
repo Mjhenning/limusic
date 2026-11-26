@@ -289,11 +289,6 @@ const TABLE: [SettingsTab, K | null, Row[]][] = [
 				'settings.integrations.enable'
 			],
 			[
-				'settings.integrations.shared_control_server',
-				'settings.integrations.shared_control_server_hint',
-				'settings.integrations.enable'
-			],
-			[
 				'settings.integrations.queue_dedupe_window',
 				'settings.integrations.queue_dedupe_window_hint',
 				'settings.integrations.enable'

@@ -1690,7 +1690,9 @@ export interface LtState {
 	suggestions: LtSuggestion[];
 	/** Persisted host opt-in; forwarded Control API mutations require it. */
 	sharedControlEnabled: boolean;
-	/** Relay/host/guest capability facts mirrored from the room state. */
+	/** Hidden room-code-derived link room is live. */
+	sharedControlLinkReady: boolean;
+	/** Legacy relay/host/guest capability facts mirrored from the room state. */
 	sharedControlCapable: boolean;
 	sharedControl: boolean;
 	hostSharedControlCapable: boolean;
@@ -1769,8 +1771,6 @@ export interface ControlApiSettings {
 	port: number;
 	/** Host opt-in: let fork guests forward Control API mutations to this player. */
 	shared_control: boolean;
-	/** Fork relay URL the Host-tab switch swaps in when shared control is enabled. */
-	shared_control_server: string;
 	/** Queue rows on either side of the current track protected from repeat requests. */
 	queue_dedupe_window: number;
 }

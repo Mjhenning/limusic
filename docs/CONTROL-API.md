@@ -88,7 +88,7 @@ parsing the message.
 | 401 | `unauthorized` | Missing or wrong bearer token |
 | 404 | `not_found` | Unknown route, or no song matched the request |
 | 405 | `method_not_allowed` | Known route, wrong HTTP method |
-| 409 | `listen_together_guest` | Host controls playback; `message` names the missing capability when known |
+| 409 | `listen_together_guest` | Host controls playback; `message` explains why shared control is unavailable when known |
 | 409 | `remote_linked` | Another linked device is the player |
 | 409 | `queue_changed` | A stale `video_id` was sent to `/queue/remove` |
 | 409 | `duplicate` | Song is inside the protected window; counterparts count as duplicates |
@@ -479,18 +479,31 @@ A guest normally gets `409 listen_together_guest`: the room's host owns playback
 This fork can forward a mutation to that host when all of the following are
 true:
 
-- the guest and host both run this fork, and the relay is this project's
-  `sync-server` (a base client or base server never sets the capability flags);
+- the guest and host both run this fork;
 - **Settings ▸ Integrations ▸ Control API ▸ Shared Listen Together control**
-  is on **on the host**, with **Shared-control server** pointing at that relay;
-- the guest joined the room through the invite minted after the switch was
-  turned on, and its Control API is enabled.
+  is on **on the host**, before the room starts;
+- the guest's Control API is enabled.
 
-The opt-in is a pre-hosting choice. Turning it on switches Listen Together to
-**Shared-control server**, saves the previous/default relay, and makes the
-room's invite carry the fork address. Turning it off restores the saved relay.
-The switch is unavailable while a room is active, because changing relay would
-drop everybody in it.
+There is no user-hosted relay and no special invite: the invite is the same
+bare room code a default host copies. The host derives a link secret from that
+code (`base64url(sha256("limusic-shared-control|" + code))`, 43 chars) and joins
+a hidden device-link room on the relay the Listen Together room already uses
+(`wss://sync.limusic.app/ws` by default). It advertises itself there under a
+device id derived from the same code. A guest with the Control API enabled
+derives the same secret when its first mutation needs forwarding, joins that
+link room on a fresh socket, targets the host's derived device id, and sends
+the mutation inside the existing opaque `Remote` envelope. The result returns
+to the guest's socket. One code serves both kinds of guest at once: API-enabled
+fork guests take this extra route while base guests and API-disabled clients use
+the normal Listen Together room unchanged. The hidden room carries only shared
+control envelopes, never general device-link controls.
+
+The opt-in is a pre-hosting choice. It does not change `lt_server_url` and does
+not change the invite, so a room can mix default users and fork users. The
+switch is unavailable while a room is active because the hidden link is opened
+only when the room is created. Upstream link rooms hold at most 8 devices
+including the host, so up to 7 fork guests can forward at once; later guests
+get a clear error and stay suggestion-only.
 
 The guest sends the same HTTP request it would send locally. It waits at most
 15 s for a correlated answer from the host, then returns the normal success
@@ -503,27 +516,28 @@ The host applies its own **Queue request window** to forwarded
 `/queue/request`, `/queue/add`, and `/queue/play-next` calls; the guest's window
 setting is not used. If the host rejects a row inside that window, the guest
 answers `502 shared_control_failed` with the host's reason and inserts nothing.
+Only `submitted_by` marks room-client ownership; `queued_by` remains the bot's
+visible requester.
 
 #### Diagnosing an unavailable room
 
-The default server is `wss://sync.limusic.app/ws`, the upstream relay. It does
-not advertise shared-control capability, so a bare room code cannot forward
-mutations. Set **Shared-control server** to this fork's `sync-server` before
-turning the switch on; the app swaps relays for you and puts the address in the
-invite.
+The Listen Together dialog and the guest `409 listen_together_guest` message
+name the first missing fact from the same `sharedControlReason`: a room that is
+still reconnecting, a hidden link that is still preparing on the host, or the
+last failure reported by the guest's link (most often "the host has not enabled
+shared control for this room (or is not running this fork)"). An expired or
+unreachable relay is reported with the same wording rather than a native
+dialog. A base host never joins the link room, so its guests remain
+suggestion-only without any user action.
 
-The Listen Together dialog and guest `409 listen_together_guest` message now
-name the first missing fact: an unsupported relay, a host that has not opted
-in, or a guest socket that is still reconnecting. On the host, a saved opt-in
-that the relay has not echoed yet is shown as pending instead of "off".
-
-The wire change is additive: defaulted fields in the existing room state, and
-new kinds inside the existing opaque `remote` envelope. No `ServerMessage`
-variant was added, so base clients keep joining unchanged and remain
-suggestion-only. Shared forward covers playback, seek, volume, and queue edits
-including `/queue/request`. Queue facts that the host decides locally, such as
-the three-second Previous rewind and the app's duplicate-prevention setting,
-are not replicated into the forwarded response.
+No `ServerMessage` variant was added. The wire change is additive: defaulted
+room-state fields kept for older fork relays, and new kinds inside the existing
+opaque `remote` envelope, which the upstream relay forwards unread in link
+rooms. Older base clients keep joining unchanged, and base clients never join
+the hidden room. Shared forward covers playback, seek, volume, and queue edits
+including `/queue/request`. Queue facts the host decides locally, such as the
+three-second Previous rewind and the app's
+duplicate-prevention setting, are not replicated into the forwarded response.
 
 ## Examples
 

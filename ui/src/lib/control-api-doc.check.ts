@@ -91,12 +91,13 @@ for (const text of [
 	'base clients',
 	'/queue/request',
 	'sync.limusic.app',
-	'not advertise shared-control capability',
-	'the first missing fact',
-	'Shared-control server',
+	'no user-hosted relay',
+	'bare room code',
+	'hidden device-link room',
 	'pre-hosting choice',
-	'restores the saved relay',
-	'invite minted after'
+	'One code serves both kinds of guest at once',
+	'the first missing fact',
+	'No `ServerMessage` variant was added'
 ]) {
 	ok(sharedSection.includes(text), `shared-control docs mention ${text}`);
 }
@@ -107,9 +108,10 @@ const commands = read(join(root, 'src-tauri', 'src', 'commands.rs'));
 ok(types.includes('listen_together_guest_with'), 'guest errors carry the room blocker');
 ok(lt.includes('sharedControlReason'), 'the room snapshot carries the diagnostic reason');
 ok(
-	integrationSettings.includes('shared_control_server'),
-	'the fork relay URL is persisted with the API settings'
+	!integrationSettings.includes('pub shared_control_server'),
+	'no fork relay URL is persisted with the API settings'
 );
+ok(lt.includes('shared_link_keys') && lt.includes('JoinLink'), 'the hidden link is derived from the room code');
 ok(commands.includes('before changing shared control'), 'backend locks the opt-in while in a room');
 ok(commands.includes('before changing the server'), 'backend locks relay edits while in a room');
 ok(handlers.includes('forward_shared_control'), 'handlers forward opted-in guest mutations');

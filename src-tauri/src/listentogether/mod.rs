@@ -7,20 +7,21 @@
 //! No back-reference to `AppState` (avoids an Arc cycle): everything the connection needs is the
 //! `AppHandle` (to emit UI events) and the sync channel.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use listen_protocol::{
     ClientMessage, Playback, PlaybackKind, RemoteAction, RoomState, ServerMessage,
     SharedControlEnvelope, Suggestion, Track, User,
 };
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -120,6 +121,33 @@ pub(crate) fn stored_url(url: String) -> String {
     }
 }
 
+/// The hidden device-link room is keyed by the room code itself, so the invite stays a bare code
+/// on the default relay. The digest is 32 bytes → 43 base64url chars, which upstream accepts as a
+/// link secret; the short hex prefix gives the guest a stable device id to target on that link.
+/// Anyone who has the room code can already join the room, so this adds no new capability leak.
+fn shared_link_keys(room_code: &str) -> (String, String) {
+    let digest = Sha256::digest(format!("limusic-shared-control|{room_code}").as_bytes());
+    let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    let host_suffix: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+    (secret, format!("sc-host-{host_suffix}"))
+}
+
+/// Map relay errors to the same diagnostics the dialog and the guest HTTP error show.
+fn shared_link_error(code: &str, message: &str) -> String {
+    match code {
+        "no_device" => {
+            "the host has not enabled shared control for this room (or is not running this fork)"
+                .into()
+        }
+        "room_full" => {
+            "too many guests are using shared control in this room; retry shortly".into()
+        }
+        "bad_secret" => "the room code could not open the shared-control channel".into(),
+        "server_full" => "the Listen Together server is full; retry shortly".into(),
+        _ => message.to_string(),
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     status_connected: bool,
@@ -146,6 +174,10 @@ struct Inner {
     shared_control: bool,
     /// The current host's fork capability, mirrored from `RoomState`.
     host_shared_control_capable: bool,
+    /// The hidden link room keyed by this room's code is live. Host-side readiness.
+    shared_link_ready: bool,
+    /// Last guest-side failure of the hidden link, surfaced in the dialog and `409` message.
+    shared_link_reason: Option<String>,
 }
 
 impl Default for Role {
@@ -180,6 +212,8 @@ impl Inner {
         self.shared_control_capable = false;
         self.shared_control = false;
         self.host_shared_control_capable = false;
+        self.shared_link_ready = false;
+        self.shared_link_reason = None;
         self.status_connected = false;
         self.connecting = false;
         self.requesting = false;
@@ -202,10 +236,14 @@ pub struct LtSession {
     sync_tx: mpsc::UnboundedSender<SyncCommand>,
     /// Bumped to cancel the running connection loop (leave / new connection).
     gen: AtomicU64,
-    /// Guest requests waiting for `control_result`, keyed by correlation id.
-    pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>>,
     /// Monotonic suffix for correlation ids; the generation prefix makes them unique across rooms.
     control_id: AtomicU64,
+    /// Bumped to cancel the hidden shared-control link when the room or opt-in changes.
+    shared_gen: AtomicU64,
+    /// Which room-code-derived link room the host session is responsible for.
+    shared_code: Mutex<Option<String>>,
+    /// Active hidden-link socket's outbound channel, used only for correlated `control_result`s.
+    shared_outbound: Mutex<Option<mpsc::UnboundedSender<ClientMessage>>>,
 }
 
 impl LtSession {
@@ -228,8 +266,10 @@ impl LtSession {
             inner: Arc::new(Mutex::new(inner)),
             sync_tx,
             gen: AtomicU64::new(0),
-            pending_control: Arc::new(Mutex::new(HashMap::new())),
             control_id: AtomicU64::new(0),
+            shared_gen: AtomicU64::new(0),
+            shared_code: Mutex::new(None),
+            shared_outbound: Mutex::new(None),
         });
         (s, sync_rx)
     }
@@ -255,26 +295,27 @@ impl LtSession {
         self.inner.lock().await.role == Role::Host
     }
 
-    /// Persist and announce the host's opt-in. The setting applies to the next room too; while a
-    /// room is live the relay publishes a fresh `sync_state` so every guest sees the change.
-    pub async fn set_shared_control_enabled(&self, on: bool) {
-        let (host, capable) = {
+    /// Persist the host opt-in. The hidden link room is keyed by the room code, so this works on
+    /// the default relay; the switch is still a pre-hosting choice in the UI.
+    pub async fn set_shared_control_enabled(self: &Arc<Self>, on: bool) {
+        let (host, code) = {
             let mut inner = self.inner.lock().await;
             inner.shared_control_enabled = on;
-            (inner.role == Role::Host, inner.shared_control_capable)
+            (inner.role == Role::Host, inner.room_code.clone())
         };
         if host {
-            self.announce_shared_control().await;
-            if on && !capable {
-                self.emit_notice(
-                    "Shared control was saved, but this server does not support it; use this fork's sync-server on both devices.",
-                )
-                .await;
+            if on {
+                self.start_shared_host_link(code).await;
+            } else {
+                self.stop_shared_host_link().await;
             }
+            self.announce_shared_control().await;
         }
         self.emit_state().await;
     }
 
+    /// Legacy relay state announcement. The hidden link does not need it, but a fork relay that
+    /// still understands `SetSharedControl` keeps its room state consistent for older clients.
     async fn announce_shared_control(&self) {
         let on = self.inner.lock().await.shared_control_enabled;
         self.send(ClientMessage::Remote {
@@ -285,16 +326,200 @@ impl LtSession {
         .await;
     }
 
+    /// Start (or keep) the host's hidden link when we are a opted-in host in a room.
+    async fn maybe_start_shared_host_link(self: &Arc<Self>) {
+        let (enabled, host, code) = {
+            let inner = self.inner.lock().await;
+            (inner.shared_control_enabled, inner.role == Role::Host, inner.room_code.clone())
+        };
+        if enabled && host {
+            self.start_shared_host_link(code).await;
+        }
+    }
+
+    async fn start_shared_host_link(self: &Arc<Self>, code: Option<String>) {
+        let Some(code) = code else { return };
+        {
+            let mut active = self.shared_code.lock().await;
+            if active.as_deref() == Some(code.as_str()) {
+                return;
+            }
+            *active = Some(code.clone());
+        }
+        let (secret, host_id) = shared_link_keys(&code);
+        let url = {
+            let inner = self.inner.lock().await;
+            if inner.server_url.is_empty() {
+                DEFAULT_SERVER.to_string()
+            } else {
+                inner.server_url.clone()
+            }
+        };
+        let gen = self.shared_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.shared_outbound.lock().await = None;
+        {
+            let mut inner = self.inner.lock().await;
+            inner.shared_link_ready = false;
+            inner.shared_link_reason = None;
+        }
+        let me = self.clone();
+        tokio::spawn(async move { me.run_shared_host_link(gen, secret, host_id, url).await });
+        self.emit_state().await;
+    }
+
+    async fn stop_shared_host_link(&self) {
+        self.shared_gen.fetch_add(1, Ordering::SeqCst);
+        *self.shared_code.lock().await = None;
+        *self.shared_outbound.lock().await = None;
+        {
+            let mut inner = self.inner.lock().await;
+            inner.shared_link_ready = false;
+            inner.shared_link_reason = None;
+        }
+        self.emit_state().await;
+    }
+
+    /// Host side of the hidden link. It joins a device-link room keyed by the room code and turns
+    /// only `control_request` envelopes into sync commands; every other device-link message is
+    /// ignored. Reconnects independently of the Listen Together socket.
+    async fn run_shared_host_link(
+        self: Arc<Self>,
+        gen: u64,
+        secret: String,
+        host_id: String,
+        url: String,
+    ) {
+        let mut attempt = 0;
+        while self.shared_gen.load(Ordering::SeqCst) == gen {
+            let ws = match connect_ws(&url).await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    tracing::warn!(error = %e, "shared-control link connect failed");
+                    attempt += 1;
+                    tokio::time::sleep(backoff_delay(attempt)).await;
+                    continue;
+                }
+            };
+            attempt = 0;
+            let (mut sink, mut read) = ws.split();
+            let (otx, mut orx) = mpsc::unbounded_channel::<ClientMessage>();
+            *self.shared_outbound.lock().await = Some(otx.clone());
+            let _ = otx.send(ClientMessage::JoinLink {
+                secret: secret.clone(),
+                device_id: host_id.clone(),
+                name: "Shared control".into(),
+            });
+            let mut writer = tokio::spawn(async move {
+                while let Some(msg) = orx.recv().await {
+                    if sink.send(Message::Text(msg.to_json())).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            loop {
+                if self.shared_gen.load(Ordering::SeqCst) != gen {
+                    break;
+                }
+                let next = tokio::select! {
+                    biased;
+                    next = read.next() => next,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => continue,
+                };
+                let Some(next) = next else { break };
+                let Ok(Message::Text(text)) = next else { continue };
+                let Ok(sm) = serde_json::from_str::<ServerMessage>(&text) else { continue };
+                match sm {
+                    ServerMessage::LinkJoined { state, .. } => {
+                        let ready =
+                            state.users.iter().any(|u| u.user_id == host_id && u.is_connected);
+                        {
+                            let mut inner = self.inner.lock().await;
+                            inner.shared_link_ready = ready;
+                            if ready {
+                                inner.shared_link_reason = None;
+                            }
+                        }
+                        self.emit_state().await;
+                    }
+                    ServerMessage::Remote { from, action } => {
+                        let Ok(envelope) = serde_json::from_value::<SharedControlEnvelope>(action)
+                        else {
+                            continue;
+                        };
+                        let SharedControlEnvelope::ControlRequest {
+                            id, action, submitted_by, ..
+                        } = envelope
+                        else {
+                            continue;
+                        };
+                        let enabled = {
+                            let inner = self.inner.lock().await;
+                            inner.role == Role::Host && inner.shared_control_enabled
+                        };
+                        if !enabled {
+                            let _ = otx.send(ClientMessage::Remote {
+                                action: SharedControlEnvelope::ControlResult {
+                                    id,
+                                    ok: false,
+                                    error: Some("the host turned shared control off".into()),
+                                }
+                                .to_value(),
+                                to: Some(from),
+                            });
+                            continue;
+                        }
+                        let _ = self.sync_tx.send(SyncCommand::SharedControlRequest {
+                            id,
+                            from,
+                            action,
+                            submitted_by,
+                        });
+                    }
+                    ServerMessage::Error { code, message } => {
+                        tracing::warn!(%code, %message, "shared-control link error");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            if self.shared_gen.load(Ordering::SeqCst) != gen {
+                drop(otx);
+                if tokio::time::timeout(Duration::from_secs(2), &mut writer).await.is_err() {
+                    writer.abort();
+                }
+                return;
+            }
+            {
+                let mut inner = self.inner.lock().await;
+                inner.shared_link_ready = false;
+            }
+            *self.shared_outbound.lock().await = None;
+            drop(otx);
+            if tokio::time::timeout(Duration::from_secs(2), &mut writer).await.is_err() {
+                writer.abort();
+            }
+            self.emit_state().await;
+            attempt += 1;
+            tokio::time::sleep(backoff_delay(attempt)).await;
+        }
+    }
+
+    async fn set_shared_link_reason(&self, reason: Option<String>) {
+        {
+            let mut inner = self.inner.lock().await;
+            inner.shared_link_reason = reason;
+        }
+        self.emit_state().await;
+    }
+
     /// True when a local Control API mutation may be forwarded to this room's host instead of being
-    /// rejected with `listen_together_guest`. All three facts come from the authoritative state;
-    /// an older relay or host leaves at least one of them false.
+    /// rejected with `listen_together_guest`. The host's opt-in is learned by the hidden link itself;
+    /// a base host simply never answers there.
     pub async fn shared_control_allowed(&self) -> bool {
         let inner = self.inner.lock().await;
-        inner.role == Role::Guest
-            && inner.shared_control_capable
-            && inner.shared_control
-            && inner.host_shared_control_capable
-            && inner.outbound.is_some()
+        inner.role == Role::Guest && inner.room_code.is_some() && inner.status_connected
     }
 
     /// Why shared control is unavailable in the current room, for the UI and guest API errors.
@@ -304,30 +529,26 @@ impl LtSession {
     }
 
     /// The single source of truth behind both `sharedControlReason` and the guest error message.
-    /// A base relay never sets `shared_control_capable`, so that case is named first.
     fn reason_for(inner: &Inner) -> Option<String> {
         if inner.role == Role::None {
             return None;
         }
-        if !inner.shared_control_capable {
-            return Some(
-                "this Listen Together server does not support shared control; use this fork's sync-server on both devices".into(),
-            );
+        if let Some(reason) = &inner.shared_link_reason {
+            return Some(reason.clone());
         }
         match inner.role {
             Role::Host => {
-                if inner.shared_control_enabled && inner.status_connected && !inner.shared_control {
-                    Some(
-                        "shared control is saved on this device but the server has not confirmed it yet".into(),
-                    )
+                if inner.shared_control_enabled
+                    && inner.status_connected
+                    && !inner.shared_link_ready
+                {
+                    Some("shared control is preparing for this room; retry shortly".into())
                 } else {
                     None
                 }
             }
             Role::Guest => {
-                if !inner.shared_control || !inner.host_shared_control_capable {
-                    Some("the host has not enabled shared control for this room".into())
-                } else if !inner.outbound.is_some() {
+                if !inner.status_connected {
                     Some("Listen Together is reconnecting; retry shortly".into())
                 } else {
                     None
@@ -337,64 +558,150 @@ impl LtSession {
         }
     }
 
-    /// Guest: forward one API mutation to the host and wait for the correlated answer.
-    pub async fn forward_shared_control(&self, action: RemoteAction) -> Result<(), String> {
+    /// Guest: open the room-code-derived link room, ask the host to apply the action, and wait for
+    /// the correlated answer. A fresh socket per request keeps concurrent calls independent and
+    /// leaves no link-room devices behind for base hosts.
+    pub async fn forward_shared_control(
+        self: &Arc<Self>,
+        action: RemoteAction,
+    ) -> Result<(), String> {
         if !self.shared_control_allowed().await {
             return Err("this host has not enabled shared control".into());
         }
-        let id = format!(
-            "{}-{}",
-            self.gen.load(Ordering::SeqCst),
-            self.control_id.fetch_add(1, Ordering::Relaxed)
-        );
-        let (tx, rx) = oneshot::channel();
-        self.pending_control.lock().await.insert(id.clone(), tx);
-        let submitted_by = self.my_username().await;
-        self.send(ClientMessage::Remote {
-            action: SharedControlEnvelope::ControlRequest {
-                id: id.clone(),
-                action: stamp_shared_action(action, submitted_by.as_deref()),
-                shared_control_capable: true,
-                submitted_by,
-            }
-            .to_value(),
-            to: None,
-        })
-        .await;
-
-        let result = match tokio::time::timeout(SHARED_CONTROL_TIMEOUT, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("the Listen Together connection closed".into()),
-            Err(_) => {
-                self.pending_control.lock().await.remove(&id);
-                Err("the host did not answer within 15 seconds".into())
+        let (secret, host_id, url) = {
+            let inner = self.inner.lock().await;
+            let code =
+                inner.room_code.clone().ok_or_else(|| "this room has no code".to_string())?;
+            let (secret, host_id) = shared_link_keys(&code);
+            let url = if inner.server_url.is_empty() {
+                DEFAULT_SERVER.to_string()
+            } else {
+                inner.server_url.clone()
+            };
+            (secret, host_id, url)
+        };
+        let ws = match connect_ws(&url).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                let reason = format!("could not reach the shared-control channel: {e}");
+                self.set_shared_link_reason(Some(reason.clone())).await;
+                return Err(reason);
             }
         };
-        result
-    }
-
-    async fn settle_control(&self, id: String, result: Result<(), String>) {
-        if let Some(tx) = self.pending_control.lock().await.remove(&id) {
-            let _ = tx.send(result);
+        let (mut sink, mut read) = ws.split();
+        let device_id = format!("sc-guest-{:016x}", rand::random::<u64>());
+        let join = ClientMessage::JoinLink { secret, device_id, name: "Control API".into() };
+        if let Err(e) = sink.send(Message::Text(join.to_json())).await {
+            let reason = format!("could not open the shared-control channel: {e}");
+            self.set_shared_link_reason(Some(reason.clone())).await;
+            return Err(reason);
         }
-    }
 
-    async fn fail_pending(&self, reason: &str) {
-        let pending = std::mem::take(&mut *self.pending_control.lock().await);
-        for (_, tx) in pending {
-            let _ = tx.send(Err(reason.to_string()));
+        let outcome = async {
+            let joined = tokio::time::timeout(SHARED_CONTROL_TIMEOUT, async {
+                loop {
+                    let Some(next) = read.next().await else {
+                        return Err("the shared-control channel closed".to_string());
+                    };
+                    let Ok(Message::Text(text)) = next else { continue };
+                    match serde_json::from_str::<ServerMessage>(&text) {
+                        Ok(ServerMessage::LinkJoined { state, .. }) => {
+                            let ready = state.users.iter().any(|u| u.user_id == host_id && u.is_connected);
+                            return if ready {
+                                Ok(())
+                            } else {
+                                Err("the host has not enabled shared control for this room (or is not running this fork)".into())
+                            };
+                        }
+                        Ok(ServerMessage::Error { code, message }) => {
+                            return Err(shared_link_error(&code, &message));
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => return Err(reason),
+                Err(_) => return Err("the host did not open the shared-control channel in time".into()),
+            }
+
+            let id = format!(
+                "{}-{}",
+                self.gen.load(Ordering::SeqCst),
+                self.control_id.fetch_add(1, Ordering::Relaxed)
+            );
+            let submitted_by = self.my_username().await;
+            let request = ClientMessage::Remote {
+                action: SharedControlEnvelope::ControlRequest {
+                    id: id.clone(),
+                    action: stamp_shared_action(action, submitted_by.as_deref()),
+                    shared_control_capable: true,
+                    submitted_by,
+                }
+                .to_value(),
+                to: Some(host_id),
+            };
+            sink.send(Message::Text(request.to_json())).await.map_err(|e| {
+                format!("could not send the shared-control request: {e}")
+            })?;
+
+            let waited = tokio::time::timeout(SHARED_CONTROL_TIMEOUT, async {
+                loop {
+                    let Some(next) = read.next().await else {
+                        return Err("the shared-control channel closed".to_string());
+                    };
+                    let Ok(Message::Text(text)) = next else { continue };
+                    match serde_json::from_str::<ServerMessage>(&text) {
+                        Ok(ServerMessage::Remote { action, .. }) => {
+                            if let Ok(SharedControlEnvelope::ControlResult {
+                                id: result_id, ok, error,
+                            }) = serde_json::from_value::<SharedControlEnvelope>(action)
+                            {
+                                if result_id == id {
+                                    return if ok {
+                                        Ok(())
+                                    } else {
+                                        Err(error.unwrap_or_else(|| "the host refused the control".into()))
+                                    };
+                                }
+                            }
+                        }
+                        Ok(ServerMessage::Error { code, message }) => {
+                            return Err(shared_link_error(&code, &message));
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            match waited {
+                Ok(result) => result,
+                Err(_) => Err("the host did not answer within 15 seconds".into()),
+            }
         }
+        .await;
+
+        // Release the link-room slot explicitly. Dropping the socket alone leaves a disconnected
+        // peer behind until cleanup, which would eat the 8-device budget after a few requests.
+        let _ = sink.send(Message::Text(ClientMessage::LeaveRoom.to_json())).await;
+        match &outcome {
+            Ok(()) => self.set_shared_link_reason(None).await,
+            Err(reason) => self.set_shared_link_reason(Some(reason.clone())).await,
+        }
+        outcome
     }
 
-    /// Host: answer a guest's request after the bridge applied it. Only a host can send results;
-    /// the relay checks that before routing them.
+    /// Host: answer a guest's request on the hidden link. The fallback keeps older fork relays
+    /// working; on the default relay only the hidden link can route to the guest device.
     pub(crate) async fn send_control_result(
         &self,
         id: String,
         to: String,
         result: Result<(), String>,
     ) {
-        self.send(ClientMessage::Remote {
+        let msg = ClientMessage::Remote {
             action: SharedControlEnvelope::ControlResult {
                 id,
                 ok: result.is_ok(),
@@ -402,8 +709,12 @@ impl LtSession {
             }
             .to_value(),
             to: Some(to),
-        })
-        .await;
+        };
+        if let Some(tx) = self.shared_outbound.lock().await.clone() {
+            let _ = tx.send(msg);
+        } else {
+            self.send(msg).await;
+        }
     }
 
     /// Our own display name in the room (None outside one) — stamps the host's queue adds.
@@ -492,8 +803,8 @@ impl LtSession {
     pub async fn leave(&self) {
         self.send(ClientMessage::LeaveRoom).await;
         self.gen.fetch_add(1, Ordering::SeqCst); // cancel the connection loop
+        self.stop_shared_host_link().await;
         self.inner.lock().await.reset_room();
-        self.fail_pending("the Listen Together room was left").await;
         let _ = self.sync_tx.send(SyncCommand::Release);
         self.emit_state().await;
     }
@@ -509,13 +820,13 @@ impl LtSession {
     async fn start(self: &Arc<Self>, initial: ClientMessage) {
         // Cancel any existing connection, reset, then spawn a fresh loop.
         self.gen.fetch_add(1, Ordering::SeqCst);
+        self.stop_shared_host_link().await;
         {
             let mut inner = self.inner.lock().await;
             inner.reset_room();
             inner.connecting = true;
             inner.requesting = true; // waiting for the room to materialize
         }
-        self.fail_pending("the Listen Together room changed").await;
         self.emit_state().await;
         let gen = self.gen.load(Ordering::SeqCst);
         let me = self.clone();
@@ -674,54 +985,17 @@ impl LtSession {
     }
 
     /// Handle one server message. Returns `true` if the connection should close (fatal).
-    async fn handle(&self, mut sm: ServerMessage) -> bool {
+    async fn handle(self: &Arc<Self>, mut sm: ServerMessage) -> bool {
         sanitize(&mut sm);
         match sm {
             ServerMessage::Pong => return false,
-            // Device link messages: the server never sends them to a Listen Together socket,
-            // except `Remote`, which is also how optional shared control travels.
+            // Device-link messages never arrive on a Listen Together socket. Shared control uses
+            // its own hidden link socket now, so `Remote` is ignored here too.
             ServerMessage::LinkJoined { .. }
             | ServerMessage::PairCode { .. }
             | ServerMessage::Paired { .. }
-            | ServerMessage::LinkStatus { .. } => return false,
-
-            ServerMessage::Remote { from, action } => {
-                let Ok(envelope) = serde_json::from_value::<SharedControlEnvelope>(action) else {
-                    return false;
-                };
-                match envelope {
-                    // The relay already applied the change and sent a fresh `sync_state`.
-                    SharedControlEnvelope::SetSharedControl { .. } => {}
-                    SharedControlEnvelope::ControlRequest { id, action, submitted_by, .. } => {
-                        let allowed = {
-                            let inner = self.inner.lock().await;
-                            inner.role == Role::Host
-                                && inner.shared_control
-                                && inner.host_shared_control_capable
-                        };
-                        if !allowed {
-                            return false;
-                        }
-                        let _ = self.sync_tx.send(SyncCommand::SharedControlRequest {
-                            id,
-                            from,
-                            action,
-                            submitted_by,
-                        });
-                    }
-                    SharedControlEnvelope::ControlResult { id, ok, error } => {
-                        self.settle_control(
-                            id,
-                            if ok {
-                                Ok(())
-                            } else {
-                                Err(error.unwrap_or_else(|| "the host refused the control".into()))
-                            },
-                        )
-                        .await;
-                    }
-                }
-            }
+            | ServerMessage::LinkStatus { .. }
+            | ServerMessage::Remote { .. } => return false,
 
             ServerMessage::RoomCreated { room_code: _, user_id, session_token, state } => {
                 {
@@ -732,8 +1006,10 @@ impl LtSession {
                     inner.session_token = Some(session_token);
                     inner.absorb(&state);
                 }
-                // Tell the relay our persisted opt-in before any guest can ask to control us.
+                // Tell the relay our persisted opt-in before any guest can ask to control us, and
+                // open the room-code-derived link room on whichever relay this room uses.
                 self.announce_shared_control().await;
+                self.maybe_start_shared_host_link().await;
                 // Seed the room with whatever we're currently playing.
                 let _ = self.sync_tx.send(SyncCommand::HostSeed);
             }
@@ -780,6 +1056,7 @@ impl LtSession {
                 }
                 if is_host {
                     self.announce_shared_control().await;
+                    self.maybe_start_shared_host_link().await;
                 } else {
                     let _ = self.sync_tx.send(SyncCommand::ApplyState(state));
                 }
@@ -832,10 +1109,13 @@ impl LtSession {
                     // The relay cleared the old host's opt-in; announce ours and pull the reset
                     // state before any new guest can ask to control us.
                     self.announce_shared_control().await;
+                    self.maybe_start_shared_host_link().await;
                     self.request_sync().await;
                     // We now control playback locally — stop applying remote sync.
                     let _ = self.sync_tx.send(SyncCommand::Release);
                     self.emit_notice("You're the host now.").await;
+                } else {
+                    self.stop_shared_host_link().await;
                 }
             }
 
@@ -887,11 +1167,6 @@ impl LtSession {
                 return true;
             }
             ServerMessage::Error { code, message } => {
-                // The relay has no correlation id on a refusal, but a host that turned shared
-                // control off mid-flight applies to every waiting guest request.
-                if code == "shared_control_unavailable" {
-                    self.fail_pending(&message).await;
-                }
                 self.emit_notice(&message).await;
                 // Any error that arrives before we're actually in a room means create/join failed:
                 // close instead of leaving the UI spinning on "waiting for the host". Once in a
@@ -951,8 +1226,8 @@ impl LtSession {
             self.emit_notice(notice).await;
         }
         self.gen.fetch_add(1, Ordering::SeqCst);
+        self.stop_shared_host_link().await;
         self.inner.lock().await.reset_room();
-        self.fail_pending("the Listen Together room closed").await;
         let _ = self.sync_tx.send(SyncCommand::Release);
         self.emit_state().await;
     }
@@ -984,6 +1259,7 @@ impl LtSession {
                 .collect::<Vec<_>>(),
             "suggestions": inner.suggestions,
             "sharedControlEnabled": inner.shared_control_enabled,
+            "sharedControlLinkReady": inner.shared_link_ready,
             "sharedControlCapable": inner.shared_control_capable,
             "sharedControl": inner.shared_control,
             "hostSharedControlCapable": inner.host_shared_control_capable,
@@ -1244,46 +1520,52 @@ mod tests {
     }
 
     #[test]
-    fn shared_control_reason_names_the_relay_before_the_host() {
+    fn room_code_seeds_a_valid_hidden_link_secret() {
+        let (secret, host_id) = shared_link_keys("ABCD1234");
+        let (again, same_host) = shared_link_keys("ABCD1234");
+        assert_eq!(secret, again);
+        assert_eq!(host_id, same_host);
+        assert_eq!(secret.len(), 43);
+        assert!(secret.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        assert!(host_id.starts_with("sc-host-"));
+        assert_ne!(secret, shared_link_keys("ABCD1235").0);
+    }
+
+    #[test]
+    fn shared_control_reason_prefers_the_last_link_failure() {
         let mut inner = Inner::default();
         inner.role = Role::Guest;
-        assert!(LtSession::reason_for(&inner).unwrap().contains("does not support shared control"));
-
-        inner.shared_control_capable = true;
-        assert_eq!(
-            LtSession::reason_for(&inner).as_deref(),
-            Some("the host has not enabled shared control for this room")
-        );
-
-        inner.shared_control = true;
-        inner.host_shared_control_capable = true;
         assert_eq!(
             LtSession::reason_for(&inner).as_deref(),
             Some("Listen Together is reconnecting; retry shortly")
         );
 
-        let (outbound, _) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
-        inner.outbound = Some(outbound);
+        inner.status_connected = true;
         assert_eq!(LtSession::reason_for(&inner), None);
+
+        inner.shared_link_reason = Some("the host has not enabled shared control".into());
+        assert_eq!(
+            LtSession::reason_for(&inner).as_deref(),
+            Some("the host has not enabled shared control")
+        );
     }
 
     #[test]
-    fn shared_control_reason_shows_the_host_ack_window() {
+    fn shared_control_reason_shows_the_host_link_window() {
         let mut inner = Inner::default();
         inner.role = Role::Host;
-        inner.shared_control_capable = true;
         inner.shared_control_enabled = true;
         inner.status_connected = true;
         assert_eq!(
             LtSession::reason_for(&inner).as_deref(),
-            Some("shared control is saved on this device but the server has not confirmed it yet")
+            Some("shared control is preparing for this room; retry shortly")
         );
 
-        inner.shared_control = true;
+        inner.shared_link_ready = true;
         assert_eq!(LtSession::reason_for(&inner), None);
 
         inner.shared_control_enabled = false;
-        inner.shared_control = false;
+        inner.shared_link_ready = false;
         assert_eq!(LtSession::reason_for(&inner), None);
     }
 
