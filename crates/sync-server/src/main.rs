@@ -101,6 +101,9 @@ struct Room {
     shared_control: bool,
     /// Listen Together: the current host advertised that it can apply shared-control requests.
     host_shared_control_capable: bool,
+    /// Host queue flags mirrored from playback broadcasts. `None` until a fork host sends them.
+    shuffle: Option<bool>,
+    repeat: Option<String>,
 }
 
 impl Room {
@@ -122,6 +125,8 @@ impl Room {
             status: None,
             shared_control: false,
             host_shared_control_capable: false,
+            shuffle: None,
+            repeat: None,
         }
     }
 
@@ -154,6 +159,9 @@ impl Room {
             shared_control_capable: !self.link,
             shared_control: !self.link && self.shared_control,
             host_shared_control_capable: !self.link && self.host_shared_control_capable,
+            // Link rooms never carry Listen Together queue flags.
+            shuffle: if self.link { None } else { self.shuffle },
+            repeat: if self.link { None } else { self.repeat.clone() },
         }
     }
 
@@ -196,6 +204,9 @@ impl Room {
             // fresh `sync_state` on `host_changed`, which is where it learns the reset.
             self.shared_control = false;
             self.host_shared_control_capable = false;
+            // A new player's queue flags are its own; it sends them with its next broadcast.
+            self.shuffle = None;
+            self.repeat = None;
         }
         self.host_id = id.clone();
         self.broadcast(&ServerMessage::HostChanged { host_id: id }, None);
@@ -510,6 +521,14 @@ impl Server {
                     PlaybackKind::SetVolume => {
                         room.volume = p.volume;
                     }
+                }
+                // Optional host queue facts: absent means an older host, so leave the last known
+                // values alone instead of resetting the room on every play/pause.
+                if p.shuffle.is_some() {
+                    room.shuffle = p.shuffle;
+                }
+                if p.repeat.is_some() {
+                    room.repeat = p.repeat.clone();
                 }
                 // Host already applied it locally; broadcast to guests only (no echo).
                 room.broadcast(&ServerMessage::SyncPlayback(p), Some(&me));

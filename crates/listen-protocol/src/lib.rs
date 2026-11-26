@@ -63,6 +63,13 @@ pub struct RoomState {
     /// The host itself is a fork that can apply shared-control requests.
     #[serde(default, skip_serializing_if = "is_false")]
     pub host_shared_control_capable: bool,
+    /// Host queue flags, so guests mirror shuffle/repeat even when no control answer is in flight.
+    /// `None` means the host predates these fields — keep the guest's current value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle: Option<bool>,
+    /// "off" | "all" | "one". `None` means the host predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<String>,
 }
 
 impl RoomState {
@@ -121,6 +128,13 @@ pub struct Playback {
     pub playing: bool,
     #[serde(default)]
     pub volume: f64,
+    /// Host queue flags carried with every playback broadcast. `None` = older host; guests keep
+    /// their current value rather than resetting flags on each play/pause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle: Option<bool>,
+    /// "off" | "all" | "one"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<String>,
 }
 
 impl Playback {
@@ -133,6 +147,8 @@ impl Playback {
             queue: None,
             playing: false,
             volume: 0.0,
+            shuffle: None,
+            repeat: None,
         }
     }
     pub fn at(kind: PlaybackKind, position_ms: i64) -> Self {
@@ -530,6 +546,8 @@ mod tests {
             queue: Some(vec![]),
             playing: true,
             volume: 0.0,
+            shuffle: Some(true),
+            repeat: Some("all".into()),
         };
         let msg = ClientMessage::Playback(p);
         let json = msg.to_json();
@@ -542,6 +560,8 @@ mod tests {
                 assert_eq!(p.kind, PlaybackKind::ChangeTrack);
                 assert_eq!(p.position_ms, 4200);
                 assert_eq!(p.track.unwrap().id, "dQw4w9WgXcQ");
+                assert_eq!(p.shuffle, Some(true));
+                assert_eq!(p.repeat.as_deref(), Some("all"));
             }
             _ => panic!("wrong variant"),
         }
@@ -581,17 +601,31 @@ mod tests {
             shared_control_capable: true,
             shared_control: true,
             host_shared_control_capable: true,
+            shuffle: Some(true),
+            repeat: Some("one".into()),
             ..Default::default()
         };
         let json = serde_json::to_string(&fork).unwrap();
         assert!(json.contains("\"shared_control_capable\":true"));
         assert!(json.contains("\"shared_control\":true"));
         assert!(json.contains("\"host_shared_control_capable\":true"));
+        assert!(json.contains("\"shuffle\":true"));
+        assert!(json.contains("\"repeat\":\"one\""));
         // A fork state still parses on a client that only reads the old fields.
         let back: RoomState = serde_json::from_str(&json).unwrap();
         assert!(back.shared_control && back.host_shared_control_capable);
+        assert_eq!(back.shuffle, Some(true));
+        assert_eq!(back.repeat.as_deref(), Some("one"));
         let base: RoomState = serde_json::from_str(old).unwrap();
         assert!(!base.shared_control && !base.shared_control_capable);
+        assert_eq!(base.shuffle, None);
+        assert_eq!(base.repeat, None);
+        // Same story for playback broadcasts from an older host.
+        let old_playback =
+            r#"{"kind":"play","position_ms":0,"server_time_ms":0,"playing":true,"volume":0.0}"#;
+        let p: Playback = serde_json::from_str(old_playback).unwrap();
+        assert_eq!(p.shuffle, None);
+        assert_eq!(p.repeat, None);
     }
 
     #[test]

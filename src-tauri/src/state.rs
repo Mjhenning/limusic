@@ -5070,6 +5070,9 @@ impl AppState {
                 let _ = self.player.seek(position_ms as f64 / 1000.0);
             }
             SyncCommand::SyncQueue { queue } => self.lt_mirror_queue(queue).await,
+            SyncCommand::QueueOptions { shuffle, repeat } => {
+                self.apply_shared_control_flags(SharedControlFlags { shuffle, repeat }).await
+            }
             SyncCommand::GuestAdd { track } => self.lt_enqueue_track(track).await,
             // Handled before the common setup above; see the early branch at the top.
             SyncCommand::SharedControlRequest { .. } => {}
@@ -5079,6 +5082,13 @@ impl AppState {
     /// Guest: apply a full room-state snapshot (join / reconnect / re-sync). If the current track is
     /// already loaded, just correct the position + play state (no reload blip); otherwise load it.
     async fn lt_apply_state(&self, state: listen_protocol::RoomState) {
+        // Flags are room facts, not tied to a loaded track: apply them even when the host has not
+        // started playback, and before the early return below.
+        self.apply_shared_control_flags(SharedControlFlags {
+            shuffle: state.shuffle,
+            repeat: state.repeat.clone(),
+        })
+        .await;
         let Some(track) = state.current_track else {
             // The host isn't playing anything yet. Whatever the guest had on would otherwise keep
             // going, with every transport control locked while they're in the room.
@@ -5284,6 +5294,8 @@ impl AppState {
 
     /// The current track and up to 50 upcoming ones as a ChangeTrack.
     async fn current_change_track(&self, position_ms: i64, playing: bool) -> Option<Playback> {
+        // Fetch before the queue lock: `shared_control_flags` takes that same lock.
+        let flags = self.shared_control_flags().await;
         let q = self.queue.lock().await;
         let cur = q.items.get(q.current)?;
         let mut p = Playback::at(PlaybackKind::ChangeTrack, position_ms);
@@ -5295,6 +5307,8 @@ impl AppState {
         p.track = Some(track);
         p.queue = Some(q.items.iter().skip(q.current + 1).take(50).map(song_to_track).collect());
         p.playing = playing;
+        p.shuffle = flags.shuffle;
+        p.repeat = flags.repeat;
         Some(p)
     }
 
@@ -5373,13 +5387,16 @@ impl AppState {
             return;
         }
         let pos_ms = (self.current_position() * 1000.0) as i64;
-        let p = if playing {
+        let flags = self.shared_control_flags().await;
+        let mut p = if playing {
             let mut p = Playback::at(PlaybackKind::Play, pos_ms);
             p.playing = true;
             p
         } else {
             Playback::at(PlaybackKind::Pause, pos_ms)
         };
+        p.shuffle = flags.shuffle;
+        p.repeat = flags.repeat;
         self.link_publish(p.clone()).await;
         if lt_host {
             self.lt.broadcast_playback(p).await;
@@ -5544,6 +5561,7 @@ impl AppState {
         self.persist_queue().await;
         // Repeat-all newly on while playing the last track: the wrap target needs priming.
         self.prime_lookahead(self.generation.load(Ordering::SeqCst)).await;
+        self.lt_broadcast_flags().await;
     }
 
     /// "Play next" from a ⋯ menu: the tracks land at the "up next" boundary — right after the
@@ -6097,16 +6115,32 @@ impl AppState {
         if !lt_host && !self.link.linked() {
             return;
         }
+        let flags = self.shared_control_flags().await;
         let queue: Vec<Track> = {
             let q = self.queue.lock().await;
             q.items.iter().skip(q.current + 1).take(50).map(song_to_track).collect()
         };
         let mut p = Playback::new(PlaybackKind::SyncQueue);
         p.queue = Some(queue);
+        p.shuffle = flags.shuffle;
+        p.repeat = flags.repeat;
         self.link.publish(p.clone());
         if lt_host {
             self.lt.broadcast_playback(p).await;
         }
+    }
+
+    /// Host-only: publish queue flags when repeat changes but no queue row moved. No `queue`
+    /// payload, so guests keep their mirrored list and only update their buttons.
+    async fn lt_broadcast_flags(&self) {
+        if !self.lt.is_host().await {
+            return;
+        }
+        let flags = self.shared_control_flags().await;
+        let mut p = Playback::new(PlaybackKind::SyncQueue);
+        p.shuffle = flags.shuffle;
+        p.repeat = flags.repeat;
+        self.lt.broadcast_playback(p).await;
     }
 
     // --- Device link (crate::devicelink) ------------------------------------------------------

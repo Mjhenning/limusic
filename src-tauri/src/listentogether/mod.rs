@@ -57,6 +57,12 @@ pub enum SyncCommand {
     GuestAdd {
         track: Track,
     },
+    /// Host-initiated queue flags carried with a playback broadcast. `None` fields are ignored so
+    /// an older host never resets a guest that already has its own flags.
+    QueueOptions {
+        shuffle: Option<bool>,
+        repeat: Option<String>,
+    },
     /// Host: an opted-in guest asked this player to apply a control. The bridge applies it through
     /// `AppState::apply_link` and sends the correlated result back to `from`.
     SharedControlRequest {
@@ -1212,6 +1218,7 @@ impl LtSession {
                 _ => {}
             }
         }
+        let flags = SharedControlFlags { shuffle: p.shuffle, repeat: p.repeat.clone() };
         let cmd = match p.kind {
             PlaybackKind::Play => Some(SyncCommand::Play { position_ms: p.position_ms }),
             PlaybackKind::Pause => Some(SyncCommand::Pause { position_ms: p.position_ms }),
@@ -1227,6 +1234,11 @@ impl LtSession {
         };
         if let Some(cmd) = cmd {
             let _ = self.sync_tx.send(cmd);
+        }
+        if flags.shuffle.is_some() || flags.repeat.is_some() {
+            let _ = self
+                .sync_tx
+                .send(SyncCommand::QueueOptions { shuffle: flags.shuffle, repeat: flags.repeat });
         }
     }
 
