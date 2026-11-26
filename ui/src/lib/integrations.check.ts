@@ -202,6 +202,10 @@ ok(
 	'the dialog explains why shared control is unavailable'
 );
 ok(
+	ltDialog.includes("t('dialogs.listen_together.shared_control_guest_on')"),
+	'a guest sees its own shared-control access, not the host opt-in switch'
+);
+ok(
 	integrationStore.includes('Leave Listen Together before changing shared control'),
 	'both switches are locked while a room is active'
 );
@@ -282,7 +286,12 @@ for (const key of [
 ]) {
 	ok(typeof en.settings.integrations[key] === 'string', `en.json has settings.integrations.${key}`);
 }
-for (const key of ['shared_control', 'shared_control_hint', 'shared_control_requires_api']) {
+for (const key of [
+	'shared_control',
+	'shared_control_hint',
+	'shared_control_requires_api',
+	'shared_control_guest_on'
+]) {
 	ok(
 		typeof en.dialogs.listen_together[key] === 'string',
 		`en.json has dialogs.listen_together.${key}`

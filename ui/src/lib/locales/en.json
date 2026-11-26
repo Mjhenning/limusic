@@ -1248,6 +1248,7 @@
 			"hosting": "Hosting",
 			"listening": "Listening",
 			"shared_control_on": "Shared control on — guests can control playback",
+			"shared_control_guest_on": "Shared control available — you can control playback",
 			"shared_control_off": "Shared control off — guests can only suggest",
 			"shared_control": "Shared playback control",
 			"shared_control_hint": "Let other fork guests' Control API clients control this room.",

@@ -73,9 +73,11 @@
 	const sharedControlLabel = $derived(
 		lt.sharedControlReason
 			? lt.sharedControlReason
-			: lt.sharedControlEnabled
-				? t('dialogs.listen_together.shared_control_on')
-				: t('dialogs.listen_together.shared_control_off')
+			: isHost
+				? lt.sharedControlEnabled
+					? t('dialogs.listen_together.shared_control_on')
+					: t('dialogs.listen_together.shared_control_off')
+				: t('dialogs.listen_together.shared_control_guest_on')
 	);
 	const controlOn = $derived(integrations.controlApi);
 
