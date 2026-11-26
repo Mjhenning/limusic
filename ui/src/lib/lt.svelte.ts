@@ -18,7 +18,8 @@ export const lt = $state<LtState>({
 	sharedControlEnabled: false,
 	sharedControlCapable: false,
 	sharedControl: false,
-	hostSharedControlCapable: false
+	hostSharedControlCapable: false,
+	sharedControlReason: null
 });
 
 /** True when we're in (or joining) a room. */

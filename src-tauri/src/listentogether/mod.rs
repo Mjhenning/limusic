@@ -258,13 +258,19 @@ impl LtSession {
     /// Persist and announce the host's opt-in. The setting applies to the next room too; while a
     /// room is live the relay publishes a fresh `sync_state` so every guest sees the change.
     pub async fn set_shared_control_enabled(&self, on: bool) {
-        let host = {
+        let (host, capable) = {
             let mut inner = self.inner.lock().await;
             inner.shared_control_enabled = on;
-            inner.role == Role::Host
+            (inner.role == Role::Host, inner.shared_control_capable)
         };
         if host {
             self.announce_shared_control().await;
+            if on && !capable {
+                self.emit_notice(
+                    "Shared control was saved, but this server does not support it; use this fork's sync-server on both devices.",
+                )
+                .await;
+            }
         }
         self.emit_state().await;
     }
@@ -289,6 +295,46 @@ impl LtSession {
             && inner.shared_control
             && inner.host_shared_control_capable
             && inner.outbound.is_some()
+    }
+
+    /// Why shared control is unavailable in the current room, for the UI and guest API errors.
+    /// `None` means there is no room to explain, or everything is ready.
+    pub async fn shared_control_reason(&self) -> Option<String> {
+        Self::reason_for(&*self.inner.lock().await)
+    }
+
+    /// The single source of truth behind both `sharedControlReason` and the guest error message.
+    /// A base relay never sets `shared_control_capable`, so that case is named first.
+    fn reason_for(inner: &Inner) -> Option<String> {
+        if inner.role == Role::None {
+            return None;
+        }
+        if !inner.shared_control_capable {
+            return Some(
+                "this Listen Together server does not support shared control; use this fork's sync-server on both devices".into(),
+            );
+        }
+        match inner.role {
+            Role::Host => {
+                if inner.shared_control_enabled && inner.status_connected && !inner.shared_control {
+                    Some(
+                        "shared control is saved on this device but the server has not confirmed it yet".into(),
+                    )
+                } else {
+                    None
+                }
+            }
+            Role::Guest => {
+                if !inner.shared_control || !inner.host_shared_control_capable {
+                    Some("the host has not enabled shared control for this room".into())
+                } else if !inner.outbound.is_some() {
+                    Some("Listen Together is reconnecting; retry shortly".into())
+                } else {
+                    None
+                }
+            }
+            Role::None => None,
+        }
     }
 
     /// Guest: forward one API mutation to the host and wait for the correlated answer.
@@ -941,6 +987,7 @@ impl LtSession {
             "sharedControlCapable": inner.shared_control_capable,
             "sharedControl": inner.shared_control,
             "hostSharedControlCapable": inner.host_shared_control_capable,
+            "sharedControlReason": Self::reason_for(inner),
         })
     }
 
@@ -1194,6 +1241,50 @@ mod tests {
     fn the_old_default_server_means_the_default() {
         assert_eq!(stored_url(OLD_DEFAULT_SERVER.into()), "");
         assert_eq!(stored_url("wss://my.host/ws".into()), "wss://my.host/ws");
+    }
+
+    #[test]
+    fn shared_control_reason_names_the_relay_before_the_host() {
+        let mut inner = Inner::default();
+        inner.role = Role::Guest;
+        assert!(LtSession::reason_for(&inner).unwrap().contains("does not support shared control"));
+
+        inner.shared_control_capable = true;
+        assert_eq!(
+            LtSession::reason_for(&inner).as_deref(),
+            Some("the host has not enabled shared control for this room")
+        );
+
+        inner.shared_control = true;
+        inner.host_shared_control_capable = true;
+        assert_eq!(
+            LtSession::reason_for(&inner).as_deref(),
+            Some("Listen Together is reconnecting; retry shortly")
+        );
+
+        let (outbound, _) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
+        inner.outbound = Some(outbound);
+        assert_eq!(LtSession::reason_for(&inner), None);
+    }
+
+    #[test]
+    fn shared_control_reason_shows_the_host_ack_window() {
+        let mut inner = Inner::default();
+        inner.role = Role::Host;
+        inner.shared_control_capable = true;
+        inner.shared_control_enabled = true;
+        inner.status_connected = true;
+        assert_eq!(
+            LtSession::reason_for(&inner).as_deref(),
+            Some("shared control is saved on this device but the server has not confirmed it yet")
+        );
+
+        inner.shared_control = true;
+        assert_eq!(LtSession::reason_for(&inner), None);
+
+        inner.shared_control_enabled = false;
+        inner.shared_control = false;
+        assert_eq!(LtSession::reason_for(&inner), None);
     }
 
     #[tokio::test]

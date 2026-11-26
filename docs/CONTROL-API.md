@@ -88,7 +88,7 @@ parsing the message.
 | 401 | `unauthorized` | Missing or wrong bearer token |
 | 404 | `not_found` | Unknown route, or no song matched the request |
 | 405 | `method_not_allowed` | Known route, wrong HTTP method |
-| 409 | `listen_together_guest` | A Listen Together host controls playback |
+| 409 | `listen_together_guest` | Host controls playback; `message` names the missing capability when known |
 | 409 | `remote_linked` | Another linked device is the player |
 | 409 | `queue_changed` | A stale `video_id` was sent to `/queue/remove` |
 | 409 | `duplicate` | Song is inside the protected window; counterparts count as duplicates |
@@ -496,6 +496,18 @@ The host applies its own **Queue request window** to forwarded
 `/queue/request`, `/queue/add`, and `/queue/play-next` calls; the guest's window
 setting is not used. If the host rejects a row inside that window, the guest
 answers `502 shared_control_failed` with the host's reason and inserts nothing.
+
+#### Diagnosing an unavailable room
+
+The default server is `wss://sync.limusic.app/ws`, the upstream relay. It does
+not advertise shared-control capability, so a bare room code cannot forward
+mutations. Set **Listen Together ▸ Server** to this fork's `sync-server` on both
+devices before joining.
+
+The Listen Together dialog and guest `409 listen_together_guest` message now
+name the first missing fact: an unsupported relay, a host that has not opted
+in, or a guest socket that is still reconnecting. On the host, a saved opt-in
+that the relay has not echoed yet is shown as pending instead of "off".
 
 The wire change is additive: defaulted fields in the existing room state, and
 new kinds inside the existing opaque `remote` envelope. No `ServerMessage`

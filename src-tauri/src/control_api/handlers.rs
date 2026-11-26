@@ -137,7 +137,9 @@ async fn queue(
 /// part of the contract: a linked guest gets the more specific Listen Together error.
 async fn guard(shared: &ApiShared) -> Result<(), ErrorBody> {
     if shared.context.is_guest().await {
-        return Err(ErrorBody::listen_together_guest());
+        return Err(ErrorBody::listen_together_guest_with(
+            shared.context.shared_control_reason().await,
+        ));
     }
     if shared.context.remote_linked() {
         return Err(ErrorBody::remote_linked());
@@ -161,7 +163,9 @@ where
         return Ok(None);
     }
     if !shared.context.shared_control_allowed().await {
-        return Err(ErrorBody::listen_together_guest());
+        return Err(ErrorBody::listen_together_guest_with(
+            shared.context.shared_control_reason().await,
+        ));
     }
     shared
         .context
@@ -573,7 +577,10 @@ async fn handle_queue_request(shared: Arc<ApiShared>, body: QueueRequest) -> Res
     }
     if shared.context.is_guest().await {
         if !shared.context.shared_control_allowed().await {
-            return ErrorBody::listen_together_guest().into_response();
+            return ErrorBody::listen_together_guest_with(
+                shared.context.shared_control_reason().await,
+            )
+            .into_response();
         }
         let Some(track) = shared_track(&item) else {
             return ErrorBody::shared_control_failed(
@@ -708,6 +715,8 @@ mod tests {
         guest: bool,
         /// Opt-in state reported by the mock `shared_control_allowed`.
         shared_control: bool,
+        /// Optional room blocker echoed in guest rejection messages.
+        shared_control_reason: Option<String>,
         /// Actions the mock host received, in order.
         forwarded: StdMutex<Vec<RemoteAction>>,
         /// Simulated correlated failure from the host.
@@ -748,6 +757,7 @@ mod tests {
             Self {
                 guest: false,
                 shared_control: false,
+                shared_control_reason: None,
                 forwarded: StdMutex::new(Vec::new()),
                 forward_error: None,
                 linked: false,
@@ -900,6 +910,10 @@ mod tests {
 
         async fn shared_control_allowed(&self) -> bool {
             self.guest && self.shared_control
+        }
+
+        async fn shared_control_reason(&self) -> Option<String> {
+            self.shared_control_reason.clone()
         }
 
         async fn forward_shared_control(&self, action: RemoteAction) -> Result<(), String> {
@@ -1332,6 +1346,29 @@ mod tests {
         assert!(ctx.removals.lock().unwrap().is_empty());
         assert_eq!(ctx.clears.load(Ordering::SeqCst), 0);
         assert!(ctx.inserted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn guest_rejection_names_the_missing_capability() {
+        let reason = "this Listen Together server does not support shared control; use this fork's sync-server on both devices";
+        let (app, _) = test_router_with(MockContext {
+            guest: true,
+            shared_control_reason: Some(reason.to_string()),
+            ..Default::default()
+        });
+        for (path, body) in [
+            ("/api/v1/playback/play", json!({})),
+            ("/api/v1/queue/request", json!({ "input": "a song" })),
+        ] {
+            let response = request(app.clone(), path, body, Some("Bearer abc123")).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{path}");
+            let json = json_body(response).await;
+            assert_eq!(json["error"], "listen_together_guest", "{path}");
+            assert!(
+                json["message"].as_str().is_some_and(|message| message.contains(reason)),
+                "{path}: {json}"
+            );
+        }
     }
 
     #[tokio::test]

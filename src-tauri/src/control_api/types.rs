@@ -185,12 +185,15 @@ impl ErrorBody {
         )
     }
 
-    pub fn listen_together_guest() -> Self {
-        Self::new(
-            StatusCode::CONFLICT,
-            "listen_together_guest",
-            "the Listen Together host controls playback",
-        )
+    /// Same stable code, but with the room's actual blocker when the client can be told. A guest on
+    /// a base relay, for example, needs to hear that the relay is unsupported rather than just
+    /// "the host controls playback".
+    pub fn listen_together_guest_with(reason: Option<String>) -> Self {
+        let message = match reason {
+            Some(reason) => format!("the Listen Together host controls playback: {reason}"),
+            None => "the Listen Together host controls playback".to_string(),
+        };
+        Self::new(StatusCode::CONFLICT, "listen_together_guest", message)
     }
 
     pub fn remote_linked() -> Self {
@@ -977,6 +980,11 @@ pub trait ControlApiContext: Send + Sync + 'static {
         false
     }
 
+    /// Why this room cannot forward, surfaced in the guest's `listen_together_guest` message.
+    async fn shared_control_reason(&self) -> Option<String> {
+        None
+    }
+
     /// Forward one mutation to the host and wait for its correlated answer. A timeout does not
     /// prove the action failed; callers tell clients to re-read `/status` before retrying.
     async fn forward_shared_control(&self, _action: RemoteAction) -> Result<(), String> {
@@ -1061,6 +1069,10 @@ impl ControlApiContext for crate::state::AppState {
 
     async fn shared_control_allowed(&self) -> bool {
         self.lt.shared_control_allowed().await
+    }
+
+    async fn shared_control_reason(&self) -> Option<String> {
+        self.lt.shared_control_reason().await
     }
 
     async fn forward_shared_control(&self, action: RemoteAction) -> Result<(), String> {

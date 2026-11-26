@@ -1694,6 +1694,8 @@ export interface LtState {
 	sharedControlCapable: boolean;
 	sharedControl: boolean;
 	hostSharedControlCapable: boolean;
+	/** Why the room cannot use shared control, or null when it is ready/no room is joined. */
+	sharedControlReason: string | null;
 }
 
 export const ltGetState = () => invoke<LtState>('lt_get_state');

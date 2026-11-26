@@ -185,6 +185,18 @@ ok(ltDialog.includes('setSharedControlEnabled(on)'), 'the room toggle saves the 
 ok(ltDialog.includes('controlOn && lt.sharedControlEnabled'), 'the switch reflects both gates');
 ok(ltDialog.includes('disabled={!controlOn || sharedBusy}'), 'the switch is disabled without the API');
 ok(ltDialog.includes('void loadIntegrations().catch'), 'opening the dialog refreshes the API flag');
+ok(
+	ltDialog.includes('lt.sharedControlReason'),
+	'the dialog explains why shared control is unavailable'
+);
+ok(
+	readFileSync(join(here, 'lt.svelte.ts'), 'utf8').includes('sharedControlReason: null'),
+	'the reactive room state carries the diagnostic reason'
+);
+ok(
+	readFileSync(join(here, 'api.ts'), 'utf8').includes('sharedControlReason: string | null'),
+	'the LtState type carries the diagnostic reason'
+);
 
 // --- queue requester pills -------------------------------------------------------------------
 const trackRowSource = readFileSync(join(here, 'components', 'TrackRow.svelte'), 'utf8');

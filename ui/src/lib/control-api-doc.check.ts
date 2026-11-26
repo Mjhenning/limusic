@@ -89,10 +89,17 @@ for (const text of [
 	'shared_control_failed',
 	'15 s',
 	'base clients',
-	'/queue/request'
+	'/queue/request',
+	'sync.limusic.app',
+	'not advertise shared-control capability',
+	'the first missing fact'
 ]) {
 	ok(sharedSection.includes(text), `shared-control docs mention ${text}`);
 }
+const types = read(join(root, 'src-tauri', 'src', 'control_api', 'types.rs'));
+const lt = read(join(root, 'src-tauri', 'src', 'listentogether', 'mod.rs'));
+ok(types.includes('listen_together_guest_with'), 'guest errors carry the room blocker');
+ok(lt.includes('sharedControlReason'), 'the room snapshot carries the diagnostic reason');
 ok(handlers.includes('forward_shared_control'), 'handlers forward opted-in guest mutations');
 ok(protocol.includes('SharedControlEnvelope'), 'the wire shape is in listen-protocol');
 ok(sync.includes('MAX_SHARED_CONTROL'), 'the relay bounds shared-control envelopes');

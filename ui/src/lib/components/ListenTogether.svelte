@@ -72,9 +72,11 @@
 	);
 	const others = $derived(lt.users.filter((u) => u.user_id !== lt.myId).length);
 	const sharedControlLabel = $derived(
-		lt.sharedControl
-			? t('dialogs.listen_together.shared_control_on')
-			: t('dialogs.listen_together.shared_control_off')
+		lt.sharedControlReason
+			? lt.sharedControlReason
+			: lt.sharedControl
+				? t('dialogs.listen_together.shared_control_on')
+				: t('dialogs.listen_together.shared_control_off')
 	);
 	const controlOn = $derived(integrations.controlApi);
 
