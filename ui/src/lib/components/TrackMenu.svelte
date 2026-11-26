@@ -150,6 +150,8 @@
 	// "Remove from this playlist", for a row playing out of a playlist (issue #270). What the three
 	// conditions are and why is in `removableFromPlaylist` (queue.ts), where they are checkable.
 	const removable = $derived(removableFromPlaylist(song, playlistId, savedIn.map));
+	// A guest's queue buttons still work, but the host owns the queue: say so where the rows are.
+	const guestQueue = $derived(lt.role === 'guest');
 
 	// "Play next" on a track that is already coming up in the queue moves it into the Play next block
 	// rather than queueing a second copy. A row the user queued, the backend moves by itself
@@ -251,15 +253,22 @@
 			<button
 				class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent/10"
 				onclick={(e) => run(e, playNext)}
+				title={guestQueue ? t('player.queue_suggestion_hint') : undefined}
 			>
 				<HugeiconsIcon icon={ArrowUpNarrowWideIcon} class="h-4 w-4" /> {t('player.play_next')}
 			</button>
 			<button
 				class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent/10"
 				onclick={(e) => run(e, () => enqueue([song], false))}
+				title={guestQueue ? t('player.queue_suggestion_hint') : undefined}
 			>
 				<HugeiconsIcon icon={ArrowDownWideNarrowIcon} class="h-4 w-4" /> {t('player.add_to_queue')}
 			</button>
+			{#if guestQueue}
+				<p class="px-2 pb-1 pt-0.5 text-[11px] leading-snug text-muted-foreground">
+					{t('player.queue_suggestion_hint')}
+				</p>
+			{/if}
 		{/if}
 		<!-- Radio is the one action worth having in the player bar too (`linksOnly`): it's how you
 		     say "keep going with more like this" about the song that's playing. -->

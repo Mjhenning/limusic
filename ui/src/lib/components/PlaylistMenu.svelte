@@ -26,6 +26,7 @@
 	import { addItemToPlaylist, enqueueItem, playItem } from '$lib/browse';
 	import { anchorMenu, ctxHost, fitMenu, NO_ANCHOR, toBody } from '$lib/menu';
 	import { t } from '$lib/i18n.svelte';
+	import { lt } from '$lib/lt.svelte';
 	import {
 		addPick,
 		addToLibrary,
@@ -83,6 +84,8 @@
 	// An artist isn't a track list — there's nothing unambiguous to queue. Songs, albums and
 	// playlists (local ones included) all are.
 	const canQueue = $derived(item.kind === 'song' || item.kind === 'album' || item.kind === 'playlist');
+	// The host owns the session queue; a guest's click only proposes rows.
+	const guestQueue = $derived(lt.role === 'guest');
 
 	// The tracks have to be fetched before anything can be queued, so the menu stays open and the
 	// row shows it's working. Guards a second click from queueing the album twice.
@@ -259,6 +262,7 @@
 					e.stopPropagation();
 					queue(true);
 				}}
+				title={guestQueue ? t('player.queue_suggestion_hint') : undefined}
 			>
 				<HugeiconsIcon icon={ArrowUpNarrowWideIcon} class="h-4 w-4" /> {t('player.play_next')}
 			</button>
@@ -269,9 +273,15 @@
 					e.stopPropagation();
 					queue(false);
 				}}
+				title={guestQueue ? t('player.queue_suggestion_hint') : undefined}
 			>
 				<HugeiconsIcon icon={ArrowDownWideNarrowIcon} class="h-4 w-4" /> {t("player.add_to_queue")}
 			</button>
+			{#if guestQueue}
+				<p class="px-2 pb-1 pt-0.5 text-[11px] leading-snug text-muted-foreground">
+					{t('player.queue_suggestion_hint')}
+				</p>
+			{/if}
 		{/if}
 		{#if onYouTube}
 			<button

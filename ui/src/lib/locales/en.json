@@ -310,6 +310,7 @@
 		"empty_queue": "Queue is empty",
 		"play_next": "Play next",
 		"add_to_queue": "Add to queue",
+		"queue_suggestion_hint": "As a guest, your add is a suggestion — the host decides what plays.",
 		"remove_from_queue": "Remove from queue",
 		"save_to_playlist": "Save to playlist",
 		"remove_from_playlist": "Remove from playlist",

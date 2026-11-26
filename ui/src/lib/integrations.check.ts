@@ -378,7 +378,8 @@ for (const key of [
 	'shared_sending',
 	'shared_sent',
 	'shared_failed',
-	'volume_local_hint'
+	'volume_local_hint',
+	'queue_suggestion_hint'
 ]) {
 	ok(typeof en.player[key] === 'string', `en.json has player.${key}`);
 }
@@ -390,5 +391,19 @@ ok(
 	miniPlayer.includes("title={inRoom() ? t('player.volume_local_hint') : undefined}"),
 	'the mini player explains that room volume is local'
 );
+
+const trackMenu = readFileSync(join(here, 'components', 'TrackMenu.svelte'), 'utf8');
+const playlistMenu = readFileSync(join(here, 'components', 'PlaylistMenu.svelte'), 'utf8');
+const selectionBar = readFileSync(join(here, 'components', 'TrackSelectionBar.svelte'), 'utf8');
+for (const [name, source] of [
+	['track menu', trackMenu],
+	['playlist menu', playlistMenu],
+	['selection bar', selectionBar]
+] as const) {
+	ok(
+		source.includes("lt.role === 'guest'") && source.includes("t('player.queue_suggestion_hint')"),
+		`the ${name} labels guest queue adds as suggestions`
+	);
+}
 
 console.log('ok');

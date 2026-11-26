@@ -30,6 +30,8 @@
 		onRemove?: (songs: SongItem[]) => Promise<void>;
 	} = $props();
 	let busy = $state(false);
+	// A guest's bulk add is a suggestion; the host owns the session queue.
+	const guestQueue = $derived(lt.role === 'guest');
 	// Second click confirms: a bulk removal is not undoable, and the button sits next to Clear.
 	let confirmRemove = $state(false);
 	// Any change to what is selected drops a half-made confirmation, so the destructive button
@@ -120,12 +122,14 @@
 				{#if selection.count}
 					<span class="mx-1 h-5 w-px shrink-0 bg-border"></span>
 					<Button variant="ghost" size="icon" disabled={blocked} onkeydown={onKey}
-						title={t('player.play_next')} aria-label={t('player.play_next')}
+						title={guestQueue ? t('player.queue_suggestion_hint') : t('player.play_next')}
+						aria-label={t('player.play_next')}
 						onclick={() => queue(true)}>
 						<HugeiconsIcon icon={ArrowUpNarrowWideIcon} class="h-4 w-4" />
 					</Button>
 					<Button variant="ghost" size="icon" disabled={blocked} onkeydown={onKey}
-						title={t('player.add_to_queue')} aria-label={t('player.add_to_queue')}
+						title={guestQueue ? t('player.queue_suggestion_hint') : t('player.add_to_queue')}
+						aria-label={t('player.add_to_queue')}
 						onclick={() => queue(false)}>
 						<HugeiconsIcon icon={ArrowDownWideNarrowIcon} class="h-4 w-4" />
 					</Button>
