@@ -4339,6 +4339,15 @@ impl AppState {
         let _ = self.app.emit("playback-notice", serde_json::json!({ "message": message }));
     }
 
+    /// Transient state for a guest's forwarded button: the badge shows "Sending…" until the host
+    /// answers. Failure details stay in the normal toast channel; this event is only for the badge.
+    fn emit_control_feedback(&self, pending: bool, ok: Option<bool>, message: &str) {
+        let _ = self.app.emit(
+            "lt-control-feedback",
+            serde_json::json!({ "pending": pending, "ok": ok, "message": message }),
+        );
+    }
+
     /// Send a UI transport button to the host over the hidden shared-control link when this desktop
     /// is a guest in an opted-in room. `true` means the press was consumed: even a failed forward
     /// must not fall through to this guest's local player. Volume has no branch here on purpose —
@@ -4357,13 +4366,16 @@ impl AppState {
         if !api_enabled {
             return false;
         }
+        self.emit_control_feedback(true, None, "Sending…");
         match self.lt.forward_shared_control(action).await {
             Ok(flags) => {
                 self.apply_shared_control_flags(flags).await;
+                self.emit_control_feedback(false, Some(true), "Sent to host");
                 true
             }
             Err(reason) => {
                 self.emit_notice(&reason);
+                self.emit_control_feedback(false, Some(false), "Not sent");
                 true
             }
         }

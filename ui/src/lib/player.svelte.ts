@@ -12,7 +12,7 @@ import type {
 	Rating,
 	SongItem
 } from './api';
-import { applyLtState, lt } from './lt.svelte';
+import { applyControlFeedback, applyLtState, lt } from './lt.svelte';
 import { applyLinkState, link } from './link.svelte';
 import { clearCached, invalidateCached, LIBRARY_SONGS_KEY } from './pagecache';
 import * as pl from './personal';
@@ -2140,6 +2140,7 @@ export function initApp(mini = false): () => void {
 		// Rust restores the shared clock before applying room playback, even with no UI open.
 		api.onLtState(applyLtState),
 		api.onLtNotice((msg) => toast(msg)),
+		api.onControlFeedback(applyControlFeedback),
 		api.onLinkState(applyLinkState)
 	];
 	const teardown = () => subs.forEach((u) => u.then((f) => f()));

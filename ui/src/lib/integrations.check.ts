@@ -242,6 +242,27 @@ ok(
 		.includes('forward_guest_ui_control'),
 	'the UI volume slider stays on this device'
 );
+const feedbackStore = readFileSync(join(here, 'lt.svelte.ts'), 'utf8');
+const playerSource = readFileSync(join(here, 'player.svelte.ts'), 'utf8');
+const apiSource = readFileSync(join(here, 'api.ts'), 'utf8');
+ok(
+	guestForward.includes('emit_control_feedback(true, None') &&
+		guestForward.includes('emit_control_feedback(false, Some(true)') &&
+		guestForward.includes('emit_control_feedback(false, Some(false)'),
+	'guest buttons report pending, sent and refused states'
+);
+ok(
+	apiSource.includes("listen<ControlFeedback>('lt-control-feedback'"),
+	'the UI listens for control delivery feedback'
+);
+ok(
+	playerSource.includes('api.onControlFeedback(applyControlFeedback)'),
+	'the shared store receives control delivery feedback'
+);
+ok(
+	feedbackStore.includes('export const controlFeedback = $state<ControlFeedback>'),
+	'control feedback is reactive'
+);
 
 ok(
 	integrationStore.includes('Leave Listen Together before changing shared control'),

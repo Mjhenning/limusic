@@ -1699,6 +1699,13 @@ export interface LtState {
 	/** Why the room cannot use shared control, or null when it is ready/no room is joined. */
 	sharedControlReason: string | null;
 }
+/** Transient badge state while a guest UI button is on its way to the host. */
+export interface ControlFeedback {
+	pending: boolean;
+	/** null while pending; the failure reason is delivered on `playback-notice`. */
+	ok: boolean | null;
+	message: string;
+}
 
 export const ltGetState = () => invoke<LtState>('lt_get_state');
 export const ltSetServerUrl = (url: string) => invoke<void>('lt_set_server_url', { url });
@@ -1718,6 +1725,8 @@ export const onLtState = (cb: (s: LtState) => void): Promise<UnlistenFn> =>
 	listen<LtState>('lt-state', (e) => cb(e.payload));
 export const onLtNotice = (cb: (msg: string) => void): Promise<UnlistenFn> =>
 	listen<string>('lt-notice', (e) => cb(e.payload));
+export const onControlFeedback = (cb: (f: ControlFeedback) => void): Promise<UnlistenFn> =>
+	listen<ControlFeedback>('lt-control-feedback', (e) => cb(e.payload));
 
 // Device link: the phone as a remote, and Continue here (src-tauri/src/devicelink.rs).
 export interface LinkDevice {

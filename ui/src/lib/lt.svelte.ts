@@ -1,6 +1,6 @@
 // Reactive Listen Together state, driven by the Rust `lt-state` event. The modal + home-header
 // button read this; mutations go through `api` commands. context/19.
-import type { LtState } from './api';
+import type { ControlFeedback, LtState } from './api';
 
 export const lt = $state<LtState>({
 	status: 'disconnected',
@@ -31,4 +31,23 @@ export function inRoom(): boolean {
 /** Replace the reactive state from a fresh `lt-state` snapshot. */
 export function applyLtState(s: LtState) {
 	Object.assign(lt, s);
+}
+
+/** Transient delivery state for a guest's forwarded transport button. */
+export const controlFeedback = $state<ControlFeedback>({
+	pending: false,
+	ok: null,
+	message: ''
+});
+let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
+
+export function applyControlFeedback(f: ControlFeedback) {
+	Object.assign(controlFeedback, f);
+	if (feedbackTimer) clearTimeout(feedbackTimer);
+	feedbackTimer = f.pending
+		? undefined
+		: setTimeout(() => {
+				controlFeedback.message = '';
+				controlFeedback.ok = null;
+			}, 2200);
 }
