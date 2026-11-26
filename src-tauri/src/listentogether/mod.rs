@@ -138,6 +138,27 @@ fn shared_link_keys(room_code: &str) -> (String, String) {
     (secret, format!("sc-host-{host_suffix}"))
 }
 
+/// Guests prefix their hidden-link device id with their room user id, so the host can badge the
+/// real participant rather than a throwaway control socket. A per-request suffix keeps concurrent
+/// sockets independent; room user ids contain no dash (`user_<nanos>_<rand>` from the relay).
+fn linked_guest_id(device_id: &str) -> Option<String> {
+    let rest = device_id.strip_prefix("sc-guest-")?;
+    let id = rest.split_once('-').map_or(rest, |(id, _)| id);
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+fn remember_linked_guest(guests: &mut Vec<String>, id: String) {
+    if !guests.contains(&id) {
+        guests.push(id);
+    }
+}
+
+fn remember_linked_guests(guests: &mut Vec<String>, incoming: Vec<String>) {
+    for id in incoming {
+        remember_linked_guest(guests, id);
+    }
+}
+
 /// Map relay errors to the same diagnostics the dialog and the guest HTTP error show.
 fn shared_link_error(code: &str, message: &str) -> String {
     match code {
@@ -185,6 +206,9 @@ struct Inner {
     /// Connected devices in that hidden link room, including us when we are the host. The relay
     /// caps a link room at 8 devices, so this is the host's guest-slot counter.
     shared_link_users: usize,
+    /// Room user ids of guests the host has seen on that hidden link. Entries are stable enough to
+    /// badge the matching participant; a guest reads the same list back in a control answer.
+    shared_link_guests: Vec<String>,
     /// Last guest-side failure of the hidden link, surfaced in the dialog and `409` message.
     shared_link_reason: Option<String>,
 }
@@ -223,6 +247,7 @@ impl Inner {
         self.host_shared_control_capable = false;
         self.shared_link_ready = false;
         self.shared_link_users = 0;
+        self.shared_link_guests.clear();
         self.shared_link_reason = None;
         self.status_connected = false;
         self.connecting = false;
@@ -371,6 +396,7 @@ impl LtSession {
             let mut inner = self.inner.lock().await;
             inner.shared_link_ready = false;
             inner.shared_link_users = 0;
+            inner.shared_link_guests.clear();
             inner.shared_link_reason = None;
         }
         let me = self.clone();
@@ -386,6 +412,7 @@ impl LtSession {
             let mut inner = self.inner.lock().await;
             inner.shared_link_ready = false;
             inner.shared_link_users = 0;
+            inner.shared_link_guests.clear();
             inner.shared_link_reason = None;
         }
         self.emit_state().await;
@@ -446,22 +473,44 @@ impl LtSession {
                         let ready =
                             state.users.iter().any(|u| u.user_id == host_id && u.is_connected);
                         let users = state.users.iter().filter(|u| u.is_connected).count();
+                        let guests = state
+                            .users
+                            .iter()
+                            .filter(|u| u.is_connected)
+                            .filter_map(|u| linked_guest_id(&u.user_id))
+                            .collect();
                         {
                             let mut inner = self.inner.lock().await;
                             inner.shared_link_ready = ready;
                             inner.shared_link_users = users;
+                            // Guests leave the link after each request; keep the badge for the
+                            // room lifetime instead of forgetting them on every UserLeft.
+                            remember_linked_guests(&mut inner.shared_link_guests, guests);
                             if ready {
                                 inner.shared_link_reason = None;
                             }
                         }
                         self.emit_state().await;
                     }
-                    ServerMessage::UserJoined { .. } | ServerMessage::UserReconnected { .. } => {
+                    ServerMessage::UserJoined { user } => {
                         // The link room's join snapshot is authoritative; these keep the counter
                         // live between snapshots without holding a second copy of the roster.
                         {
                             let mut inner = self.inner.lock().await;
                             inner.shared_link_users = inner.shared_link_users.saturating_add(1);
+                            if let Some(id) = linked_guest_id(&user.user_id) {
+                                remember_linked_guest(&mut inner.shared_link_guests, id);
+                            }
+                        }
+                        self.emit_state().await;
+                    }
+                    ServerMessage::UserReconnected { user_id } => {
+                        {
+                            let mut inner = self.inner.lock().await;
+                            inner.shared_link_users = inner.shared_link_users.saturating_add(1);
+                            if let Some(id) = linked_guest_id(&user_id) {
+                                remember_linked_guest(&mut inner.shared_link_guests, id);
+                            }
                         }
                         self.emit_state().await;
                     }
@@ -483,9 +532,13 @@ impl LtSession {
                             continue;
                         };
                         let enabled = {
-                            let inner = self.inner.lock().await;
+                            let mut inner = self.inner.lock().await;
+                            if let Some(id) = linked_guest_id(&from) {
+                                remember_linked_guest(&mut inner.shared_link_guests, id);
+                            }
                             inner.role == Role::Host && inner.shared_control_enabled
                         };
+                        self.emit_state().await;
                         if !enabled {
                             let _ = otx.send(ClientMessage::Remote {
                                 action: SharedControlEnvelope::ControlResult {
@@ -525,6 +578,7 @@ impl LtSession {
                 let mut inner = self.inner.lock().await;
                 inner.shared_link_ready = false;
                 inner.shared_link_users = 0;
+                // Keep the names learned in this room: the link reconnects, but the badges stay.
             }
             *self.shared_outbound.lock().await = None;
             drop(otx);
@@ -557,6 +611,24 @@ impl LtSession {
     /// `None` means there is no room to explain, or everything is ready.
     pub async fn shared_control_reason(&self) -> Option<String> {
         Self::reason_for(&*self.inner.lock().await)
+    }
+
+    /// Room user ids the host has seen on the hidden link (host view), or the list the host sent
+    /// back with a control answer (guest view). Used only for participant badges.
+    pub async fn capable_guests(&self) -> Vec<String> {
+        self.inner.lock().await.shared_link_guests.clone()
+    }
+
+    /// A guest mirrors the host's capability roster from the opaque hidden-link answer.
+    pub async fn note_capable_guests(&self, guests: Vec<String>) {
+        {
+            let mut inner = self.inner.lock().await;
+            if inner.shared_link_guests == guests {
+                return;
+            }
+            inner.shared_link_guests = guests;
+        }
+        self.emit_state().await;
     }
 
     /// The single source of truth behind both `sharedControlReason` and the guest error message.
@@ -603,7 +675,7 @@ impl LtSession {
         if !self.shared_control_allowed().await {
             return Err("this host has not enabled shared control".into());
         }
-        let (secret, host_id, url) = {
+        let (secret, host_id, url, my_id) = {
             let inner = self.inner.lock().await;
             let code =
                 inner.room_code.clone().ok_or_else(|| "this room has no code".to_string())?;
@@ -613,7 +685,7 @@ impl LtSession {
             } else {
                 inner.server_url.clone()
             };
-            (secret, host_id, url)
+            (secret, host_id, url, inner.my_id.clone())
         };
         let ws = match connect_ws(&url).await {
             Ok(ws) => ws,
@@ -624,7 +696,11 @@ impl LtSession {
             }
         };
         let (mut sink, mut read) = ws.split();
-        let device_id = format!("sc-guest-{:016x}", rand::random::<u64>());
+        // Keep the throwaway socket but name it after the room participant, so the host can badge
+        // the real user rather than an opaque control id.
+        let device_id = my_id
+            .map(|id| format!("sc-guest-{id}-{:016x}", rand::random::<u64>()))
+            .unwrap_or_else(|| format!("sc-guest-{:016x}", rand::random::<u64>()));
         let join = ClientMessage::JoinLink { secret, device_id, name: "Control API".into() };
         if let Err(e) = sink.send(Message::Text(join.to_json())).await {
             let reason = format!("could not open the shared-control channel: {e}");
@@ -1242,7 +1318,11 @@ impl LtSession {
                 _ => {}
             }
         }
-        let flags = SharedControlFlags { shuffle: p.shuffle, repeat: p.repeat.clone() };
+        let flags = SharedControlFlags {
+            shuffle: p.shuffle,
+            repeat: p.repeat.clone(),
+            capable_guests: None,
+        };
         let cmd = match p.kind {
             PlaybackKind::Play => Some(SyncCommand::Play { position_ms: p.position_ms }),
             PlaybackKind::Pause => Some(SyncCommand::Pause { position_ms: p.position_ms }),
@@ -1308,6 +1388,8 @@ impl LtSession {
             "sharedControlLinkReady": inner.shared_link_ready,
             // The host is one of the eight link devices; show only the guest slots it can fill.
             "sharedControlLinkGuests": inner.shared_link_users.saturating_sub(1),
+            // Room user ids, not hidden-link device ids: the UI badges the participant directly.
+            "sharedControlGuests": inner.shared_link_guests,
             "sharedControlCapable": inner.shared_control_capable,
             "sharedControl": inner.shared_control,
             "hostSharedControlCapable": inner.host_shared_control_capable,
@@ -1635,13 +1717,27 @@ mod tests {
         inner.role = Role::Host;
         inner.shared_link_ready = true;
         inner.shared_link_users = 4; // host + three guests
+        inner.shared_link_guests = vec!["g1".into(), "g2".into(), "g3".into()];
         let snap = LtSession::snapshot_of(&inner);
         assert_eq!(snap["sharedControlLinkReady"], true);
         assert_eq!(snap["sharedControlLinkGuests"], 3);
+        assert_eq!(snap["sharedControlGuests"][0], "g1");
 
         inner.shared_link_users = 0;
+        inner.shared_link_guests.clear();
         let snap = LtSession::snapshot_of(&inner);
         assert_eq!(snap["sharedControlLinkGuests"], 0);
+        assert_eq!(snap["sharedControlGuests"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn hidden_link_device_ids_name_the_room_participant() {
+        assert_eq!(
+            linked_guest_id("sc-guest-user_123_456-9a8b7c6d").as_deref(),
+            Some("user_123_456")
+        );
+        assert_eq!(linked_guest_id("sc-host-abc123"), None);
+        assert_eq!(linked_guest_id("sc-guest-"), None);
     }
 
     #[tokio::test]

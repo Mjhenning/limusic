@@ -4383,13 +4383,14 @@ impl AppState {
     /// Mirror the queue flags the host actually applied. The normal room snapshot carries tracks
     /// and playback but not shuffle/repeat, so a guest's buttons would otherwise go stale.
     async fn apply_shared_control_flags(&self, flags: SharedControlFlags) {
-        let repeat = flags
-            .repeat
+        let SharedControlFlags { shuffle: host_shuffle, repeat: host_repeat, capable_guests } =
+            flags;
+        let repeat = host_repeat
             .as_deref()
             .and_then(|mode| serde_json::from_value(serde_json::Value::String(mode.into())).ok());
         let changed = {
             let mut q = self.queue.lock().await;
-            let shuffle = flags.shuffle.is_some_and(|on| {
+            let shuffle = host_shuffle.is_some_and(|on| {
                 if q.shuffle_orig.is_some() != on {
                     q.shuffle_orig = if on { Some(q.items.clone()) } else { None };
                     true
@@ -4413,6 +4414,9 @@ impl AppState {
         if changed {
             self.emit_queue().await;
         }
+        if let Some(guests) = capable_guests {
+            self.lt.note_capable_guests(guests).await;
+        }
     }
 
     /// Queue facts returned with a host-side answer so the guest's buttons stay in step.
@@ -4424,6 +4428,7 @@ impl AppState {
         SharedControlFlags {
             shuffle: Some(shuffle),
             repeat: serde_json::to_value(repeat).ok().and_then(|v| v.as_str().map(str::to_owned)),
+            capable_guests: Some(self.lt.capable_guests().await),
         }
     }
 
@@ -5088,7 +5093,12 @@ impl AppState {
             }
             SyncCommand::SyncQueue { queue } => self.lt_mirror_queue(queue).await,
             SyncCommand::QueueOptions { shuffle, repeat } => {
-                self.apply_shared_control_flags(SharedControlFlags { shuffle, repeat }).await
+                self.apply_shared_control_flags(SharedControlFlags {
+                    shuffle,
+                    repeat,
+                    capable_guests: None,
+                })
+                .await
             }
             SyncCommand::GuestAdd { track } => self.lt_enqueue_track(track).await,
             // Handled before the common setup above; see the early branch at the top.
@@ -5104,6 +5114,7 @@ impl AppState {
         self.apply_shared_control_flags(SharedControlFlags {
             shuffle: state.shuffle,
             repeat: state.repeat.clone(),
+            capable_guests: None,
         })
         .await;
         let Some(track) = state.current_track else {

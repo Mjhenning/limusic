@@ -248,6 +248,10 @@ pub struct SharedControlFlags {
     /// "off" | "all" | "one"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<String>,
+    /// Room user ids the host has seen on the hidden control link. Rides only over that opaque
+    /// link, so it never asks the public relay to understand a new field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capable_guests: Option<Vec<String>>,
 }
 
 /// Optional host-authoritative control for Listen Together. These ride inside the existing opaque
@@ -663,12 +667,17 @@ mod tests {
             id: "req-3".into(),
             ok: true,
             error: None,
-            flags: Some(SharedControlFlags { shuffle: Some(true), repeat: Some("one".into()) }),
+            flags: Some(SharedControlFlags {
+                shuffle: Some(true),
+                repeat: Some("one".into()),
+                capable_guests: Some(vec!["guest-1".into()]),
+            }),
         };
         assert_eq!(
             serde_json::from_value::<SharedControlEnvelope>(with_flags.to_value()).unwrap(),
             with_flags
         );
+        assert!(with_flags.to_value().to_string().contains("capable_guests"));
         // An older guest ignores the answer's extra field.
         let old_result = serde_json::json!({
             "kind": "control_result", "id": "req-3", "ok": true

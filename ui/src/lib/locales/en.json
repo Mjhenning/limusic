@@ -1272,6 +1272,8 @@
 			"control_link_preparing": "Preparing",
 			"control_link_off": "Off",
 			"control_link_slots": "{used} of {max} guest slots in use",
+			"capable_badge": "can control",
+			"capable_badge_hint": "This participant can use shared control with this fork.",
 			"copy_invite": "Copy invite",
 			"invite_copy_failed": "Could not copy the invite",
 			"join_requests": "Join requests",

@@ -18,6 +18,7 @@ export const lt = $state<LtState>({
 	sharedControlEnabled: false,
 	sharedControlLinkReady: false,
 	sharedControlLinkGuests: 0,
+	sharedControlGuests: [],
 	sharedControlCapable: false,
 	sharedControl: false,
 	hostSharedControlCapable: false,

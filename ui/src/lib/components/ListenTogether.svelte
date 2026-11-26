@@ -71,6 +71,7 @@
 				: t('dialogs.listen_together.status_disconnected')
 	);
 	const others = $derived(lt.users.filter((u) => u.user_id !== lt.myId).length);
+	const capableGuests = $derived(new Set(lt.sharedControlGuests));
 	const controlOn = $derived(integrations.controlApi);
 	const clientControlOn = $derived(integrations.clientControl);
 	const sharedControlLabel = $derived(
@@ -92,6 +93,13 @@
 	/** First letter of a display name, for the participant circles. */
 	function initial(username: string): string {
 		return (username.trim()[0] ?? '?').toUpperCase();
+	}
+
+	/** We always know our own fork and the host; other guests are learned from the hidden link. */
+	function participantCapable(userId: string, isHostUser: boolean): boolean {
+		if (userId === lt.myId) return true;
+		if (isHostUser) return lt.hostSharedControlCapable;
+		return capableGuests.has(userId);
 	}
 
 	/** The default is stored as empty, so typing it in by hand still mints bare invites. */
@@ -501,6 +509,14 @@
 											? ` ${t('dialogs.listen_together.you')}`
 											: ''}
 									</span>
+									{#if participantCapable(u.user_id, u.is_host)}
+										<span
+											class="shrink-0 rounded-full border border-primary/40 bg-primary/10 px-1.5 py-px text-[10px] font-medium leading-tight text-primary"
+											title={t('dialogs.listen_together.capable_badge_hint')}
+										>
+											{t('dialogs.listen_together.capable_badge')}
+										</span>
+									{/if}
 									{#if u.is_host}
 										<HugeiconsIcon icon={CrownIcon} class="h-3.5 w-3.5 shrink-0 text-amber-500" />
 									{/if}

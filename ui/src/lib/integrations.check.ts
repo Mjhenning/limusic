@@ -377,7 +377,9 @@ for (const key of [
 	'control_link_ready',
 	'control_link_preparing',
 	'control_link_off',
-	'control_link_slots'
+	'control_link_slots',
+	'capable_badge',
+	'capable_badge_hint'
 ]) {
 	ok(
 		typeof en.dialogs.listen_together[key] === 'string',
@@ -456,6 +458,21 @@ ok(
 ok(
 	ltDialog.includes('sharedControlLinkGuests') && ltDialog.includes('control_link_slots'),
 	'the connected host section shows link readiness and guest slots'
+);
+ok(
+	apiSource.includes('sharedControlGuests: string[]') &&
+		readFileSync(join(here, 'lt.svelte.ts'), 'utf8').includes('sharedControlGuests: []'),
+	'LtState carries the capability roster learned over the hidden link'
+);
+ok(
+	ltDialog.includes('participantCapable(u.user_id, u.is_host)') &&
+		ltDialog.includes("t('dialogs.listen_together.capable_badge')"),
+	'participant rows badge the clients known to support shared control'
+);
+ok(
+	appState.includes('capable_guests: Some(self.lt.capable_guests().await)') &&
+		appState.includes('self.lt.note_capable_guests(guests).await'),
+	'the capability roster rides back in the opaque control answer'
 );
 
 console.log('ok');
