@@ -379,7 +379,9 @@ for (const key of [
 	'shared_sent',
 	'shared_failed',
 	'volume_local_hint',
-	'queue_suggestion_hint'
+	'queue_suggestion_hint',
+	'seek_host_driven',
+	'seek_host_driven_hint'
 ]) {
 	ok(typeof en.player[key] === 'string', `en.json has player.${key}`);
 }
@@ -405,5 +407,15 @@ for (const [name, source] of [
 		`the ${name} labels guest queue adds as suggestions`
 	);
 }
+ok(
+	playerBar.includes("const guestFollowsHost = $derived(lt.role === 'guest')") &&
+		playerBar.includes("{#if guestFollowsHost}") &&
+		playerBar.includes("t('player.seek_host_driven')"),
+	'the guest seek bar is a read-only host-follow label'
+);
+ok(
+	!playerBar.includes('disabled={guestFollowsHost}'),
+	'the guest seek label does not masquerade as a disabled input'
+);
 
 console.log('ok');

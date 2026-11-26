@@ -50,7 +50,7 @@
 	import TrackMenu from './TrackMenu.svelte';
 	import DevicePicker from './DevicePicker.svelte';
 	import { link } from '$lib/link.svelte';
-	import { inRoom } from '$lib/lt.svelte';
+	import { inRoom, lt } from '$lib/lt.svelte';
 	import { currentLocale, t } from '$lib/i18n.svelte';
 	import LiveBadge from './LiveBadge.svelte';
 	import SharedControlBadge from './SharedControlBadge.svelte';
@@ -130,6 +130,9 @@
 	const seekPct = $derived(
 		shownDuration > 0 ? Math.min(1, Math.max(0, shownPosition / shownDuration)) : 0
 	);
+	// Guests follow the host's clock. A draggable bar that snaps back on release reads as broken, so
+	// keep the position display but replace the control with a plain label.
+	const guestFollowsHost = $derived(lt.role === 'guest');
 
 	function onSeekInput(e: Event) {
 		seekDrag = Number((e.target as HTMLInputElement).value) * playback.speed;
@@ -406,17 +409,26 @@
 						duration={shownDuration}
 						dragging={seekDrag !== null}
 					/>
-					<input
-						type="range"
-						class="range w-full flex-1"
-						style="--pct:{seekPct * 100}%"
-						min="0"
-						max={shownDuration || 0}
-						value={shownPosition}
-						oninput={onSeekInput}
-						onchange={onSeekCommit}
-						aria-label={t('player.seek')}
-					/>
+					{#if guestFollowsHost}
+						<span
+							class="pointer-events-none absolute inset-0 flex items-center justify-center rounded-md bg-background/75 text-[10px] font-medium tracking-wide text-muted-foreground"
+							title={t('player.seek_host_driven_hint')}
+						>
+							{t('player.seek_host_driven')}
+						</span>
+					{:else}
+						<input
+							type="range"
+							class="range w-full flex-1"
+							style="--pct:{seekPct * 100}%"
+							min="0"
+							max={shownDuration || 0}
+							value={shownPosition}
+							oninput={onSeekInput}
+							onchange={onSeekCommit}
+							aria-label={t('player.seek')}
+						/>
+					{/if}
 				</div>
 				<span class="min-w-[5ch] tabular-nums">{fmt(shownDuration)}</span>
 			</div>
