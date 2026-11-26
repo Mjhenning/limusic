@@ -5012,6 +5012,7 @@ impl AppState {
             let (id, from, action, submitted_by) =
                 (id.clone(), from.clone(), action.clone(), submitted_by.clone());
             let action = stamp_shared_action(action, submitted_by.as_deref());
+            let label = shared_control_action_label(&action);
             let queue_request =
                 matches!(&action, RemoteAction::PlayNext { .. } | RemoteAction::AddToQueue { .. });
             let result = if queue_request {
@@ -5025,8 +5026,13 @@ impl AppState {
                 self.apply_link(LinkCommand::Remote(action)).await;
                 Ok(())
             };
+            let applied = result.is_ok();
             let flags = self.shared_control_flags().await;
             self.lt.send_control_result(id, from, result, Some(flags)).await;
+            if applied {
+                let who = submitted_by.as_deref().unwrap_or("A guest");
+                self.emit_notice(&format!("{who} {label}"));
+            }
             return;
         }
         // Membership has already changed. Finish any earlier effect request, restore the shared
@@ -7501,9 +7507,37 @@ fn persist_fingerprint(q: &QueueState) -> u64 {
     hasher.finish()
 }
 
+/// Short past-tense phrase for a guest action in the host's toast: `"{who} {label}"`.
+fn shared_control_action_label(action: &RemoteAction) -> &'static str {
+    match action {
+        RemoteAction::Play => "started playback",
+        RemoteAction::Pause => "paused playback",
+        RemoteAction::Toggle => "toggled playback",
+        RemoteAction::Next => "skipped to the next track",
+        RemoteAction::Previous => "went back a track",
+        RemoteAction::Seek { .. } => "moved the playhead",
+        RemoteAction::SetVolume { .. } => "changed the volume",
+        RemoteAction::PlayTrack { .. }
+        | RemoteAction::PlayTracks { .. }
+        | RemoteAction::PlayIndex { .. } => "started a track",
+        RemoteAction::Remove { .. } | RemoteAction::Move { .. } | RemoteAction::ClearQueued => {
+            "edited the queue"
+        }
+        RemoteAction::PlayNext { .. } | RemoteAction::AddToQueue { .. } => {
+            "added a song to the queue"
+        }
+        RemoteAction::SetShuffle { .. } | RemoteAction::ToggleShuffle => "changed shuffle",
+        RemoteAction::SetRepeat { .. } | RemoteAction::CycleRepeat => "changed repeat",
+        RemoteAction::SetAutoplay { .. } => "changed Autoplay",
+        RemoteAction::TakeOver => "asked to take over",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+
+    use listen_protocol::RemoteAction;
 
     use super::{
         adopt_playlist_twins, adopt_twin, append_page, backfill_metadata, cache_horizon,
@@ -8764,5 +8798,25 @@ mod tests {
         assert_eq!(hash, AppState::hash_query("private viewer query"));
         assert_ne!(hash, AppState::hash_query("another viewer query"));
         assert!(!hash.contains("private"));
+    }
+
+    #[test]
+    fn guest_actions_have_readable_host_notices() {
+        assert_eq!(super::shared_control_action_label(&RemoteAction::Toggle), "toggled playback");
+        assert_eq!(
+            super::shared_control_action_label(&RemoteAction::Next),
+            "skipped to the next track"
+        );
+        assert_eq!(
+            super::shared_control_action_label(&RemoteAction::ToggleShuffle),
+            "changed shuffle"
+        );
+        assert_eq!(
+            super::shared_control_action_label(&RemoteAction::AddToQueue {
+                tracks: vec![],
+                from: None
+            }),
+            "added a song to the queue"
+        );
     }
 }
