@@ -349,7 +349,12 @@ for (const key of [
 	'shared_control',
 	'shared_control_hint',
 	'shared_control_requires_api',
-	'shared_control_guest_on'
+	'shared_control_guest_on',
+	'control_link',
+	'control_link_ready',
+	'control_link_preparing',
+	'control_link_off',
+	'control_link_slots'
 ]) {
 	ok(
 		typeof en.dialogs.listen_together[key] === 'string',
@@ -416,6 +421,18 @@ ok(
 ok(
 	!playerBar.includes('disabled={guestFollowsHost}'),
 	'the guest seek label does not masquerade as a disabled input'
+);
+ok(
+	apiSource.includes('sharedControlLinkGuests: number'),
+	'LtState exposes the hidden-link guest count'
+);
+ok(
+	readFileSync(join(here, 'lt.svelte.ts'), 'utf8').includes('sharedControlLinkGuests: 0'),
+	'the reactive LT state starts with no hidden-link guests'
+);
+ok(
+	ltDialog.includes('sharedControlLinkGuests') && ltDialog.includes('control_link_slots'),
+	'the connected host section shows link readiness and guest slots'
 );
 
 console.log('ok');

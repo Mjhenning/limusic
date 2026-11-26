@@ -1692,6 +1692,8 @@ export interface LtState {
 	sharedControlEnabled: boolean;
 	/** Hidden room-code-derived link room is live. */
 	sharedControlLinkReady: boolean;
+	/** Connected guests in that hidden room. The relay caps it at 8 devices including the host. */
+	sharedControlLinkGuests: number;
 	/** Legacy relay/host/guest capability facts mirrored from the room state. */
 	sharedControlCapable: boolean;
 	sharedControl: boolean;

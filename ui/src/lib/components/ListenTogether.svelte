@@ -387,6 +387,32 @@
 
 				<!-- Everything that grows with the room scrolls; the invite and the footer do not. -->
 				<div class="-mx-1 flex min-w-0 max-h-[38vh] flex-col gap-5 overflow-y-auto px-1">
+					<!-- Host-only readiness panel for the hidden control channel. It lives here, with the
+					     other room facts, rather than in Settings: the counter only means something while
+					     this room is live. -->
+					{#if isHost}
+						<div class="rounded-xl border bg-muted/40 p-3">
+							<div class="flex items-center justify-between gap-2">
+								<p class="text-xs font-medium">{t('dialogs.listen_together.control_link')}</p>
+								<span class="text-[11px] font-medium text-muted-foreground">
+									{#if !lt.sharedControlEnabled}
+										{t('dialogs.listen_together.control_link_off')}
+									{:else if lt.sharedControlLinkReady}
+										{t('dialogs.listen_together.control_link_ready')}
+									{:else}
+										{t('dialogs.listen_together.control_link_preparing')}
+									{/if}
+								</span>
+							</div>
+							<p class="mt-1 text-[11px] text-muted-foreground">
+								{t('dialogs.listen_together.control_link_slots', {
+									used: lt.sharedControlLinkGuests,
+									max: 7
+								})}
+							</p>
+						</div>
+					{/if}
+
 					<!-- Host: pending join requests -->
 					{#if isHost && lt.pendingJoins.length}
 						<div>

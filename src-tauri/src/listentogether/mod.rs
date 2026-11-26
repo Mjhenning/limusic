@@ -182,6 +182,9 @@ struct Inner {
     host_shared_control_capable: bool,
     /// The hidden link room keyed by this room's code is live. Host-side readiness.
     shared_link_ready: bool,
+    /// Connected devices in that hidden link room, including us when we are the host. The relay
+    /// caps a link room at 8 devices, so this is the host's guest-slot counter.
+    shared_link_users: usize,
     /// Last guest-side failure of the hidden link, surfaced in the dialog and `409` message.
     shared_link_reason: Option<String>,
 }
@@ -219,6 +222,7 @@ impl Inner {
         self.shared_control = false;
         self.host_shared_control_capable = false;
         self.shared_link_ready = false;
+        self.shared_link_users = 0;
         self.shared_link_reason = None;
         self.status_connected = false;
         self.connecting = false;
@@ -366,6 +370,7 @@ impl LtSession {
         {
             let mut inner = self.inner.lock().await;
             inner.shared_link_ready = false;
+            inner.shared_link_users = 0;
             inner.shared_link_reason = None;
         }
         let me = self.clone();
@@ -380,6 +385,7 @@ impl LtSession {
         {
             let mut inner = self.inner.lock().await;
             inner.shared_link_ready = false;
+            inner.shared_link_users = 0;
             inner.shared_link_reason = None;
         }
         self.emit_state().await;
@@ -439,13 +445,30 @@ impl LtSession {
                     ServerMessage::LinkJoined { state, .. } => {
                         let ready =
                             state.users.iter().any(|u| u.user_id == host_id && u.is_connected);
+                        let users = state.users.iter().filter(|u| u.is_connected).count();
                         {
                             let mut inner = self.inner.lock().await;
                             inner.shared_link_ready = ready;
+                            inner.shared_link_users = users;
                             if ready {
                                 inner.shared_link_reason = None;
                             }
                         }
+                        self.emit_state().await;
+                    }
+                    ServerMessage::UserJoined { .. } | ServerMessage::UserReconnected { .. } => {
+                        // The link room's join snapshot is authoritative; these keep the counter
+                        // live between snapshots without holding a second copy of the roster.
+                        {
+                            let mut inner = self.inner.lock().await;
+                            inner.shared_link_users = inner.shared_link_users.saturating_add(1);
+                        }
+                        self.emit_state().await;
+                    }
+                    ServerMessage::UserLeft { .. } | ServerMessage::UserDisconnected { .. } => {
+                        let mut inner = self.inner.lock().await;
+                        inner.shared_link_users = inner.shared_link_users.saturating_sub(1);
+                        drop(inner);
                         self.emit_state().await;
                     }
                     ServerMessage::Remote { from, action } => {
@@ -501,6 +524,7 @@ impl LtSession {
             {
                 let mut inner = self.inner.lock().await;
                 inner.shared_link_ready = false;
+                inner.shared_link_users = 0;
             }
             *self.shared_outbound.lock().await = None;
             drop(otx);
@@ -1282,6 +1306,8 @@ impl LtSession {
             "suggestions": inner.suggestions,
             "sharedControlEnabled": inner.shared_control_enabled,
             "sharedControlLinkReady": inner.shared_link_ready,
+            // The host is one of the eight link devices; show only the guest slots it can fill.
+            "sharedControlLinkGuests": inner.shared_link_users.saturating_sub(1),
             "sharedControlCapable": inner.shared_control_capable,
             "sharedControl": inner.shared_control,
             "hostSharedControlCapable": inner.host_shared_control_capable,
@@ -1601,6 +1627,21 @@ mod tests {
         inner.shared_control_enabled = false;
         inner.shared_link_ready = false;
         assert_eq!(LtSession::reason_for(&inner), None);
+    }
+
+    #[test]
+    fn snapshot_counts_only_hidden_link_guests() {
+        let mut inner = Inner::default();
+        inner.role = Role::Host;
+        inner.shared_link_ready = true;
+        inner.shared_link_users = 4; // host + three guests
+        let snap = LtSession::snapshot_of(&inner);
+        assert_eq!(snap["sharedControlLinkReady"], true);
+        assert_eq!(snap["sharedControlLinkGuests"], 3);
+
+        inner.shared_link_users = 0;
+        let snap = LtSession::snapshot_of(&inner);
+        assert_eq!(snap["sharedControlLinkGuests"], 0);
     }
 
     #[tokio::test]
