@@ -50,6 +50,7 @@
 	import Marquee from './Marquee.svelte';
 	import { t } from '$lib/i18n.svelte';
 	import LiveBadge from './LiveBadge.svelte';
+	import SharedControlBadge from './SharedControlBadge.svelte';
 
 	// Which of the two the right column is showing. Local, and reset when the widget is destroyed:
 	// nothing here is worth persisting. The queue is the default because it is the cheaper view —
@@ -360,6 +361,7 @@
 					class="font-heading text-[0.95rem] font-semibold leading-tight text-white"
 				/>
 				<Marquee text={now?.artists ?? ''} class="text-xs leading-snug text-white/75" />
+				<div class="mt-1 flex"><SharedControlBadge onArt /></div>
 			</div>
 
 			<div class="flex items-center gap-2">

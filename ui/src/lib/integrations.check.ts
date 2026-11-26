@@ -357,4 +357,29 @@ for (const key of [
 	);
 }
 
+const badgeSource = readFileSync(join(here, 'components', 'SharedControlBadge.svelte'), 'utf8');
+const playerBar = readFileSync(join(here, 'components', 'PlayerBar.svelte'), 'utf8');
+const miniPlayer = readFileSync(join(here, 'components', 'MiniPlayer.svelte'), 'utf8');
+ok(badgeSource.includes('controlFeedback.pending'), 'the badge acknowledges a pending guest press');
+ok(
+	badgeSource.includes('lt.sharedControlReason !== null'),
+	'the badge stays quiet when the room cannot offer shared control'
+);
+ok(
+	badgeSource.includes('integrations.controlApi'),
+	'the guest badge reflects whether local Control API is enabled'
+);
+ok(playerBar.includes('<SharedControlBadge />'), 'the main player bar shows the badge');
+ok(miniPlayer.includes('<SharedControlBadge onArt />'), 'the mini player shows the badge');
+for (const key of [
+	'shared_host',
+	'shared_guest',
+	'shared_needs_api',
+	'shared_sending',
+	'shared_sent',
+	'shared_failed'
+]) {
+	ok(typeof en.player[key] === 'string', `en.json has player.${key}`);
+}
+
 console.log('ok');

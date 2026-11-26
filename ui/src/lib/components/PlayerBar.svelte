@@ -52,6 +52,7 @@
 	import { link } from '$lib/link.svelte';
 	import { currentLocale, t } from '$lib/i18n.svelte';
 	import LiveBadge from './LiveBadge.svelte';
+	import SharedControlBadge from './SharedControlBadge.svelte';
 
 	let {
 		onToggleQueue,
@@ -228,6 +229,7 @@
 						<HugeiconsIcon icon={InfinityIcon} class="h-3.5 w-3.5" />
 					</span>
 				{/if}
+				<SharedControlBadge />
 			</div>
 			<ArtistLine
 				runs={playback.now?.artistRuns}
