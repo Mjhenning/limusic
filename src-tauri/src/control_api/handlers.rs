@@ -171,6 +171,7 @@ where
         .context
         .forward_shared_control(action)
         .await
+        .map(|_| ())
         .map_err(ErrorBody::shared_control_failed)?;
     Ok(Some(response().await))
 }
@@ -684,6 +685,7 @@ mod tests {
     use axum::http::{header::AUTHORIZATION, HeaderValue, Request, StatusCode};
     use futures_util::StreamExt;
     use innertube::SongItem;
+    use listen_protocol::SharedControlFlags;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
@@ -916,11 +918,14 @@ mod tests {
             self.shared_control_reason.clone()
         }
 
-        async fn forward_shared_control(&self, action: RemoteAction) -> Result<(), String> {
+        async fn forward_shared_control(
+            &self,
+            action: RemoteAction,
+        ) -> Result<SharedControlFlags, String> {
             self.forwarded.lock().unwrap().push(action);
             match self.forward_error.clone() {
                 Some(error) => Err(error),
-                None => Ok(()),
+                None => Ok(SharedControlFlags::default()),
             }
         }
 

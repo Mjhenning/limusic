@@ -505,6 +505,15 @@ only when the room is created. Upstream link rooms hold at most 8 devices
 including the host, so up to 7 fork guests can forward at once; later guests
 get a clear error and stay suggestion-only.
 
+The same link carries the guest's own UI transport buttons once it is in an
+opted-in room: play/pause, skip, previous, shuffle, and loop are sent as host
+actions instead of showing the suggestion-only hint. The correlated answer
+returns the host's shuffle/repeat flags so those buttons stay lit correctly.
+Queue suggestions from the UI are unchanged — adding a song still goes through
+the normal Listen Together suggestion path. The volume slider is deliberately
+not forwarded: it stays local to the guest's device and never changes the
+host's audio level.
+
 The guest sends the same HTTP request it would send locally. It waits at most
 15 s for a correlated answer from the host, then returns the normal success
 body with the guest's current mirrored track/queue. A timeout answers `502
@@ -523,19 +532,19 @@ visible requester.
 
 The Listen Together dialog and the guest `409 listen_together_guest` message
 name the first missing fact from the same `sharedControlReason`: a room that is
-still reconnecting, a hidden link that is still preparing on the host, or the
-last failure reported by the guest's link (most often "the host has not enabled
-shared control for this room (or is not running this fork)"). An expired or
-unreachable relay is reported with the same wording rather than a native
-dialog. A base host never joins the link room, so its guests remain
-suggestion-only without any user action.
+still reconnecting, a host that is not a fork or has not opted in, a hidden link
+that is still preparing on the host, or the last failure reported by the guest's
+link. An expired or unreachable relay is reported with the same wording rather
+than a native dialog. A base host never joins the link room, so its guests stay
+suggestion-only without any user action and see that fact in the dialog.
 
 No `ServerMessage` variant was added. The wire change is additive: defaulted
 room-state fields kept for older fork relays, and new kinds inside the existing
 opaque `remote` envelope, which the upstream relay forwards unread in link
 rooms. Older base clients keep joining unchanged, and base clients never join
-the hidden room. Shared forward covers playback, seek, volume, and queue edits
-including `/queue/request`. Queue facts the host decides locally, such as the
+the hidden room. HTTP shared forward covers playback, seek, volume, and queue
+edits including `/queue/request`; the app's own volume slider is not part of it.
+Queue facts the host decides locally, such as the
 three-second Previous rewind and the app's
 duplicate-prevention setting, are not replicated into the forwarded response.
 

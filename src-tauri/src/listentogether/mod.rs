@@ -16,7 +16,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use listen_protocol::{
     ClientMessage, Playback, PlaybackKind, RemoteAction, RoomState, ServerMessage,
-    SharedControlEnvelope, Suggestion, Track, User,
+    SharedControlEnvelope, SharedControlFlags, Suggestion, Track, User,
 };
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
@@ -463,6 +463,7 @@ impl LtSession {
                                     id,
                                     ok: false,
                                     error: Some("the host turned shared control off".into()),
+                                    flags: None,
                                 }
                                 .to_value(),
                                 to: Some(from),
@@ -550,6 +551,10 @@ impl LtSession {
             Role::Guest => {
                 if !inner.status_connected {
                     Some("Listen Together is reconnecting; retry shortly".into())
+                } else if !inner.host_shared_control_capable {
+                    Some("the host is not running this fork with shared control".into())
+                } else if !inner.shared_control {
+                    Some("the host has not enabled shared control for this room".into())
                 } else {
                     None
                 }
@@ -564,7 +569,7 @@ impl LtSession {
     pub async fn forward_shared_control(
         self: &Arc<Self>,
         action: RemoteAction,
-    ) -> Result<(), String> {
+    ) -> Result<SharedControlFlags, String> {
         if !self.shared_control_allowed().await {
             return Err("this host has not enabled shared control".into());
         }
@@ -656,12 +661,15 @@ impl LtSession {
                     match serde_json::from_str::<ServerMessage>(&text) {
                         Ok(ServerMessage::Remote { action, .. }) => {
                             if let Ok(SharedControlEnvelope::ControlResult {
-                                id: result_id, ok, error,
+                                id: result_id,
+                                ok,
+                                error,
+                                flags,
                             }) = serde_json::from_value::<SharedControlEnvelope>(action)
                             {
                                 if result_id == id {
                                     return if ok {
-                                        Ok(())
+                                        Ok(flags.unwrap_or_default())
                                     } else {
                                         Err(error.unwrap_or_else(|| "the host refused the control".into()))
                                     };
@@ -687,7 +695,7 @@ impl LtSession {
         // peer behind until cleanup, which would eat the 8-device budget after a few requests.
         let _ = sink.send(Message::Text(ClientMessage::LeaveRoom.to_json())).await;
         match &outcome {
-            Ok(()) => self.set_shared_link_reason(None).await,
+            Ok(_) => self.set_shared_link_reason(None).await,
             Err(reason) => self.set_shared_link_reason(Some(reason.clone())).await,
         }
         outcome
@@ -700,12 +708,14 @@ impl LtSession {
         id: String,
         to: String,
         result: Result<(), String>,
+        flags: Option<SharedControlFlags>,
     ) {
         let msg = ClientMessage::Remote {
             action: SharedControlEnvelope::ControlResult {
                 id,
                 ok: result.is_ok(),
                 error: result.err(),
+                flags,
             }
             .to_value(),
             to: Some(to),
@@ -1541,6 +1551,18 @@ mod tests {
         );
 
         inner.status_connected = true;
+        assert_eq!(
+            LtSession::reason_for(&inner).as_deref(),
+            Some("the host is not running this fork with shared control")
+        );
+
+        inner.host_shared_control_capable = true;
+        assert_eq!(
+            LtSession::reason_for(&inner).as_deref(),
+            Some("the host has not enabled shared control for this room")
+        );
+
+        inner.shared_control = true;
         assert_eq!(LtSession::reason_for(&inner), None);
 
         inner.shared_link_reason = Some("the host has not enabled shared control".into());

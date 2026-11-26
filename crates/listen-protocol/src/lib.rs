@@ -210,6 +210,10 @@ pub enum RemoteAction {
     SetRepeat {
         mode: String,
     },
+    /// UI shuffle toggle. The host flips its own queue rather than trusting a mirrored flag.
+    ToggleShuffle,
+    /// UI loop button. The host advances its own repeat mode.
+    CycleRepeat,
     /// The player's own Autoplay setting.
     SetAutoplay {
         on: bool,
@@ -217,6 +221,17 @@ pub enum RemoteAction {
     /// To a device that isn't playing: play what the player plays, from where it is now, with its
     /// queue (Continue here, asked from another device).
     TakeOver,
+}
+
+/// Queue facts the host sends back with a shared-control answer so a guest's buttons mirror the
+/// state the host actually applied. Every field is optional: an older host simply omits them.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SharedControlFlags {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle: Option<bool>,
+    /// "off" | "all" | "one"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<String>,
 }
 
 /// Optional host-authoritative control for Listen Together. These ride inside the existing opaque
@@ -254,6 +269,8 @@ pub enum SharedControlEnvelope {
         ok: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flags: Option<SharedControlFlags>,
     },
 }
 
@@ -598,6 +615,7 @@ mod tests {
             id: "req-1".into(),
             ok: false,
             error: Some("host lost the room".into()),
+            flags: None,
         };
         let json = result.to_value().to_string();
         assert_eq!(
@@ -605,6 +623,32 @@ mod tests {
             result
         );
         assert!(json.contains("\"ok\":false"));
+        assert!(!json.contains("flags"));
+
+        let with_flags = SharedControlEnvelope::ControlResult {
+            id: "req-3".into(),
+            ok: true,
+            error: None,
+            flags: Some(SharedControlFlags { shuffle: Some(true), repeat: Some("one".into()) }),
+        };
+        assert_eq!(
+            serde_json::from_value::<SharedControlEnvelope>(with_flags.to_value()).unwrap(),
+            with_flags
+        );
+        // An older guest ignores the answer's extra field.
+        let old_result = serde_json::json!({
+            "kind": "control_result", "id": "req-3", "ok": true
+        });
+        let back: SharedControlEnvelope = serde_json::from_value(old_result).unwrap();
+        assert_eq!(
+            back,
+            SharedControlEnvelope::ControlResult {
+                id: "req-3".into(),
+                ok: true,
+                error: None,
+                flags: None,
+            }
+        );
 
         // An older guest omits the submitter; the host still parses its request.
         let old = serde_json::json!({
@@ -756,6 +800,8 @@ mod tests {
             RemoteAction::ClearQueued,
             RemoteAction::SetShuffle { on: true },
             RemoteAction::SetRepeat { mode: "one".into() },
+            RemoteAction::ToggleShuffle,
+            RemoteAction::CycleRepeat,
             RemoteAction::SetAutoplay { on: false },
             RemoteAction::TakeOver,
         ] {

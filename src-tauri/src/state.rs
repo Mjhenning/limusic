@@ -13,7 +13,7 @@ use innertube::{
     MAIN_CLIENT,
 };
 use karaoke::cache::PinSlot;
-use listen_protocol::{Playback, PlaybackKind, RemoteAction, Track};
+use listen_protocol::{Playback, PlaybackKind, RemoteAction, SharedControlFlags, Track};
 use player::Player;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
@@ -1942,6 +1942,9 @@ impl AppState {
             self.emit_ui_event("playback-state", if playing { "playing" } else { "paused" }, true);
             return playing;
         }
+        if self.forward_guest_ui_control(RemoteAction::Toggle).await {
+            return self.sync_playback_state(); // the host's playback event follows the answer
+        }
         if self.lt.is_guest().await {
             return self.sync_playback_state(); // guest playback is host-driven
         }
@@ -1966,6 +1969,9 @@ impl AppState {
         if self.link_route(|_| Some(RemoteAction::Play)) {
             self.emit_ui_event("playback-state", "playing", true);
             return true;
+        }
+        if self.forward_guest_ui_control(RemoteAction::Play).await {
+            return self.sync_playback_state();
         }
         if self.lt.is_guest().await {
             return self.sync_playback_state(); // guest playback is host-driven
@@ -1993,6 +1999,9 @@ impl AppState {
         if self.link_route(|_| Some(RemoteAction::Pause)) {
             self.emit_ui_event("playback-state", "paused", true);
             return false;
+        }
+        if self.forward_guest_ui_control(RemoteAction::Pause).await {
+            return self.sync_playback_state();
         }
         if self.lt.is_guest().await || self.player.is_idle() || self.player.is_paused() {
             return self.sync_playback_state();
@@ -4150,6 +4159,9 @@ impl AppState {
         if self.link_route(|_| Some(RemoteAction::Next)) {
             return;
         }
+        if self.forward_guest_ui_control(RemoteAction::Next).await {
+            return;
+        }
         self.next_in_queue_local().await;
     }
 
@@ -4182,6 +4194,9 @@ impl AppState {
     /// which is where they get the host-only hint.
     pub async fn prev_in_queue(self: &std::sync::Arc<Self>) {
         if self.link_route(|_| Some(RemoteAction::Previous)) {
+            return;
+        }
+        if self.forward_guest_ui_control(RemoteAction::Previous).await {
             return;
         }
         if self.current_position() > PREV_REWIND_SECS && !self.lt.is_guest().await {
@@ -4322,6 +4337,83 @@ impl AppState {
     fn emit_notice(&self, message: &str) {
         tracing::info!(message, "playback notice");
         let _ = self.app.emit("playback-notice", serde_json::json!({ "message": message }));
+    }
+
+    /// Send a UI transport button to the host over the hidden shared-control link when this desktop
+    /// is a guest in an opted-in room. `true` means the press was consumed: even a failed forward
+    /// must not fall through to this guest's local player. Volume has no branch here on purpose —
+    /// the slider stays local to this device.
+    async fn forward_guest_ui_control(self: &Arc<Self>, action: RemoteAction) -> bool {
+        if !self.lt.is_guest().await || !self.lt.shared_control_allowed().await {
+            return false;
+        }
+        let api_enabled = self
+            .db
+            .get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY)
+            .and_then(|s| {
+                serde_json::from_str::<crate::integrations::settings::ControlApiSettings>(&s).ok()
+            })
+            .is_some_and(|s| s.enabled);
+        if !api_enabled {
+            return false;
+        }
+        match self.lt.forward_shared_control(action).await {
+            Ok(flags) => {
+                self.apply_shared_control_flags(flags).await;
+                true
+            }
+            Err(reason) => {
+                self.emit_notice(&reason);
+                true
+            }
+        }
+    }
+
+    /// Mirror the queue flags the host actually applied. The normal room snapshot carries tracks
+    /// and playback but not shuffle/repeat, so a guest's buttons would otherwise go stale.
+    async fn apply_shared_control_flags(&self, flags: SharedControlFlags) {
+        let repeat = flags
+            .repeat
+            .as_deref()
+            .and_then(|mode| serde_json::from_value(serde_json::Value::String(mode.into())).ok());
+        let changed = {
+            let mut q = self.queue.lock().await;
+            let shuffle = flags.shuffle.is_some_and(|on| {
+                if q.shuffle_orig.is_some() != on {
+                    q.shuffle_orig = if on { Some(q.items.clone()) } else { None };
+                    true
+                } else {
+                    false
+                }
+            });
+            let repeat = repeat.is_some_and(|mode| {
+                if q.repeat != mode {
+                    q.repeat = mode;
+                    true
+                } else {
+                    false
+                }
+            });
+            shuffle || repeat
+        };
+        if let Some(mode) = repeat {
+            let _ = self.player.set_loop_file(mode == RepeatMode::One);
+        }
+        if changed {
+            self.emit_queue().await;
+        }
+    }
+
+    /// Queue facts returned with a host-side answer so the guest's buttons stay in step.
+    async fn shared_control_flags(&self) -> SharedControlFlags {
+        let (shuffle, repeat) = {
+            let q = self.queue.lock().await;
+            (q.shuffle_orig.is_some(), q.repeat)
+        };
+        SharedControlFlags {
+            shuffle: Some(shuffle),
+            repeat: serde_json::to_value(repeat).ok().and_then(|v| v.as_str().map(str::to_owned)),
+        }
     }
 
     /// A track was auto-skipped because no client could resolve it — a transient toast, not the
@@ -4933,7 +5025,8 @@ impl AppState {
                 self.apply_link(LinkCommand::Remote(action)).await;
                 Ok(())
             };
-            self.lt.send_control_result(id, from, result).await;
+            let flags = self.shared_control_flags().await;
+            self.lt.send_control_result(id, from, result, Some(flags)).await;
             return;
         }
         // Membership has already changed. Finish any earlier effect request, restore the shared
@@ -5346,6 +5439,9 @@ impl AppState {
         }) {
             return;
         }
+        if self.forward_guest_ui_control(RemoteAction::ToggleShuffle).await {
+            return;
+        }
         if self.lt.is_guest().await {
             self.emit_guest_hint();
             return;
@@ -5400,11 +5496,20 @@ impl AppState {
         }) {
             return;
         }
+        let mode_str = serde_json::to_value(mode).ok().and_then(|v| v.as_str().map(str::to_owned));
+        if let Some(mode) = mode_str {
+            if self.forward_guest_ui_control(RemoteAction::SetRepeat { mode }).await {
+                return;
+            }
+        }
         self.update_repeat(|_| mode).await;
     }
 
     /// Advance repeat mode Off -> All -> One -> Off (the global hotkey; the UI cycles itself).
     pub async fn cycle_repeat(self: &std::sync::Arc<Self>) {
+        if self.forward_guest_ui_control(RemoteAction::CycleRepeat).await {
+            return;
+        }
         self.update_repeat(|mode| match mode {
             RepeatMode::Off => RepeatMode::All,
             RepeatMode::All => RepeatMode::One,
@@ -6070,6 +6175,8 @@ impl AppState {
                         self.set_repeat(mode).await;
                     }
                 }
+                RemoteAction::ToggleShuffle => self.toggle_shuffle().await,
+                RemoteAction::CycleRepeat => self.cycle_repeat().await,
                 RemoteAction::SetAutoplay { on } => {
                     self.db.set_setting("autoplay", if on { "true" } else { "false" });
                     self.autoplay_changed(on).await;

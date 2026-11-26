@@ -13,7 +13,7 @@ use axum::{
     Json,
 };
 use innertube::SongItem;
-use listen_protocol::RemoteAction;
+use listen_protocol::{RemoteAction, SharedControlFlags};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -985,9 +985,13 @@ pub trait ControlApiContext: Send + Sync + 'static {
         None
     }
 
-    /// Forward one mutation to the host and wait for its correlated answer. A timeout does not
-    /// prove the action failed; callers tell clients to re-read `/status` before retrying.
-    async fn forward_shared_control(&self, _action: RemoteAction) -> Result<(), String> {
+    /// Forward one mutation to the host and wait for its correlated answer, including the queue
+    /// flags the host applied. A timeout does not prove the action failed; callers tell clients to
+    /// re-read `/status` before retrying.
+    async fn forward_shared_control(
+        &self,
+        _action: RemoteAction,
+    ) -> Result<SharedControlFlags, String> {
         Err("shared control is not available".into())
     }
 
@@ -1075,7 +1079,10 @@ impl ControlApiContext for crate::state::AppState {
         self.lt.shared_control_reason().await
     }
 
-    async fn forward_shared_control(&self, action: RemoteAction) -> Result<(), String> {
+    async fn forward_shared_control(
+        &self,
+        action: RemoteAction,
+    ) -> Result<SharedControlFlags, String> {
         self.lt.forward_shared_control(action).await
     }
 

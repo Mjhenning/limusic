@@ -70,6 +70,7 @@
 				: t('dialogs.listen_together.status_disconnected')
 	);
 	const others = $derived(lt.users.filter((u) => u.user_id !== lt.myId).length);
+	const controlOn = $derived(integrations.controlApi);
 	const sharedControlLabel = $derived(
 		lt.sharedControlReason
 			? lt.sharedControlReason
@@ -77,9 +78,10 @@
 				? lt.sharedControlEnabled
 					? t('dialogs.listen_together.shared_control_on')
 					: t('dialogs.listen_together.shared_control_off')
-				: t('dialogs.listen_together.shared_control_guest_on')
+				: controlOn
+					? t('dialogs.listen_together.shared_control_guest_on')
+					: t('dialogs.listen_together.shared_control_requires_api')
 	);
-	const controlOn = $derived(integrations.controlApi);
 
 	function rememberName() {
 		localStorage.setItem('lt_name', name.trim());

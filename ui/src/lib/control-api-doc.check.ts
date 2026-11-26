@@ -108,6 +108,10 @@ const commands = read(join(root, 'src-tauri', 'src', 'commands.rs'));
 ok(types.includes('listen_together_guest_with'), 'guest errors carry the room blocker');
 ok(lt.includes('sharedControlReason'), 'the room snapshot carries the diagnostic reason');
 ok(
+	lt.includes('!inner.host_shared_control_capable') && lt.includes('!inner.shared_control'),
+	'guest diagnostics name a base host and a host without the opt-in'
+);
+ok(
 	!integrationSettings.includes('pub shared_control_server'),
 	'no fork relay URL is persisted with the API settings'
 );
@@ -116,6 +120,14 @@ ok(commands.includes('before changing shared control'), 'backend locks the opt-i
 ok(commands.includes('before changing the server'), 'backend locks relay edits while in a room');
 ok(handlers.includes('forward_shared_control'), 'handlers forward opted-in guest mutations');
 ok(protocol.includes('SharedControlEnvelope'), 'the wire shape is in listen-protocol');
+ok(
+	protocol.includes('ToggleShuffle') && protocol.includes('CycleRepeat'),
+	'UI shuffle and loop toggles exist on the wire'
+);
+ok(
+	doc.includes('The volume slider is deliberately'),
+	'the docs keep UI volume local to the guest'
+);
 ok(sync.includes('MAX_SHARED_CONTROL'), 'the relay bounds shared-control envelopes');
 ok(doc.includes('| 502 | `shared_control_failed` |'), 'the error table has shared_control_failed');
 

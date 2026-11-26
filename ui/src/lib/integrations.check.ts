@@ -36,6 +36,7 @@ const titlebar = join(here, 'components', 'Titlebar.svelte');
 const dialog = join(here, 'components', 'SettingsDialog.svelte');
 const store = join(here, 'integrations.svelte.ts');
 const root = join(here, '..', '..', '..');
+const appState = readFileSync(join(root, 'src-tauri', 'src', 'state.rs'), 'utf8');
 const files = [
 	component,
 	discord,
@@ -205,6 +206,43 @@ ok(
 	ltDialog.includes("t('dialogs.listen_together.shared_control_guest_on')"),
 	'a guest sees its own shared-control access, not the host opt-in switch'
 );
+ok(
+	ltDialog.includes(': controlOn\n\t\t\t\t\t? t(\'dialogs.listen_together.shared_control_guest_on\')'),
+	'the guest status also requires the local Control API'
+);
+ok(
+	appState.includes('CONTROL_API_SETTINGS_KEY') && appState.includes('is_some_and(|s| s.enabled)'),
+	'UI forwarding requires the local Control API'
+);
+
+// --- UI transport buttons over the hidden link -----------------------------------------------
+for (const call of [
+	'forward_guest_ui_control(RemoteAction::Toggle)',
+	'forward_guest_ui_control(RemoteAction::Play)',
+	'forward_guest_ui_control(RemoteAction::Pause)',
+	'forward_guest_ui_control(RemoteAction::Next)',
+	'forward_guest_ui_control(RemoteAction::Previous)',
+	'forward_guest_ui_control(RemoteAction::ToggleShuffle)',
+	'forward_guest_ui_control(RemoteAction::SetRepeat { mode })',
+	'forward_guest_ui_control(RemoteAction::CycleRepeat)'
+]) {
+	ok(appState.includes(call), `the guest UI forwards ${call}`);
+}
+const guestForward = appState.slice(
+	appState.indexOf('async fn forward_guest_ui_control'),
+	appState.indexOf('/// A track was auto-skipped')
+);
+ok(!guestForward.includes('SetVolume'), 'guest UI forwarding never sends a volume action');
+ok(
+	!appState
+		.slice(
+			appState.indexOf('pub fn set_volume_with_effects'),
+			appState.indexOf('/// Jump to a specific queue index')
+		)
+		.includes('forward_guest_ui_control'),
+	'the UI volume slider stays on this device'
+);
+
 ok(
 	integrationStore.includes('Leave Listen Together before changing shared control'),
 	'both switches are locked while a room is active'

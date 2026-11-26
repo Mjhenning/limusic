@@ -806,7 +806,7 @@ impl Server {
                         .to_value();
                         room.send_to(&host, ServerMessage::Remote { from: me, action });
                     }
-                    SharedControlEnvelope::ControlResult { id, ok, error } => {
+                    SharedControlEnvelope::ControlResult { id, ok, error, flags } => {
                         // Results come only from the host and only go back to the named guest.
                         if !room.is_host(&me) {
                             return;
@@ -815,8 +815,8 @@ impl Server {
                         if !room.peers.get(&target).is_some_and(|p| p.connected) {
                             return;
                         }
-                        let action =
-                            SharedControlEnvelope::ControlResult { id, ok, error }.to_value();
+                        let action = SharedControlEnvelope::ControlResult { id, ok, error, flags }
+                            .to_value();
                         room.send_to(&target, ServerMessage::Remote { from: me, action });
                     }
                 }
@@ -1812,6 +1812,7 @@ mod tests {
                         id: "r1".into(),
                         ok: true,
                         error: None,
+                        flags: None,
                     }
                     .to_value(),
                     to: Some(host.id()),
@@ -1826,6 +1827,7 @@ mod tests {
                     id: "r1".into(),
                     ok: true,
                     error: None,
+                    flags: None,
                 }
                 .to_value(),
                 to: Some(guest.id()),
