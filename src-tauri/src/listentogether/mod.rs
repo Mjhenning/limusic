@@ -471,6 +471,9 @@ impl LtSession {
 
     async fn start_shared_host_link(self: &Arc<Self>, code: Option<String>) {
         let Some(code) = code else { return };
+        // The two roles share one hidden-link room. A device that just became host must not leave
+        // its old guest socket in that room: the new host would count itself twice (0 → 1 → 2).
+        self.stop_shared_guest_link().await;
         {
             let mut active = self.shared_code.lock().await;
             if active.as_deref() == Some(code.as_str()) {
@@ -1643,6 +1646,9 @@ impl LtSession {
                     self.announce_shared_control().await;
                     self.maybe_start_shared_host_link().await;
                 } else {
+                    // A reconnect can restore the guest role while the old host socket is still
+                    // winding down; keep exactly one hidden-link identity in the room.
+                    self.stop_shared_host_link().await;
                     self.maybe_start_shared_guest_link(Some(code)).await;
                     self.send_guest_hello().await;
                     let _ = self.sync_tx.send(SyncCommand::ApplyState(state));
