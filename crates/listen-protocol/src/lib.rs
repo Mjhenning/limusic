@@ -254,6 +254,21 @@ pub struct SharedControlFlags {
     pub capable_guests: Option<Vec<String>>,
 }
 
+/// One participant the host has seen on the hidden control link. `api_enabled` means this guest
+/// can forward Control API mutations; `ui_control` means its desktop buttons are allowed too.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedControlPeer {
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub api_enabled: bool,
+    #[serde(default)]
+    pub ui_control: bool,
+}
+
 /// Optional host-authoritative control for Listen Together. These ride inside the existing opaque
 /// `remote` envelope, so no new `ServerMessage` variant is needed: a base client that ignores
 /// `ServerMessage::Remote` never sees them, and an older device-link client ignores the new kinds.
@@ -291,6 +306,25 @@ pub enum SharedControlEnvelope {
         error: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         flags: Option<SharedControlFlags>,
+    },
+    /// Guest → host, over the hidden link: advertise which kinds of control this client allows.
+    /// Sent on join and whenever either setting changes, so the host's roster stays live.
+    ParticipantHello {
+        #[serde(default)]
+        user_id: String,
+        #[serde(default)]
+        username: String,
+        #[serde(default)]
+        api_enabled: bool,
+        #[serde(default)]
+        ui_control: bool,
+    },
+    /// Host → all hidden-link guests: the current allow state plus the other capable guests.
+    ParticipantRoster {
+        #[serde(default)]
+        host_allows: bool,
+        #[serde(default)]
+        guests: Vec<SharedControlPeer>,
     },
 }
 
@@ -708,6 +742,49 @@ mod tests {
                 action: RemoteAction::Toggle,
                 shared_control_capable: true,
                 submitted_by: None,
+            }
+        );
+    }
+
+    #[test]
+    fn capability_handshake_is_additive_on_the_opaque_link() {
+        let hello = SharedControlEnvelope::ParticipantHello {
+            user_id: "user_1".into(),
+            username: "Ann".into(),
+            api_enabled: true,
+            ui_control: false,
+        };
+        let wire = hello.to_value();
+        assert_eq!(wire["kind"], "participant_hello");
+        assert_eq!(wire["api_enabled"], true);
+        assert_eq!(wire["ui_control"], false);
+        assert_eq!(serde_json::from_value::<SharedControlEnvelope>(wire).unwrap(), hello);
+
+        let roster = SharedControlEnvelope::ParticipantRoster {
+            host_allows: true,
+            guests: vec![SharedControlPeer {
+                user_id: "user_1".into(),
+                username: "Ann".into(),
+                api_enabled: true,
+                ui_control: true,
+            }],
+        };
+        let wire = roster.to_value();
+        assert_eq!(wire["kind"], "participant_roster");
+        assert_eq!(wire["host_allows"], true);
+        assert_eq!(wire["guests"][0]["userId"], "user_1");
+        assert_eq!(wire["guests"][0]["apiEnabled"], true);
+        assert_eq!(serde_json::from_value::<SharedControlEnvelope>(wire).unwrap(), roster);
+
+        // An older client ignores both kinds; defaulted fields keep them parseable.
+        let old_hello = serde_json::json!({ "kind": "participant_hello" });
+        assert_eq!(
+            serde_json::from_value::<SharedControlEnvelope>(old_hello).unwrap(),
+            SharedControlEnvelope::ParticipantHello {
+                user_id: String::new(),
+                username: String::new(),
+                api_enabled: false,
+                ui_control: false,
             }
         );
     }

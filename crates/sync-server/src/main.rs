@@ -838,6 +838,10 @@ impl Server {
                             .to_value();
                         room.send_to(&target, ServerMessage::Remote { from: me, action });
                     }
+                    // Handshake traffic belongs to the hidden link room only; the relay forwards
+                    // it there unread and never advertises it in a main room.
+                    SharedControlEnvelope::ParticipantHello { .. }
+                    | SharedControlEnvelope::ParticipantRoster { .. } => {}
                 }
             }
 
