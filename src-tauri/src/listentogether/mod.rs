@@ -2046,6 +2046,7 @@ mod tests {
             duration_ms: 0,
             queued_by: None,
             submitted_by: None,
+            ..Default::default()
         }
     }
 

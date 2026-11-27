@@ -502,6 +502,8 @@ fn resolve_error(error: ResolveError) -> ErrorBody {
 
 /// The relay only accepts YouTube ids, which is also what a host can apply. A local-file row
 /// cannot cross the wire; refusing it here keeps the guest's API from claiming a successful add.
+/// Queue placement is decided by the applying host (`insert_queued_request`), not by this guest,
+/// so the new room-state flags stay defaulted here.
 fn shared_track(item: &SongItem) -> Option<listen_protocol::Track> {
     let track = listen_protocol::Track {
         id: item.video_id.clone(),
@@ -511,6 +513,7 @@ fn shared_track(item: &SongItem) -> Option<listen_protocol::Track> {
         duration_ms: duration_secs(item.duration.as_deref()).unwrap_or(0) as i64 * 1000,
         queued_by: item.queued_by.clone(),
         submitted_by: item.submitted_by.clone(),
+        ..Default::default()
     };
     crate::listentogether::shareable(&track).then_some(track)
 }

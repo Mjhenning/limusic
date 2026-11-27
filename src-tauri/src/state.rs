@@ -6540,6 +6540,10 @@ pub(crate) fn song_to_track(s: &SongItem) -> Track {
         duration_ms: parse_duration_ms(s.duration.as_deref()),
         queued_by: s.queued_by.clone(),
         submitted_by: s.submitted_by.clone(),
+        queued: s.queued,
+        queued_end: s.queued_end,
+        queued_from: s.queued_from.clone(),
+        autoplay: s.autoplay,
     }
 }
 
@@ -6703,10 +6707,10 @@ fn track_to_song(t: &Track) -> SongItem {
         rating: None,
         queued_by: t.queued_by.clone(),
         submitted_by: t.submitted_by.clone(),
-        queued: false,
-        queued_end: false,
-        queued_from: None,
-        autoplay: false,
+        queued: t.queued,
+        queued_end: t.queued_end,
+        queued_from: t.queued_from.clone(),
+        autoplay: t.autoplay,
         is_video: false,
         // Not on the wire either; `lt_apply_change_track` backfills it from the guest's `/player`.
         is_episode: false,
@@ -7575,9 +7579,9 @@ mod tests {
         history_threshold, is_mix, loudness_gain, merge_radio, next_index, parse_duration_ms,
         persist_fingerprint, playlist_context, prefer_version, prev_track_title, put_url,
         queue_fingerprint, queue_neighbors_from_snapshot, radio_seed_for, remote_list,
-        retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into,
-        stamp_host_attribution, swap_version, trim_played, twin_position, unshuffled,
-        upcoming_queued, AppState, HubDedupe, QueueState, RepeatMode, VideoUrls,
+        retain_upcoming, shuffle_new_queue, shuffle_upcoming, song_to_track, splice_radio_into,
+        stamp_host_attribution, swap_version, track_to_song, trim_played, twin_position,
+        unshuffled, upcoming_queued, AppState, HubDedupe, QueueState, RepeatMode, VideoUrls,
         CONTROL_API_SEARCH_RECORD_HISTORY, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
     };
 
@@ -8113,6 +8117,23 @@ mod tests {
         assert_eq!(guest_insert_index(&items, 0), 1);
         // Empty queue (nothing playing yet) → index 0… clamped, no panic.
         assert_eq!(guest_insert_index(&[], 0), 0);
+    }
+
+    #[test]
+    fn room_sync_keeps_the_play_next_block_for_the_new_host() {
+        // A synced SR row must still look like a queued row when this guest becomes host; without
+        // the room-state flags, the next play-next add landed on top of it instead of behind it.
+        let sr = innertube::SongItem {
+            queued_from: Some("twitch".into()),
+            ..song("sr", Some("viewer"))
+        };
+        let synced = track_to_song(&song_to_track(&sr));
+        assert!(synced.queued);
+        assert_eq!(synced.queued_by.as_deref(), Some("viewer"));
+        assert_eq!(synced.queued_from.as_deref(), Some("twitch"));
+
+        let items = vec![song("a", None), synced, song("b", None)];
+        assert_eq!(guest_insert_index(&items, 0), 2);
     }
 
     // "Start radio" on the song that's already playing: the track keeps playing, the tail is

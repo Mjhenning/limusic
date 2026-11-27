@@ -1661,6 +1661,11 @@ export interface LtTrack {
 	queued_by?: string | null;
 	/** Room client that forwarded the row when `queued_by` is a bot's requester. */
 	submitted_by?: string | null;
+	/** Manual-queue placement, kept through sync so a new host still stacks play-next adds. */
+	queued?: boolean;
+	queued_end?: boolean;
+	queued_from?: string | null;
+	autoplay?: boolean;
 }
 export interface LtPendingJoin {
 	userId: string;

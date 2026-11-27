@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// A track in the shared room. `id` is a raw YouTube videoId — the client resolves and plays it
 /// locally through the normal orchestrator; the server only relays it (context/19 Part B §6).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Track {
     pub id: String,
     pub title: String,
@@ -29,6 +29,19 @@ pub struct Track {
     /// requester instead. Defaulted so base clients and older devices ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submitted_by: Option<String>,
+    /// Manual-queue placement of this row in the host's real queue. Room state used to carry only
+    /// the metadata above, so a guest that became host lost the distinction between a play-next
+    /// add and the upcoming playlist: the next add landed at `current + 1` and displaced an SR
+    /// that was already there. These mirror the local `SongItem` flags and are additive — base
+    /// clients ignore them and old hosts send them as `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub queued: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub queued_end: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_from: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub autoplay: bool,
 }
 
 /// A room participant.
@@ -580,6 +593,7 @@ mod tests {
                 duration_ms: 180_000,
                 queued_by: None,
                 submitted_by: None,
+                ..Default::default()
             }),
             queue: Some(vec![]),
             playing: true,
@@ -664,6 +678,29 @@ mod tests {
         let p: Playback = serde_json::from_str(old_playback).unwrap();
         assert_eq!(p.shuffle, None);
         assert_eq!(p.repeat, None);
+    }
+
+    #[test]
+    fn track_queue_flags_survive_room_state() {
+        // A base host's track line stays byte-identical; the new flags default off.
+        let old = r#"{"id":"vid","title":"t","artist":"a","thumbnail":null,"duration_ms":0}"#;
+        let parsed: Track = serde_json::from_str(old).unwrap();
+        assert!(!parsed.queued && !parsed.queued_end && !parsed.autoplay);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), old);
+
+        let queued = Track {
+            id: "vid".into(),
+            title: "t".into(),
+            artist: "a".into(),
+            queued: true,
+            queued_from: Some("album".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&queued).unwrap();
+        assert!(json.contains("\"queued\":true"));
+        assert!(json.contains("\"queued_from\":\"album\""));
+        assert!(!json.contains("queued_end") && !json.contains("autoplay"));
+        assert_eq!(serde_json::from_str::<Track>(&json).unwrap(), queued);
     }
 
     #[test]
@@ -892,6 +929,7 @@ mod tests {
             duration_ms: 0,
             queued_by: None,
             submitted_by: None,
+            ..Default::default()
         }
     }
 
