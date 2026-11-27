@@ -1597,7 +1597,6 @@ impl AppState {
             return;
         }
         if self.lt.is_guest().await {
-            self.emit_guest_hint();
             return;
         }
         // A mix has no "rest of the playlist" worth walking (see `is_mix`) — drop the token.
@@ -1683,7 +1682,6 @@ impl AppState {
         start: Option<f64>,
     ) -> Result<(), String> {
         if self.lt.is_guest().await {
-            self.emit_guest_hint();
             return Ok(());
         }
         // Guarded here rather than in each menu: everything without a YouTube item behind it
@@ -2159,7 +2157,7 @@ impl AppState {
             return;
         }
         if self.lt.is_guest().await {
-            self.emit_guest_hint(); // guest playback is host-driven
+            // Guest playback is host-driven.
             return;
         }
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2197,7 +2195,6 @@ impl AppState {
     /// the same way. The reload is the failed-track retry's (`on_track_failed`).
     pub async fn switch_version(self: &std::sync::Arc<Self>) {
         if self.lt.is_guest().await {
-            self.emit_guest_hint();
             return;
         }
         {
@@ -4325,14 +4322,6 @@ impl AppState {
         );
     }
 
-    /// Guest tried a host-only playback action — explain instead of silently ignoring.
-    fn emit_guest_hint(&self) {
-        let _ = self.app.emit(
-            "playback-notice",
-            serde_json::json!({ "message": "The host controls playback — click a song to add it to the session queue" }),
-        );
-    }
-
     /// A transient toast. Same channel as [`Self::emit_skip`], for messages that phrase themselves.
     fn emit_notice(&self, message: &str) {
         tracing::info!(message, "playback notice");
@@ -5488,7 +5477,6 @@ impl AppState {
             return;
         }
         if self.lt.is_guest().await {
-            self.emit_guest_hint();
             return;
         }
         let shuffle = {
@@ -5571,7 +5559,6 @@ impl AppState {
         next: impl FnOnce(RepeatMode) -> RepeatMode,
     ) {
         if self.lt.is_guest().await {
-            self.emit_guest_hint();
             return;
         }
         let mode = {
@@ -6462,7 +6449,6 @@ impl AppState {
     /// a Listen Together guest's. Starting it is the takeover that pauses the other device.
     pub async fn link_continue_here(self: &std::sync::Arc<Self>) {
         if self.lt.is_guest().await {
-            self.emit_guest_hint();
             return;
         }
         let Some((track, _, _)) = self.link.handoff() else { return };
