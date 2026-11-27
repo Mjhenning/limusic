@@ -5085,6 +5085,10 @@ impl AppState {
                 self.apply_crossfade().await;
                 self.lt_apply_state(state).await
             }
+            SyncCommand::AdoptState(state) => {
+                self.apply_crossfade().await;
+                self.lt_adopt_state(state).await
+            }
             SyncCommand::ChangeTrack { track: Some(track), position_ms, playing, queue } => {
                 self.lt_apply_change_track(track, position_ms, playing, queue).await
             }
@@ -5157,6 +5161,48 @@ impl AppState {
             self.lt_apply_change_track(track, state.position_ms, state.is_playing, state.queue)
                 .await;
         }
+    }
+
+    /// Promotion: continue the track we were already playing as a guest and take over the old
+    /// host's queue snapshot. Reloading here would silence the room; rebuilding only the queue
+    /// keeps the play-next block (with its flags) so the first add after handoff stacks behind it.
+    async fn lt_adopt_state(self: &std::sync::Arc<Self>, state: listen_protocol::RoomState) {
+        self.apply_shared_control_flags(SharedControlFlags {
+            shuffle: state.shuffle,
+            repeat: state.repeat.clone(),
+            capable_guests: None,
+        })
+        .await;
+        let Some(track) = state.current_track else {
+            let _ = self.player.pause();
+            self.lt_mirror_queue(state.queue).await;
+            return;
+        };
+        // The normal case: we were following this exact track, so only the queue needs replacing.
+        // Fall back to a full load if the snapshot caught us before we synced (or on a local file).
+        let loaded = {
+            let q = self.queue.lock().await;
+            q.items.get(q.current).is_some_and(|i| i.video_id == track.id)
+        };
+        if !loaded {
+            self.lt_apply_change_track(track, state.position_ms, state.is_playing, state.queue)
+                .await;
+            return;
+        }
+        {
+            let mut q = self.queue.lock().await;
+            adopt_room_queue(&mut q, Some(&track), &state.queue);
+        }
+        let _ = if state.is_playing { self.player.play() } else { self.player.pause() };
+        let gen = self.generation.load(Ordering::SeqCst);
+        self.emit_queue().await;
+        self.persist_queue().await;
+        // `Release` may have primed the old queue; replace that lookahead with the adopted one.
+        self.prime_lookahead(gen).await;
+        // Tell the room and any linked device what the new host is now playing, including the
+        // restored queue, so later adds are mirrored from this snapshot.
+        let position_ms = (self.current_position() * 1000.0) as i64;
+        self.lt_broadcast_current_track(position_ms, state.is_playing).await;
     }
 
     /// Guest: load a host-chosen track, seek to its live position, set play/pause, mirror the queue.
@@ -6516,6 +6562,55 @@ impl AppState {
     }
 }
 
+/// Replace the local queue with the outgoing host's snapshot on promotion. The current wire row
+/// has no album/artist-run/video metadata, so keep what the guest already resolved for the track it
+/// is still playing. Everything after it comes from the host and keeps its play-next flags.
+fn adopt_room_queue(q: &mut QueueState, current: Option<&Track>, upcoming: &[Track]) {
+    let rich = q.items.get(q.current).cloned();
+    let mut items = Vec::with_capacity(upcoming.len() + usize::from(current.is_some()));
+    if let Some(track) = current {
+        let mut song = track_to_song(track);
+        if let Some(old) = rich.filter(|i| i.video_id == song.video_id) {
+            song.artist_id = old.artist_id;
+            song.artist_runs = old.artist_runs;
+            song.album = old.album;
+            song.album_id = old.album_id;
+            song.play_count = old.play_count;
+            song.set_video_id = old.set_video_id;
+            song.added_by = old.added_by;
+            song.added_by_avatars = old.added_by_avatars;
+            song.added_at = old.added_at;
+            song.rating = old.rating;
+            song.duration = song.duration.or(old.duration);
+            song.thumbnail = song.thumbnail.or(old.thumbnail);
+            song.is_video = old.is_video;
+            song.is_episode = old.is_episode;
+            song.counterpart = old.counterpart;
+            song.counterpart_thumbnail = old.counterpart_thumbnail;
+            song.counterpart_segments = old.counterpart_segments;
+            song.is_upload = old.is_upload;
+            song.explicit = old.explicit;
+            song.library = old.library;
+        }
+        items.push(song);
+    }
+    items.extend(upcoming.iter().map(track_to_song));
+    q.items = items;
+    q.current = 0;
+    q.epoch += 1;
+    q.prev_context = None;
+    q.lookahead_loaded = None;
+    q.lookahead_client = None;
+    q.lookahead_loudness_db = None;
+    q.lookahead_playback_ping = None;
+    q.shuffle_orig = None;
+    q.radio_seed = None;
+    q.radio = false;
+    q.hydrating = None;
+    q.source_name = None;
+    q.source_id = None;
+}
+
 /// Attribute room adds without losing a bot's requester. A nameless add keeps the old single pill
 /// (the host); when `queued_by` is a bot's `requested_by`, the host becomes `submitted_by` so the
 /// queue can show both names. A guest's forwarded row already carries its submitter and is left
@@ -7574,11 +7669,11 @@ mod tests {
     use listen_protocol::RemoteAction;
 
     use super::{
-        adopt_playlist_twins, adopt_twin, append_page, backfill_metadata, cache_horizon,
-        drop_duplicates, enqueue_at, format_duration, freshen, get_url, guest_insert_index,
-        history_threshold, is_mix, loudness_gain, merge_radio, next_index, parse_duration_ms,
-        persist_fingerprint, playlist_context, prefer_version, prev_track_title, put_url,
-        queue_fingerprint, queue_neighbors_from_snapshot, radio_seed_for, remote_list,
+        adopt_playlist_twins, adopt_room_queue, adopt_twin, append_page, backfill_metadata,
+        cache_horizon, drop_duplicates, enqueue_at, format_duration, freshen, get_url,
+        guest_insert_index, history_threshold, is_mix, loudness_gain, merge_radio, next_index,
+        parse_duration_ms, persist_fingerprint, playlist_context, prefer_version, prev_track_title,
+        put_url, queue_fingerprint, queue_neighbors_from_snapshot, radio_seed_for, remote_list,
         retain_upcoming, shuffle_new_queue, shuffle_upcoming, song_to_track, splice_radio_into,
         stamp_host_attribution, swap_version, track_to_song, trim_played, twin_position,
         unshuffled, upcoming_queued, AppState, HubDedupe, QueueState, RepeatMode, VideoUrls,
@@ -8134,6 +8229,31 @@ mod tests {
 
         let items = vec![song("a", None), synced, song("b", None)];
         assert_eq!(guest_insert_index(&items, 0), 2);
+    }
+
+    #[test]
+    fn promotion_adopts_the_old_hosts_play_next_block() {
+        // The promoted guest had never seen the two earlier adds: adopting the relay's snapshot
+        // must restore them, or the next play-next lands at current+1 and jumps the queue.
+        let current = song_to_track(&song("now", None));
+        let pending: Vec<_> = ["sr1", "sr2"]
+            .iter()
+            .map(|id| {
+                song_to_track(&innertube::SongItem {
+                    queued: true,
+                    queued_by: Some("viewer".into()),
+                    ..song(id, None)
+                })
+            })
+            .collect();
+        let mut q =
+            QueueState { items: vec![song("now", None)], current: 0, ..QueueState::default() };
+        adopt_room_queue(&mut q, Some(&current), &pending);
+
+        let ids: Vec<_> = q.items.iter().map(|i| i.video_id.as_str()).collect();
+        assert_eq!(ids, ["now", "sr1", "sr2"]);
+        assert!(q.items[1..].iter().all(|i| i.queued));
+        assert_eq!(guest_insert_index(&q.items, 0), 3);
     }
 
     // "Start radio" on the song that's already playing: the track keeps playing, the tail is

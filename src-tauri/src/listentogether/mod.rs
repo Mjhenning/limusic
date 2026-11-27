@@ -33,6 +33,9 @@ pub enum SyncCommand {
     /// Full state (after join / reconnect / request-sync): resolve current track, seek to live
     /// position, set play/pause, mirror the queue.
     ApplyState(RoomState),
+    /// We just became host: take over the outgoing host's snapshot without reloading what we are
+    /// already playing, so play-next flags/order survive the handoff.
+    AdoptState(RoomState),
     /// `track` is `None` when the host is on something a guest can't play (a local file).
     ChangeTrack {
         track: Option<Track>,
@@ -205,6 +208,9 @@ struct Inner {
     users: Vec<User>,
     current_track: Option<Track>,
     queue: Vec<Track>,
+    /// We were promoted to host and asked the previous one for its state. The first `SyncState`
+    /// back is ours to adopt instead of ignoring it because we are no longer a guest.
+    adopt_next_state: bool,
     pending_joins: Vec<(String, String)>, // (user_id, username)
     suggestions: Vec<Suggestion>,
     outbound: Option<mpsc::UnboundedSender<ClientMessage>>,
@@ -267,6 +273,7 @@ impl Inner {
         self.users.clear();
         self.current_track = None;
         self.queue.clear();
+        self.adopt_next_state = false;
         self.pending_joins.clear();
         self.suggestions.clear();
         self.outbound = None;
@@ -1695,10 +1702,14 @@ impl LtSession {
                         // The server re-sends these to the new host; ours can't be acted on now.
                         inner.pending_joins.clear();
                         inner.suggestions.clear();
+                        inner.adopt_next_state = false;
                     }
                     became
                 };
                 if became_host {
+                    // The relay kept the old host's room state. Pull it now and adopt it: a guest
+                    // that never saw an earlier play-next add would otherwise insert at current+1.
+                    self.inner.lock().await.adopt_next_state = true;
                     // The relay cleared the old host's opt-in; announce ours and pull the reset
                     // state before any new guest can ask to control us.
                     self.announce_shared_control().await;
@@ -1723,11 +1734,16 @@ impl LtSession {
             }
 
             ServerMessage::SyncState { state } => {
-                {
+                let adopt = {
                     let mut inner = self.inner.lock().await;
                     inner.absorb(&state);
-                }
-                if self.inner.lock().await.role == Role::Guest {
+                    let adopt = inner.adopt_next_state;
+                    inner.adopt_next_state = false;
+                    adopt
+                };
+                if adopt {
+                    let _ = self.sync_tx.send(SyncCommand::AdoptState(state));
+                } else if self.inner.lock().await.role == Role::Guest {
                     let _ = self.sync_tx.send(SyncCommand::ApplyState(state));
                 }
             }
