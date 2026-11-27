@@ -536,50 +536,62 @@
 											? ` ${t('dialogs.listen_together.you')}`
 											: ''}
 									</span>
-									{#if capabilityOf(u.user_id, u.is_host).host}
-										<span
-											class="shrink-0 rounded-full border border-green-500/40 bg-green-500/10 px-1.5 py-px text-[10px] font-medium leading-tight text-green-600"
-											title={t('dialogs.listen_together.host_allows_hint')}
-										>
-											{t('dialogs.listen_together.host_allows')}
-										</span>
-									{/if}
-									{#if capabilityOf(u.user_id, u.is_host).api}
-										<span
-											class="shrink-0 rounded-full border border-primary/40 bg-primary/10 px-1.5 py-px text-[10px] font-medium leading-tight text-primary"
-											title={t('dialogs.listen_together.capable_api_hint')}
-										>
-											{t('dialogs.listen_together.capable_api')}
-										</span>
-									{/if}
-									{#if capabilityOf(u.user_id, u.is_host).ui}
-										<span
-											class="shrink-0 rounded-full border border-sky-500/40 bg-sky-500/10 px-1.5 py-px text-[10px] font-medium leading-tight text-sky-600"
-											title={t('dialogs.listen_together.capable_ui_hint')}
-										>
-											{t('dialogs.listen_together.capable_ui')}
-										</span>
-									{/if}
-									{#if u.is_host}
-										<HugeiconsIcon icon={CrownIcon} class="h-3.5 w-3.5 shrink-0 text-amber-500" />
-									{/if}
-									{#if isHost && u.user_id !== lt.myId}
-										<!-- Revealed on hover, but always in the tab order and always named. -->
-										<button
-											class="shrink-0 cursor-pointer rounded-md p-1 text-muted-foreground opacity-0 transition hover:bg-muted hover:text-foreground focus-visible:shown group-hover:shown"
-											onclick={() => api.ltTransferHost(u.user_id)}
-										>
-											<HugeiconsIcon icon={Exchange01Icon} class="h-4 w-4" />
-											<span class="sr-only">{t('dialogs.listen_together.make_host')}</span>
-										</button>
-										<button
-											class="shrink-0 cursor-pointer rounded-md p-1 text-muted-foreground opacity-0 transition hover:bg-muted hover:text-destructive focus-visible:shown group-hover:shown"
-											onclick={() => api.ltKick(u.user_id)}
-										>
-											<HugeiconsIcon icon={UserRemove01Icon} class="h-4 w-4" />
-											<span class="sr-only">{t('dialogs.listen_together.remove')}</span>
-										</button>
-									{/if}
+									<!-- One right-anchored cluster: badges sit flush right at rest, and the
+									     hover actions take their width from the end so the badges slide left. -->
+									<div class="ml-auto flex shrink-0 items-center">
+										{#if capabilityOf(u.user_id, u.is_host).host}
+											<span
+												class="ml-1.5 shrink-0 rounded-full border border-green-500/40 bg-green-500/10 px-1.5 py-px text-[10px] font-medium leading-tight text-green-600"
+												title={t('dialogs.listen_together.host_allows_hint')}
+											>
+												{t('dialogs.listen_together.host_allows')}
+											</span>
+										{/if}
+										{#if capabilityOf(u.user_id, u.is_host).api}
+											<span
+												class="ml-1.5 shrink-0 rounded-full border border-primary/40 bg-primary/10 px-1.5 py-px text-[10px] font-medium leading-tight text-primary"
+												title={t('dialogs.listen_together.capable_api_hint')}
+											>
+												{t('dialogs.listen_together.capable_api')}
+											</span>
+										{/if}
+										{#if capabilityOf(u.user_id, u.is_host).ui}
+											<span
+												class="ml-1.5 shrink-0 rounded-full border border-sky-500/40 bg-sky-500/10 px-1.5 py-px text-[10px] font-medium leading-tight text-sky-600"
+												title={t('dialogs.listen_together.capable_ui_hint')}
+											>
+												{t('dialogs.listen_together.capable_ui')}
+											</span>
+										{/if}
+										{#if u.is_host}
+											<HugeiconsIcon
+												icon={CrownIcon}
+												class="ml-1.5 h-3.5 w-3.5 shrink-0 text-amber-500"
+											/>
+										{/if}
+										{#if isHost && u.user_id !== lt.myId}
+											<!-- Always in the tab order and named; focus-within reveals it too. The
+											     animated width is the slide, not an opacity trick. -->
+											<div
+												class="flex w-0 items-center justify-end gap-0.5 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-150 ease-out group-hover:ml-1.5 group-hover:w-16 group-hover:shown focus-within:ml-1.5 focus-within:w-16 focus-within:shown"
+											>
+												<button
+													class="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:bg-muted focus-visible:text-foreground"
+													onclick={() => api.ltTransferHost(u.user_id)}
+												>
+													<HugeiconsIcon icon={Exchange01Icon} class="h-4 w-4" />
+													<span class="sr-only">{t('dialogs.listen_together.make_host')}</span>
+												</button>
+												<button
+													class="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-destructive focus-visible:bg-muted focus-visible:text-destructive"
+													onclick={() => api.ltKick(u.user_id)}
+												>
+													<HugeiconsIcon icon={UserRemove01Icon} class="h-4 w-4" />
+													<span class="sr-only">{t('dialogs.listen_together.remove')}</span>
+												</button>
+											</div>
+										{/if}
+									</div>
 								</div>
 							{/each}
 						</div>
