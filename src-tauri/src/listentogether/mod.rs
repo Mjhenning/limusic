@@ -174,7 +174,7 @@ fn peer_for_user(inner: &Inner, user_id: &str) -> SharedControlPeer {
 /// Map relay errors to the same diagnostics the dialog and the guest HTTP error show.
 fn shared_link_error(code: &str, message: &str) -> String {
     match code {
-        "no_device" => "the host is not allowing shared control for this room".into(),
+        "no_device" | "no_player" => "the host is not allowing shared control for this room".into(),
         "room_full" => {
             "too many guests are using shared control in this room; retry shortly".into()
         }
@@ -182,6 +182,12 @@ fn shared_link_error(code: &str, message: &str) -> String {
         "server_full" => "the Listen Together server is full; retry shortly".into(),
         _ => message.to_string(),
     }
+}
+
+/// A link-room answer that only means "the host isn't here yet". The socket stays open so the
+/// host's next `UserJoined` can resume the handshake; every other link error is fatal.
+fn shared_link_error_is_absent_host(code: &str) -> bool {
+    matches!(code, "no_device" | "no_player")
 }
 
 #[derive(Default)]
@@ -1020,6 +1026,9 @@ impl LtSession {
                             let mut inner = self.inner.lock().await;
                             inner.shared_link_ready = ready;
                             inner.shared_link_users = users;
+                            if !ready {
+                                inner.shared_link_host_allows = false;
+                            }
                         }
                         if !ready {
                             self.set_shared_link_reason(Some(
@@ -1050,6 +1059,18 @@ impl LtSession {
                                 inner.shared_link_reason = None;
                             }
                             self.send_guest_hello().await;
+                            self.emit_state().await;
+                        }
+                    }
+                    ServerMessage::UserLeft { user_id }
+                    | ServerMessage::UserDisconnected { user_id } => {
+                        if user_id == host_id {
+                            {
+                                let mut inner = self.inner.lock().await;
+                                inner.shared_link_ready = false;
+                                inner.shared_link_host_allows = false;
+                                inner.shared_link_reason = None;
+                            }
                             self.emit_state().await;
                         }
                     }
@@ -1088,7 +1109,12 @@ impl LtSession {
                     }
                     ServerMessage::Error { code, message } => {
                         self.set_shared_link_reason(Some(shared_link_error(&code, &message))).await;
-                        break;
+                        // The host may not have opted in yet. Staying connected lets its next
+                        // `UserJoined` retry the handshake instead of flickering the label on every
+                        // reconnect. Every other link error still needs a fresh socket.
+                        if !shared_link_error_is_absent_host(&code) {
+                            break;
+                        }
                     }
                     _ => {}
                 }
@@ -1118,29 +1144,42 @@ impl LtSession {
         }
     }
 
+    /// Build the guest handshake for the current room. A link room's default `Remote` target is its
+    /// "player" device, which stays empty until a device-link control claims it; a broadcast hello
+    /// would therefore get `no_player` instead of reaching the Listen Together host. Address the
+    /// deterministic host device directly, using the same id the host joins with.
+    fn guest_hello_message(inner: &Inner) -> Option<ClientMessage> {
+        let code = inner.room_code.as_deref()?;
+        let me = inner.my_id.as_deref().unwrap_or_default();
+        let username = inner
+            .users
+            .iter()
+            .find(|u| u.user_id == me)
+            .map(|u| u.username.clone())
+            .unwrap_or_default();
+        let (_, host_id) = shared_link_keys(code);
+        Some(ClientMessage::Remote {
+            action: SharedControlEnvelope::ParticipantHello {
+                user_id: me.to_string(),
+                username,
+                api_enabled: inner.control_api_enabled,
+                ui_control: inner.client_control_enabled,
+            }
+            .to_value(),
+            to: Some(host_id),
+        })
+    }
+
     /// Guest: (re)advertise API/UI capability on the open hidden-link socket. The host derives the
     /// user id from the link device id, so the payload only supplies display data and flags.
     async fn send_guest_hello(&self) {
-        let (user_id, username, api_enabled, ui_control) = {
+        let message = {
             let inner = self.inner.lock().await;
-            let username = inner
-                .my_id
-                .as_deref()
-                .and_then(|me| inner.users.iter().find(|u| u.user_id == me))
-                .map(|u| u.username.clone())
-                .unwrap_or_default();
-            (
-                inner.my_id.clone().unwrap_or_default(),
-                username,
-                inner.control_api_enabled,
-                inner.client_control_enabled,
-            )
+            Self::guest_hello_message(&inner)
         };
-        let action =
-            SharedControlEnvelope::ParticipantHello { user_id, username, api_enabled, ui_control }
-                .to_value();
-        if let Some(tx) = self.guest_link_outbound.lock().await.clone() {
-            let _ = tx.send(ClientMessage::Remote { action, to: None });
+        if let (Some(tx), Some(message)) = (self.guest_link_outbound.lock().await.clone(), message)
+        {
+            let _ = tx.send(message);
         }
     }
 
@@ -2098,6 +2137,52 @@ mod tests {
         assert!(secret.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
         assert!(host_id.starts_with("sc-host-"));
         assert_ne!(secret, shared_link_keys("ABCD1235").0);
+    }
+
+    #[test]
+    fn guest_hello_targets_the_hidden_host_device() {
+        let mut inner = Inner::default();
+        inner.room_code = Some("ABCD1234".into());
+        inner.my_id = Some("room-guest".into());
+        inner.users.push(User {
+            user_id: "room-guest".into(),
+            username: "Guest".into(),
+            is_host: false,
+            is_connected: true,
+        });
+        inner.control_api_enabled = true;
+        inner.client_control_enabled = true;
+
+        let Some(ClientMessage::Remote { to, action }) = LtSession::guest_hello_message(&inner)
+        else {
+            panic!("a joined guest must have a hello");
+        };
+        let expected_host = shared_link_keys("ABCD1234").1;
+        assert_eq!(to.as_deref(), Some(expected_host.as_str()));
+        let Ok(SharedControlEnvelope::ParticipantHello {
+            user_id,
+            username,
+            api_enabled,
+            ui_control,
+        }) = serde_json::from_value::<SharedControlEnvelope>(action)
+        else {
+            panic!("the hello must be a ParticipantHello");
+        };
+        assert_eq!(user_id, "room-guest");
+        assert_eq!(username, "Guest");
+        assert!(api_enabled && ui_control);
+    }
+
+    #[test]
+    fn a_missing_host_is_not_a_fatal_link_error() {
+        assert!(shared_link_error_is_absent_host("no_device"));
+        assert!(shared_link_error_is_absent_host("no_player"));
+        assert!(!shared_link_error_is_absent_host("room_full"));
+        assert!(!shared_link_error_is_absent_host("bad_secret"));
+        assert_eq!(
+            shared_link_error("no_player", "No other device is playing right now."),
+            "the host is not allowing shared control for this room"
+        );
     }
 
     #[test]
