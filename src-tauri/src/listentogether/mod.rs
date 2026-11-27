@@ -208,6 +208,10 @@ struct Inner {
     users: Vec<User>,
     current_track: Option<Track>,
     queue: Vec<Track>,
+    /// Last queue snapshot we sent as host, keyed by video id. A base client that takes the room
+    /// over drops these manual-queue flags when it re-broadcasts the queue; keeping them here lets
+    /// a later promotion restore play-next order even after passing through such a host.
+    own_queue_flags: HashMap<String, Track>,
     /// We were promoted to host and asked the previous one for its state. The first `SyncState`
     /// back is ours to adopt instead of ignoring it because we are no longer a guest.
     adopt_next_state: bool,
@@ -273,6 +277,7 @@ impl Inner {
         self.users.clear();
         self.current_track = None;
         self.queue.clear();
+        self.own_queue_flags.clear();
         self.adopt_next_state = false;
         self.pending_joins.clear();
         self.suggestions.clear();
@@ -1314,9 +1319,15 @@ impl LtSession {
     /// Host: broadcast a playback action to the room. No-op unless we're the host and connected.
     pub async fn broadcast_playback(&self, mut p: Playback) {
         keep_shareable(&mut p);
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
         if inner.role != Role::Host {
             return;
+        }
+        // Remember what we told the room: if a base client takes over and strips these flags from
+        // its own broadcasts, we can put them back on the rows we still recognize later.
+        if let Some(queue) = &p.queue {
+            inner.own_queue_flags.clear();
+            inner.own_queue_flags.extend(queue.iter().map(|t| (t.id.clone(), t.clone())));
         }
         if let Some(tx) = &inner.outbound {
             let _ = tx.send(ClientMessage::Playback(p));
@@ -1576,6 +1587,10 @@ impl LtSession {
     /// Handle one server message. Returns `true` if the connection should close (fatal).
     async fn handle(self: &Arc<Self>, mut sm: ServerMessage) -> bool {
         sanitize(&mut sm);
+        {
+            let inner = self.inner.lock().await;
+            restore_queue_flags(&mut sm, &inner.own_queue_flags);
+        }
         match sm {
             ServerMessage::Pong => return false,
             // Device-link messages never arrive on a Listen Together socket. Shared control uses
@@ -1945,6 +1960,49 @@ pub(crate) fn stamp_shared_action(action: RemoteAction, by: Option<&str>) -> Rem
     }
 }
 
+/// Put the manual-queue flags we last sent as host back onto rows a base client stripped. Only
+/// rows with no placement of their own and the same requester are restored, so a fork host's own
+/// flags and a genuinely new add are left alone.
+fn restore_queue_flags(sm: &mut ServerMessage, remembered: &HashMap<String, Track>) {
+    if remembered.is_empty() {
+        return;
+    }
+    let restore = |t: &mut Track| {
+        if t.queued || t.queued_end || t.autoplay {
+            return;
+        }
+        let Some(old) = remembered.get(&t.id) else { return };
+        if old.queued_by != t.queued_by || old.submitted_by != t.submitted_by {
+            return;
+        }
+        t.queued = old.queued;
+        t.queued_end = old.queued_end;
+        t.queued_from = old.queued_from.clone();
+        t.autoplay = old.autoplay;
+    };
+    match sm {
+        ServerMessage::RoomCreated { state, .. }
+        | ServerMessage::JoinApproved { state, .. }
+        | ServerMessage::Reconnected { state, .. }
+        | ServerMessage::SyncState { state }
+        | ServerMessage::LinkJoined { state, .. } => {
+            state.queue.iter_mut().for_each(restore);
+            if let Some(t) = state.current_track.as_mut() {
+                restore(t);
+            }
+        }
+        ServerMessage::SyncPlayback(p) => {
+            if let Some(q) = p.queue.as_mut() {
+                q.iter_mut().for_each(restore);
+            }
+            if let Some(t) = p.track.as_mut() {
+                restore(t);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn keep_shareable(p: &mut Playback) {
     p.track = p.track.take().filter(shareable);
     if let Some(q) = &mut p.queue {
@@ -2088,6 +2146,41 @@ mod tests {
 
         assert!(!shareable(&track("../../etc/pas")));
         assert!(shareable(&track("a-B_c123456")));
+    }
+
+    #[test]
+    fn base_host_broadcasts_keep_our_play_next_flags() {
+        let mut remembered = HashMap::new();
+        let mut sr = track("a");
+        sr.queued = true;
+        sr.queued_by = Some("viewer".into());
+        sr.queued_from = Some("Play next".into());
+        remembered.insert(sr.id.clone(), sr);
+
+        let mut other_requester = track("b");
+        other_requester.queued_by = Some("someone_else".into());
+        let mut stale = track("b");
+        stale.queued = true;
+        stale.queued_by = Some("original".into());
+        remembered.insert("b".into(), stale);
+
+        let mut fork_flagged = track("c");
+        fork_flagged.queued_end = true;
+        fork_flagged.queued_by = Some("viewer".into());
+        remembered.insert("c".into(), track("c"));
+
+        let mut plain = track("a");
+        plain.queued_by = Some("viewer".into());
+        let mut p = Playback::new(PlaybackKind::SyncQueue);
+        p.queue = Some(vec![plain, other_requester, fork_flagged]);
+        let mut sm = ServerMessage::SyncPlayback(p);
+        restore_queue_flags(&mut sm, &remembered);
+        let ServerMessage::SyncPlayback(got) = sm else { unreachable!() };
+        let queue = got.queue.unwrap();
+        assert!(queue[0].queued);
+        assert_eq!(queue[0].queued_from.as_deref(), Some("Play next"));
+        assert!(!queue[1].queued && !queue[1].queued_end);
+        assert!(queue[2].queued_end);
     }
 
     #[test]
