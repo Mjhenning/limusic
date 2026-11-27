@@ -2622,6 +2622,18 @@ pub async fn lt_get_state(state: St<'_>) -> Result<serde_json::Value, String> {
     Ok(state.lt.snapshot().await)
 }
 
+/// Turn this desktop's player buttons into host-bound controls. Persisted separately from the
+/// Control API and pushed to the hidden link so the host's badge changes live.
+#[tauri::command]
+pub async fn lt_set_client_control(state: St<'_>, on: bool) -> Result<(), String> {
+    state.db.set_setting(
+        crate::integrations::settings::LT_CLIENT_CONTROL_KEY,
+        if on { "true" } else { "false" },
+    );
+    state.lt.set_client_control_enabled(on).await;
+    Ok(())
+}
+
 /// Set + persist the sync server URL (e.g. the Tailscale Funnel `wss://…` address).
 #[tauri::command]
 pub async fn lt_set_server_url(state: St<'_>, url: String) -> Result<(), String> {
@@ -3787,11 +3799,8 @@ pub async fn set_integration_settings(
         .get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY)
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
-    // The opt-in prepares a hidden device-link room when a room starts, so it is a pre-hosting
-    // choice. Other Control API fields stay editable while a bot is connected; only this one is locked.
-    if previous.shared_control != control_api.shared_control && state.lt.in_room().await {
-        return Err("Leave Listen Together before changing shared control.".to_string());
-    }
+    // The opt-in is live: turning it on opens the room-code-derived link immediately, and turning
+    // it off closes it. Guests learn the change from the hidden-link roster, not from room state.
     db.set_setting(
         crate::integrations::settings::CONTROL_API_SETTINGS_KEY,
         &serde_json::to_string(&control_api).map_err(|e| e.to_string())?,
@@ -3812,6 +3821,7 @@ pub async fn set_integration_settings(
         manager.apply_settings(control_api.clone(), reason).await;
     }
     state.lt.set_shared_control_enabled(control_api.shared_control).await;
+    state.lt.set_api_enabled(control_api.enabled).await;
     manager.apply_tuna_settings(tuna).await;
     Ok(())
 }

@@ -1128,12 +1128,20 @@ pub fn run() {
             // Empty means the built-in default, which `LtSession` resolves when it connects. The
             // URL does not live here so that nothing ever has to hand it to the UI.
             let lt_url = db.get_setting("lt_server_url").unwrap_or_default();
-            let lt_shared_control =
+            let lt_control_api =
                 db.get_setting(crate::integrations::settings::CONTROL_API_SETTINGS_KEY)
                     .and_then(|json| serde_json::from_str::<crate::integrations::settings::ControlApiSettings>(&json).ok())
-                    .is_some_and(|settings| settings.shared_control);
-            let (lt, lt_sync_rx) =
-                listentogether::LtSession::new(handle.clone(), lt_url, lt_shared_control);
+                    .unwrap_or_default();
+            let lt_client_control = db
+                .get_setting(crate::integrations::settings::LT_CLIENT_CONTROL_KEY)
+                .is_some_and(|v| v == "true");
+            let (lt, lt_sync_rx) = listentogether::LtSession::new(
+                handle.clone(),
+                lt_url,
+                lt_control_api.shared_control,
+                lt_control_api.enabled,
+                lt_client_control,
+            );
             // Device link: opens a socket only once the user has linked a device.
             let (link, link_rx) = devicelink::LinkSession::new(handle.clone(), db.clone());
 
@@ -1581,6 +1589,7 @@ pub fn run() {
             commands::import_update,
             commands::import_resolve,
             commands::lt_get_state,
+            commands::lt_set_client_control,
             commands::lt_set_server_url,
             commands::lt_create_room,
             commands::lt_join_room,
