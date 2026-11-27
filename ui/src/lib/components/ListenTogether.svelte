@@ -71,9 +71,9 @@
 				: t('dialogs.listen_together.status_disconnected')
 	);
 	const others = $derived(lt.users.filter((u) => u.user_id !== lt.myId).length);
-	const capableGuests = $derived(new Set(lt.sharedControlGuests));
 	const controlOn = $derived(integrations.controlApi);
 	const clientControlOn = $derived(integrations.clientControl);
+	const guestCapable = $derived(controlOn || clientControlOn);
 	const sharedControlLabel = $derived(
 		lt.sharedControlReason
 			? lt.sharedControlReason
@@ -81,10 +81,28 @@
 				? lt.sharedControlEnabled
 					? t('dialogs.listen_together.shared_control_on')
 					: t('dialogs.listen_together.shared_control_off')
-				: clientControlOn
+				: guestCapable
 					? t('dialogs.listen_together.shared_control_guest_on')
-					: t('dialogs.listen_together.shared_control_requires_client_control')
+					: t('dialogs.listen_together.shared_control_requires_capability')
 	);
+
+	type Capability = { api: boolean; ui: boolean; host: boolean };
+
+	/** Capability markers come from the hidden-link roster, never from the relay's stale bit. */
+	function capabilityOf(userId: string, isHostUser: boolean): Capability {
+		if (isHostUser) {
+			return {
+				api: false,
+				ui: false,
+				host: isHost ? lt.sharedControlEnabled : lt.sharedControlHostAllows
+			};
+		}
+		if (userId === lt.myId) {
+			return { api: controlOn, ui: clientControlOn, host: false };
+		}
+		const peer = lt.sharedControlGuests.find((p) => p.userId === userId);
+		return { api: peer?.apiEnabled ?? false, ui: peer?.uiControl ?? false, host: false };
+	}
 
 	function rememberName() {
 		localStorage.setItem('lt_name', name.trim());
@@ -93,13 +111,6 @@
 	/** First letter of a display name, for the participant circles. */
 	function initial(username: string): string {
 		return (username.trim()[0] ?? '?').toUpperCase();
-	}
-
-	/** We always know our own fork and the host; other guests are learned from the hidden link. */
-	function participantCapable(userId: string, isHostUser: boolean): boolean {
-		if (userId === lt.myId) return true;
-		if (isHostUser) return lt.hostSharedControlCapable;
-		return capableGuests.has(userId);
 	}
 
 	/** The default is stored as empty, so typing it in by hand still mints bare invites. */
@@ -405,10 +416,9 @@
 
 				<!-- Everything that grows with the room scrolls; the invite and the footer do not. -->
 				<div class="-mx-1 flex min-w-0 max-h-[38vh] flex-col gap-5 overflow-y-auto px-1">
-					<!-- Guest opt-in for this desktop's player buttons. Deliberately separate from the
-					     Control API switch: a guest should be able to press play without running a
-					     local HTTP server, and an API user should be able to opt out of remote play. -->
-					{#if !isHost && lt.sharedControl && lt.hostSharedControlCapable}
+					<!-- Guest opt-in for this desktop's player buttons. Always available so a guest can
+					     join as suggestion-only and enable control later, without re-joining. -->
+					{#if !isHost}
 						<div
 							class="flex items-center justify-between gap-3 rounded-xl border bg-background/60 px-3 py-2.5 text-left"
 						>
@@ -426,9 +436,8 @@
 						</div>
 					{/if}
 
-					<!-- Host-only readiness panel for the hidden control channel. It lives here, with the
-					     other room facts, rather than in Settings: the counter only means something while
-					     this room is live. -->
+					<!-- Host-only control panel. The opt-in is live: toggling it here opens or closes the
+					     room-code-derived link without leaving the room. -->
 					{#if isHost}
 						<div class="rounded-xl border bg-muted/40 p-3">
 							<div class="flex items-center justify-between gap-2">
@@ -449,6 +458,24 @@
 									max: 7
 								})}
 							</p>
+							<div class="mt-3 flex items-center justify-between gap-3 border-t pt-3">
+								<div class="min-w-0">
+									<p class="text-xs font-medium">
+										{t('dialogs.listen_together.shared_control')}
+									</p>
+									<p class="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+										{!controlOn
+											? t('dialogs.listen_together.shared_control_requires_api')
+											: t('dialogs.listen_together.control_link_live_hint')}
+									</p>
+								</div>
+								<Switch
+									checked={controlOn && lt.sharedControlEnabled}
+									disabled={!controlOn || sharedBusy}
+									aria-label={t('dialogs.listen_together.shared_control')}
+									onCheckedChange={toggleSharedControl}
+								/>
+							</div>
 						</div>
 					{/if}
 
@@ -509,12 +536,28 @@
 											? ` ${t('dialogs.listen_together.you')}`
 											: ''}
 									</span>
-									{#if participantCapable(u.user_id, u.is_host)}
+									{#if capabilityOf(u.user_id, u.is_host).host}
+										<span
+											class="shrink-0 rounded-full border border-green-500/40 bg-green-500/10 px-1.5 py-px text-[10px] font-medium leading-tight text-green-600"
+											title={t('dialogs.listen_together.host_allows_hint')}
+										>
+											{t('dialogs.listen_together.host_allows')}
+										</span>
+									{/if}
+									{#if capabilityOf(u.user_id, u.is_host).api}
 										<span
 											class="shrink-0 rounded-full border border-primary/40 bg-primary/10 px-1.5 py-px text-[10px] font-medium leading-tight text-primary"
-											title={t('dialogs.listen_together.capable_badge_hint')}
+											title={t('dialogs.listen_together.capable_api_hint')}
 										>
-											{t('dialogs.listen_together.capable_badge')}
+											{t('dialogs.listen_together.capable_api')}
+										</span>
+									{/if}
+									{#if capabilityOf(u.user_id, u.is_host).ui}
+										<span
+											class="shrink-0 rounded-full border border-sky-500/40 bg-sky-500/10 px-1.5 py-px text-[10px] font-medium leading-tight text-sky-600"
+											title={t('dialogs.listen_together.capable_ui_hint')}
+										>
+											{t('dialogs.listen_together.capable_ui')}
 										</span>
 									{/if}
 									{#if u.is_host}

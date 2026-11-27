@@ -1672,6 +1672,13 @@ export interface LtSuggestion {
 	from_username: string;
 	track: LtTrack;
 }
+/** A guest currently on the hidden control link, with its live capability markers. */
+export interface LtSharedControlGuest {
+	userId: string;
+	username: string;
+	apiEnabled: boolean;
+	uiControl: boolean;
+}
 export interface LtState {
 	status: 'disconnected' | 'connecting' | 'connected';
 	role: 'none' | 'host' | 'guest';
@@ -1694,8 +1701,13 @@ export interface LtState {
 	sharedControlLinkReady: boolean;
 	/** Connected guests in that hidden room. The relay caps it at 8 devices including the host. */
 	sharedControlLinkGuests: number;
-	/** Room user ids the host has seen on the hidden control link. */
-	sharedControlGuests: string[];
+	/** Guests currently on the hidden control link, with live API/UI capability markers. */
+	sharedControlGuests: LtSharedControlGuest[];
+	/** Host answered the hidden-link handshake with its current opt-in. */
+	sharedControlHostAllows: boolean;
+	/** Mirrors of this client's two capability switches, pushed through the link. */
+	sharedControlApiEnabled: boolean;
+	sharedControlClientControl: boolean;
 	/** Legacy relay/host/guest capability facts mirrored from the room state. */
 	sharedControlCapable: boolean;
 	sharedControl: boolean;
@@ -1712,6 +1724,8 @@ export interface ControlFeedback {
 }
 
 export const ltGetState = () => invoke<LtState>('lt_get_state');
+export const ltSetClientControl = (on: boolean) =>
+	invoke<void>('lt_set_client_control', { on });
 export const ltSetServerUrl = (url: string) => invoke<void>('lt_set_server_url', { url });
 export const ltCreateRoom = (username: string) => invoke<void>('lt_create_room', { username });
 export const ltJoinRoom = (code: string, username: string) =>

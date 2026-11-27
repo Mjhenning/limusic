@@ -37,6 +37,8 @@ const dialog = join(here, 'components', 'SettingsDialog.svelte');
 const store = join(here, 'integrations.svelte.ts');
 const root = join(here, '..', '..', '..');
 const appState = readFileSync(join(root, 'src-tauri', 'src', 'state.rs'), 'utf8');
+const commandRust = readFileSync(join(root, 'src-tauri', 'src', 'commands.rs'), 'utf8');
+const ltRust = readFileSync(join(root, 'src-tauri', 'src', 'listentogether', 'mod.rs'), 'utf8');
 const files = [
 	component,
 	discord,
@@ -184,18 +186,23 @@ for (const title of discordRows) {
 	);
 }
 
-// --- shared-control switch in the Listen Together Host setup ------------------------------------
+// --- shared-control switches in the connected Listen Together room -----------------------------
 const ltDialog = readFileSync(join(here, 'components', 'ListenTogether.svelte'), 'utf8');
 const integrationStore = readFileSync(join(here, 'integrations.svelte.ts'), 'utf8');
 const integrationSettings = readFileSync(join(here, 'components', 'IntegrationsSettings.svelte'), 'utf8');
 ok(
 	ltDialog.includes('setSharedControlEnabled(on)'),
-	'the pre-host toggle saves only the opt-in'
+	'both host switches save only the opt-in'
 );
 ok(ltDialog.includes('controlOn && lt.sharedControlEnabled'), 'the switch reflects both gates');
 ok(
 	ltDialog.includes('disabled={!controlOn || sharedBusy}'),
 	'the switch needs only the Control API'
+);
+ok(
+	ltDialog.indexOf('controlOn && lt.sharedControlEnabled') !==
+		ltDialog.lastIndexOf('controlOn && lt.sharedControlEnabled'),
+	'the host toggle appears in both the setup form and the connected room panel'
 );
 ok(ltDialog.includes('void loadIntegrations()'), 'opening the dialog refreshes the API flag');
 ok(
@@ -203,14 +210,14 @@ ok(
 	'the dialog explains why shared control is unavailable'
 );
 ok(
-	ltDialog.includes("t('dialogs.listen_together.shared_control_guest_on')"),
-	'a guest sees its own shared-control access, not the host opt-in switch'
+	ltDialog.includes("t('dialogs.listen_together.shared_control_guest_on')") &&
+		ltDialog.includes("t('dialogs.listen_together.shared_control_requires_capability')"),
+	'a guest sees its own capability state, not the host opt-in switch'
 );
 ok(
-	ltDialog.includes(
-		": clientControlOn\n\t\t\t\t\t? t('dialogs.listen_together.shared_control_guest_on')"
-	),
-	'the guest status follows the separate client-control opt-in'
+	ltDialog.includes(': guestCapable') &&
+		!ltDialog.includes('lt.sharedControl && lt.hostSharedControlCapable'),
+	'the guest switch stays available even before the host opts in'
 );
 const uiForward = appState.slice(
 	appState.indexOf('async fn forward_guest_ui_control'),
@@ -226,8 +233,9 @@ ok(
 );
 ok(
 	storeSource.includes('clientControl: false') &&
-		storeSource.includes('export async function setClientControl'),
-	'client control starts off and can be toggled from the room'
+		storeSource.includes('export async function setClientControl') &&
+		storeSource.includes('api.ltSetClientControl(on)'),
+	'client control starts off and is persisted through the LT command'
 );
 ok(
 	ltDialog.includes('onCheckedChange={toggleClientControl}') &&
@@ -285,17 +293,18 @@ ok(
 );
 
 ok(
-	integrationStore.includes('Leave Listen Together before changing shared control'),
-	'both switches are locked while a room is active'
+	!integrationStore.includes('Leave Listen Together before changing shared control') &&
+		!commandRust.includes('Leave Listen Together before changing shared control.'),
+	'the host opt-in can be toggled while a room is active'
+);
+ok(
+	!integrationSettings.includes('roomActive') &&
+		integrationSettings.includes('disabled={applying || !settings}'),
+	'the settings toggle is live, gated only by an in-flight apply'
 );
 ok(
 	!integrationStore.includes('BEFORE_SERVER_KEY') && !integrationStore.includes('ACTIVE_SERVER_KEY'),
 	'no relay swap state remains'
-);
-ok(
-	integrationSettings.includes('roomActive') &&
-		integrationSettings.includes('settings?.control_api.shared_control'),
-	'the settings toggle obeys the same idle rule'
 );
 ok(
 	!readFileSync(join(here, 'api.ts'), 'utf8').includes('shared_control_server'),
@@ -370,16 +379,21 @@ for (const key of [
 	'shared_control_hint',
 	'shared_control_requires_api',
 	'shared_control_guest_on',
-	'shared_control_requires_client_control',
+	'shared_control_requires_capability',
 	'client_control',
 	'client_control_hint',
 	'control_link',
+	'control_link_live_hint',
 	'control_link_ready',
 	'control_link_preparing',
 	'control_link_off',
 	'control_link_slots',
-	'capable_badge',
-	'capable_badge_hint'
+	'host_allows',
+	'host_allows_hint',
+	'capable_api',
+	'capable_api_hint',
+	'capable_ui',
+	'capable_ui_hint'
 ]) {
 	ok(
 		typeof en.dialogs.listen_together[key] === 'string',
@@ -396,15 +410,29 @@ ok(
 	'the badge stays quiet when the room cannot offer shared control'
 );
 ok(
-	badgeSource.includes('integrations.clientControl'),
-	'the guest badge reflects the separate client-control opt-in'
+	badgeSource.includes('integrations.controlApi || integrations.clientControl') &&
+		badgeSource.includes('lt.sharedControlHostAllows'),
+	'the guest badge follows the handshake and either local capability'
 );
 ok(playerBar.includes('<SharedControlBadge />'), 'the main player bar shows the badge');
 ok(miniPlayer.includes('<SharedControlBadge onArt />'), 'the mini player shows the badge');
+ok(
+	playerBar.includes('setClientControl(!integrations.clientControl)') &&
+		playerBar.includes('aria-pressed={integrations.clientControl}') &&
+		playerBar.includes("t('player.client_control_hint')"),
+	'the playback bar toggles the same client-control switch as the room panel'
+);
+ok(
+	playerBar.includes("class=\"h-5 w-5 {integrations.clientControl ? 'text-green-600' : 'text-red-500'}\""),
+	'the playback-bar control is green when on and red when off'
+);
 for (const key of [
 	'shared_host',
 	'shared_guest',
 	'shared_needs_client_control',
+	'client_control_on',
+	'client_control_off',
+	'client_control_hint',
 	'shared_sending',
 	'shared_sent',
 	'shared_failed',
@@ -460,19 +488,28 @@ ok(
 	'the connected host section shows link readiness and guest slots'
 );
 ok(
-	apiSource.includes('sharedControlGuests: string[]') &&
+	apiSource.includes('sharedControlGuests: LtSharedControlGuest[]') &&
+		apiSource.includes('sharedControlHostAllows: boolean') &&
 		readFileSync(join(here, 'lt.svelte.ts'), 'utf8').includes('sharedControlGuests: []'),
-	'LtState carries the capability roster learned over the hidden link'
+	'LtState carries the live roster and the host allow state from the hidden link'
 );
 ok(
-	ltDialog.includes('participantCapable(u.user_id, u.is_host)') &&
-		ltDialog.includes("t('dialogs.listen_together.capable_badge')"),
-	'participant rows badge the clients known to support shared control'
+	ltDialog.includes('capabilityOf(u.user_id, u.is_host)') &&
+		ltDialog.includes("t('dialogs.listen_together.capable_api')") &&
+		ltDialog.includes("t('dialogs.listen_together.capable_ui')") &&
+		ltDialog.includes("t('dialogs.listen_together.host_allows')"),
+	'participant rows show separate API/UI markers and a host-allows marker'
+);
+ok(
+	ltRust.includes('SharedControlEnvelope::ParticipantHello') &&
+		ltRust.includes('SharedControlEnvelope::ParticipantRoster') &&
+		ltRust.includes('maybe_start_shared_guest_link'),
+	'the hidden link handshakes capabilities on join and sends a live roster'
 );
 ok(
 	appState.includes('capable_guests: Some(self.lt.capable_guests().await)') &&
 		appState.includes('self.lt.note_capable_guests(guests).await'),
-	'the capability roster rides back in the opaque control answer'
+	'the legacy id list still rides back in the opaque control answer'
 );
 
 console.log('ok');

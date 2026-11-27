@@ -20,7 +20,8 @@
 		ArrowDown01Icon,
 		PreferenceVerticalIcon,
 		GoBackward15SecIcon,
-		GoForward15SecIcon
+		GoForward15SecIcon,
+		UserGroupIcon
 	} from '@hugeicons/core-free-icons';
 	import LogoMark from './LogoMark.svelte';
 	import { fade } from 'svelte/transition';
@@ -38,6 +39,7 @@
 		skipBy,
 		toggleMute,
 		toggleNowPlayingRating,
+		toast,
 		ui,
 		wheelVolume
 	} from '$lib/player.svelte';
@@ -51,6 +53,7 @@
 	import DevicePicker from './DevicePicker.svelte';
 	import { link } from '$lib/link.svelte';
 	import { inRoom, lt } from '$lib/lt.svelte';
+	import { integrations, setClientControl } from '$lib/integrations.svelte';
 	import { currentLocale, t } from '$lib/i18n.svelte';
 	import LiveBadge from './LiveBadge.svelte';
 	import SharedControlBadge from './SharedControlBadge.svelte';
@@ -78,6 +81,15 @@
 	function toggleLike() {
 		if (playback.rating !== 'like') justLiked = true;
 		toggleNowPlayingRating();
+	}
+
+	/** Same persisted switch as the room panel, so the two controls never disagree. */
+	async function togglePlayerControl() {
+		try {
+			await setClientControl(!integrations.clientControl);
+		} catch (e) {
+			toast.error(String(e));
+		}
 	}
 
 	const fmt = (secs: number) => {
@@ -511,6 +523,30 @@
 					<span class="absolute right-1 top-1 size-1.5 rounded-full bg-primary" aria-hidden="true"></span>
 				{/if}
 			</Button>
+			{#if inRoom() && lt.role === 'guest'}
+				<Button
+					variant={integrations.clientControl ? 'secondary' : 'ghost'}
+					size="icon-sm"
+					class="relative"
+					onclick={togglePlayerControl}
+					aria-label={integrations.clientControl
+						? t('player.client_control_on')
+						: t('player.client_control_off')}
+					aria-pressed={integrations.clientControl}
+					title={t('player.client_control_hint')}
+				>
+					<HugeiconsIcon
+						icon={UserGroupIcon}
+						class="h-5 w-5 {integrations.clientControl ? 'text-green-600' : 'text-red-500'}"
+					/>
+					<span
+						class="absolute right-1 top-1 size-1.5 rounded-full {integrations.clientControl
+							? 'bg-green-500'
+							: 'bg-red-500'}"
+						aria-hidden="true"
+					></span>
+				</Button>
+			{/if}
 			<!-- A local file has no YouTube comment thread to open. -->
 			{#if playback.now && !api.isLocalId(playback.now.videoId)}
 				<Button

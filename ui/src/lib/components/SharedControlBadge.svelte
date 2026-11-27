@@ -14,9 +14,9 @@
 		if (controlFeedback.ok === false) return t('player.shared_failed');
 		if (!inRoom() || lt.sharedControlReason !== null) return '';
 		if (lt.role === 'host' && lt.sharedControlEnabled) return t('player.shared_host');
-		if (lt.role === 'guest' && lt.hostSharedControlCapable && lt.sharedControl) {
+		if (lt.role === 'guest' && lt.sharedControlHostAllows && lt.sharedControlLinkReady) {
 			if (!integrations.loaded) return '';
-			return integrations.clientControl
+			return integrations.controlApi || integrations.clientControl
 				? t('player.shared_guest')
 				: t('player.shared_needs_client_control');
 		}

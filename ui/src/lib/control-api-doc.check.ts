@@ -94,7 +94,7 @@ for (const text of [
 	'no user-hosted relay',
 	'bare room code',
 	'hidden device-link room',
-	'pre-hosting choice',
+	'toggled live',
 	'One code serves both kinds of guest at once',
 	'the first missing fact',
 	'No `ServerMessage` variant was added'
@@ -108,15 +108,20 @@ const commands = read(join(root, 'src-tauri', 'src', 'commands.rs'));
 ok(types.includes('listen_together_guest_with'), 'guest errors carry the room blocker');
 ok(lt.includes('sharedControlReason'), 'the room snapshot carries the diagnostic reason');
 ok(
-	lt.includes('!inner.host_shared_control_capable') && lt.includes('!inner.shared_control'),
-	'guest diagnostics name a base host and a host without the opt-in'
+	lt.includes('!inner.shared_link_host_allows') &&
+		!lt.includes('!inner.host_shared_control_capable') &&
+		lt.includes('the host is not allowing shared control for this room'),
+	'guest diagnostics come from the hidden-link handshake, not the relay bit'
 );
 ok(
 	!integrationSettings.includes('pub shared_control_server'),
 	'no fork relay URL is persisted with the API settings'
 );
 ok(lt.includes('shared_link_keys') && lt.includes('JoinLink'), 'the hidden link is derived from the room code');
-ok(commands.includes('before changing shared control'), 'backend locks the opt-in while in a room');
+ok(
+	!commands.includes('before changing shared control') && lt.includes('set_api_enabled'),
+	'backend accepts the host opt-in live and mirrors it to the link'
+);
 ok(commands.includes('before changing the server'), 'backend locks relay edits while in a room');
 ok(handlers.includes('forward_shared_control'), 'handlers forward opted-in guest mutations');
 ok(protocol.includes('SharedControlEnvelope'), 'the wire shape is in listen-protocol');

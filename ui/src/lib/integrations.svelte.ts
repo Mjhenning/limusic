@@ -3,15 +3,15 @@
 // authority; this store only mirrors what it accepted.
 import * as api from './api';
 import { prefs } from './player.svelte';
-import { applyLtState, inRoom, lt } from './lt.svelte';
+import { applyLtState } from './lt.svelte';
 
 export const LT_CLIENT_CONTROL_KEY = 'lt_client_control';
 
 export const integrations = $state({
 	controlApi: false,
 	tuna: false,
-	/// Guest opt-in for player buttons in a shared room. Independent of `controlApi` and off until
-	/// the user turns it on inside the connected Listen Together section.
+	/// Guest opt-in for player buttons in a shared room. Independent of `controlApi`; available in
+	/// both the connected room panel and the player bar, and off until the user enables it.
 	clientControl: false,
 	loaded: false
 });
@@ -46,7 +46,10 @@ export async function setClientControl(on: boolean): Promise<void> {
 	const before = integrations.clientControl;
 	integrations.clientControl = on;
 	try {
-		await api.setSetting(LT_CLIENT_CONTROL_KEY, on ? 'true' : 'false');
+		await api.ltSetClientControl(on);
+		// The backend pushes the capability to the hidden link; refresh the roster immediately so
+		// both the room panel and the player-bar badge reflect the new state.
+		applyLtState(await api.ltGetState());
 	} catch (e) {
 		integrations.clientControl = before;
 		throw e;
@@ -66,12 +69,9 @@ export async function setIntegrationEnabled(
 	return settings;
 }
 
-/** Set the host opt-in. The hidden link room is keyed by the room code, which only exists after
- *  hosting starts, so this stays a pre-hosting choice. The relay is never swapped. */
+/** Set the host opt-in. The hidden link is keyed by the room code, so this can be toggled live:
+ *  on opens it immediately, off closes it and guests drop their badges. The relay never changes. */
 export async function setSharedControlEnabled(on: boolean): Promise<api.IntegrationSettings> {
-	if (inRoom() || lt.requesting || lt.status === 'connecting') {
-		throw new Error('Leave Listen Together before changing shared control.');
-	}
 	const settings = await api.getIntegrationSettings();
 	settings.control_api.shared_control = on;
 	await api.setIntegrationSettings(settings);

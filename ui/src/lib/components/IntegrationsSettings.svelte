@@ -16,7 +16,6 @@
 		setSharedControlEnabled,
 		syncIntegrations
 	} from '$lib/integrations.svelte';
-	import { lt } from '$lib/lt.svelte';
 	import { toast, ui } from '$lib/player.svelte';
 	import { t } from '$lib/i18n.svelte';
 
@@ -50,7 +49,6 @@
 		const port = Number(portInput);
 		return Number.isInteger(port) && port >= 1024 && port <= 65535;
 	});
-	const roomActive = $derived(lt.role !== 'none' || lt.requesting || lt.status === 'connecting');
 	const dedupeValid = $derived.by(() => {
 		const distance = Number(dedupeInput);
 		return Number.isInteger(distance) && distance >= 0 && distance <= 50;
@@ -197,7 +195,7 @@
 	}
 
 	async function toggleSharedControl(on: boolean) {
-		if (roomActive || applying) return;
+		if (applying) return;
 		error = '';
 		applying = true;
 		try {
@@ -296,9 +294,7 @@
 				})}
 				{@render row({
 					title: t('settings.integrations.shared_control'),
-					desc: roomActive
-						? t('settings.integrations.shared_control_idle_hint')
-						: t('settings.integrations.shared_control_hint'),
+					desc: t('settings.integrations.shared_control_hint'),
 					control: sharedControlSwitch
 				})}
 				{@render row({
@@ -416,7 +412,7 @@
 {#snippet sharedControlSwitch()}
 	<Switch
 		checked={settings?.control_api.shared_control ?? false}
-		disabled={applying || !settings || roomActive}
+		disabled={applying || !settings}
 		onCheckedChange={toggleSharedControl}
 	/>
 {/snippet}
