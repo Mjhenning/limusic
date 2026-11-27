@@ -106,9 +106,22 @@
 	}
 
 	function openIntegrationMenu(e: MouseEvent) {
+		if (integrationMenuOpen) {
+			integrationMenuOpen = false;
+			return;
+		}
 		integrationAnchor = anchorMenu(e, { align: 'right' });
 		integrationMenuOpen = true;
 		void loadIntegrations().catch(() => {});
+	}
+
+	/** Both menus sit above the full-screen backdrop, so clicking another titlebar control never
+	    reaches it. Closing them from the header's capture phase makes every other control (and the
+	    drag region) act as click-out, the same way the backdrop does for the rest of the window. */
+	function onTitlebarPointerDown(e: PointerEvent) {
+		const target = e.target as Element | null;
+		if (!target?.closest('[data-titlebar-menu="integrations"]')) integrationMenuOpen = false;
+		if (!target?.closest('[data-titlebar-menu="scrobbler"]')) menuOpen = false;
 	}
 
 	function openIntegrationSettings() {
@@ -173,6 +186,7 @@
 <header
 	data-tauri-drag-region
 	class="pointer-events-auto relative {ui.theaterOpen ? 'z-0' : 'z-50'} flex h-9 shrink-0 select-none items-center justify-between border-b border-border/60 bg-background"
+	onpointerdowncapture={onTitlebarPointerDown}
 >
 	<!-- Centred on the window, so below about 800px the icons on the right run into it (#688). -->
 	<span
@@ -272,6 +286,7 @@
 			class="flex h-full w-8 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground {anyIntegrationOn
 				? 'text-foreground'
 				: ''}"
+			data-titlebar-menu="integrations"
 			onclick={openIntegrationMenu}
 			title={anyIntegrationOn ? t('integrations.tooltip_on') : t('integrations.tooltip_off')}
 			aria-label={t('settings.tabs.integrations')}
@@ -292,6 +307,7 @@
 			class="flex h-full w-8 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground {connected
 				? 'text-foreground'
 				: ''}"
+			data-titlebar-menu="scrobbler"
 			onclick={onScrobblerClick}
 			title={scrobblerTitle}
 			aria-label={scrobblerTitle}
