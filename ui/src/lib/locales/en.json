@@ -1289,6 +1289,8 @@
 			"connected": "Connected",
 			"disconnected": "Disconnected",
 			"make_host": "Make host",
+			"make_host_no_api_title": "Hand hosting to a non-fork?",
+			"make_host_no_api_desc": "{name} has no Control API. Bot requests and shared playback control will stop until a fork host takes over.",
 			"remove": "Remove",
 			"suggestions": "Suggestions",
 			"from_user": "from {user}",

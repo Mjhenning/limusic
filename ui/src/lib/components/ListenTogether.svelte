@@ -1,5 +1,6 @@
 <script lang="ts">
 	import * as Dialog from '$lib/components/ui/dialog';
+	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import { Switch } from '$lib/components/ui/switch';
@@ -39,6 +40,8 @@
 	let busy = $state(false);
 	let sharedBusy = $state(false);
 	let copied = $state(false);
+	let pendingTransfer = $state<{ id: string; name: string } | null>(null);
+	let transferConfirmOpen = $state(false);
 
 	// Seed inputs when the modal opens: remembered name + the persisted server URL. `serverUrl` is
 	// empty on the default server, which is the whole point: the address only appears once the user
@@ -102,6 +105,28 @@
 		}
 		const peer = lt.sharedControlGuests.find((p) => p.userId === userId);
 		return { api: peer?.apiEnabled ?? false, ui: peer?.uiControl ?? false, host: false };
+	}
+
+	/** A participant with no Control API badge can't run the bot or accept shared-control requests. */
+	function askTransferHost(userId: string, username: string) {
+		if (capabilityOf(userId, false).api) {
+			void api.ltTransferHost(userId).catch((e) => toast.error(String(e)));
+			return;
+		}
+		pendingTransfer = { id: userId, name: username };
+		transferConfirmOpen = true;
+	}
+
+	async function confirmTransferHost() {
+		const target = pendingTransfer;
+		pendingTransfer = null;
+		transferConfirmOpen = false;
+		if (!target) return;
+		try {
+			await api.ltTransferHost(target.id);
+		} catch (e) {
+			toast.error(String(e));
+		}
 	}
 
 	function rememberName() {
@@ -577,7 +602,7 @@
 											>
 												<button
 													class="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:bg-muted focus-visible:text-foreground"
-													onclick={() => api.ltTransferHost(u.user_id)}
+													onclick={() => askTransferHost(u.user_id, u.username)}
 												>
 													<HugeiconsIcon icon={Exchange01Icon} class="h-4 w-4" />
 													<span class="sr-only">{t('dialogs.listen_together.make_host')}</span>
@@ -651,3 +676,31 @@
 		{/if}
 	</Dialog.Content>
 </Dialog.Root>
+
+<!-- Outside the room dialog so cancelling/accepting can't unmount the confirm with the room list. -->
+<AlertDialog.Root
+	bind:open={transferConfirmOpen}
+	onOpenChange={(open) => {
+		if (!open) pendingTransfer = null;
+	}}
+>
+	<AlertDialog.Content class="sm:max-w-md">
+		<AlertDialog.Header>
+			<AlertDialog.Media class="text-amber-500">
+				<HugeiconsIcon icon={CrownIcon} />
+			</AlertDialog.Media>
+			<AlertDialog.Title>{t('dialogs.listen_together.make_host_no_api_title')}</AlertDialog.Title>
+			<AlertDialog.Description>
+				{t('dialogs.listen_together.make_host_no_api_desc', {
+					name: pendingTransfer?.name ?? ''
+				})}
+			</AlertDialog.Description>
+		</AlertDialog.Header>
+		<AlertDialog.Footer>
+			<AlertDialog.Cancel>{t('common.cancel')}</AlertDialog.Cancel>
+			<AlertDialog.Action onclick={confirmTransferHost}>
+				{t('dialogs.listen_together.make_host')}
+			</AlertDialog.Action>
+		</AlertDialog.Footer>
+	</AlertDialog.Content>
+</AlertDialog.Root>

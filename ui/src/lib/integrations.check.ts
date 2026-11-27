@@ -393,7 +393,9 @@ for (const key of [
 	'capable_api',
 	'capable_api_hint',
 	'capable_ui',
-	'capable_ui_hint'
+	'capable_ui_hint',
+	'make_host_no_api_title',
+	'make_host_no_api_desc'
 ]) {
 	ok(
 		typeof en.dialogs.listen_together[key] === 'string',
@@ -499,6 +501,13 @@ ok(
 		ltDialog.includes("t('dialogs.listen_together.capable_ui')") &&
 		ltDialog.includes("t('dialogs.listen_together.host_allows')"),
 	'participant rows show separate API/UI markers and a host-allows marker'
+);
+ok(
+	ltDialog.includes('AlertDialog.Root') &&
+		ltDialog.includes('capabilityOf(userId, false).api') &&
+		ltDialog.includes("t('dialogs.listen_together.make_host_no_api_title')") &&
+		!ltDialog.includes('confirm('),
+	'handing host to a non-API participant asks in an in-app confirm dialog'
 );
 ok(
 	ltRust.includes('SharedControlEnvelope::ParticipantHello') &&
