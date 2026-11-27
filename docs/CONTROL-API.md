@@ -489,21 +489,25 @@ bare room code a default host copies. The host derives a link secret from that
 code (`base64url(sha256("limusic-shared-control|" + code))`, 43 chars) and joins
 a hidden device-link room on the relay the Listen Together room already uses
 (`wss://sync.limusic.app/ws` by default). It advertises itself there under a
-device id derived from the same code. A guest with the Control API enabled
-derives the same secret when its first mutation needs forwarding, joins that
-link room on a fresh socket, targets the host's derived device id, and sends
-the mutation inside the existing opaque `Remote` envelope. The result returns
-to the guest's socket. One code serves both kinds of guest at once: API-enabled
-fork guests take this extra route while base guests and API-disabled clients use
-the normal Listen Together room unchanged. The hidden room carries only shared
+device id derived from the same code. A guest with the Control API enabled or
+the client-control switch on derives the same secret when it joins, opens one
+persistent socket named after its room user id, and keeps it for the room's
+lifetime. Mutations target the host's derived device id and travel inside the
+existing opaque `Remote` envelope; their correlated answers return on that same
+socket. One code serves both kinds of guest at once: capable fork guests take
+this extra route while base guests and guests with both switches off use the
+normal Listen Together room unchanged. The hidden room carries only shared
 control envelopes, never general device-link controls.
 
-The opt-in is a pre-hosting choice. It does not change `lt_server_url` and does
-not change the invite, so a room can mix default users and fork users. The
-switch is unavailable while a room is active because the hidden link is opened
-only when the room is created. Upstream link rooms hold at most 8 devices
-including the host, so up to 7 fork guests can forward at once; later guests
-get a clear error and stay suggestion-only.
+The opt-in can be toggled live, before or during a room. Turning it on opens the
+room-code-derived link immediately; turning it off closes it and drops every
+badge and slot. It does not change `lt_server_url` or the invite, so a room can
+mix default users and fork users. A capable guest sends a capability `hello` on
+join and whenever either switch changes; the host answers with a roster that
+carries the current allow state plus each guest's separate `API` and `UI`
+markers. Those markers can appear together on one participant. Upstream link
+rooms hold at most 8 devices including the host, so up to 7 capable guests can
+connect at once; later guests get a clear error and stay suggestion-only.
 
 The same link carries the guest's own UI transport buttons once it is in an
 opted-in room: play/pause, skip, previous, shuffle, and loop are sent as host
@@ -532,10 +536,12 @@ visible requester.
 
 The Listen Together dialog and the guest `409 listen_together_guest` message
 name the first missing fact from the same `sharedControlReason`: a room that is
-still reconnecting, a host that is not a fork or has not opted in, a hidden link
-that is still preparing on the host, or the last failure reported by the guest's
-link. An expired or unreachable relay is reported with the same wording rather
-than a native dialog. A base host never joins the link room, so its guests stay
+still reconnecting, a host that did not answer the hidden-link handshake with
+`host_allows`, a link that is still preparing on the host, or the last failure
+reported by the guest's socket. The relay's legacy capability bit is never used
+for this diagnosis, so a host that opts in mid-room is seen immediately. An
+expired or unreachable relay is reported with the same wording rather than a
+native dialog. A base host never joins the link room, so its guests stay
 suggestion-only without any user action and see that fact in the dialog.
 
 No `ServerMessage` variant was added. The wire change is additive: defaulted
